@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Content Moderator</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --card-border: rgba(255, 255, 255, 0.1);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --success: #10b981;
+            --success-hover: #059669;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.15) 0px, transparent 50%),
+                radial-gradient(at 100% 0%, rgba(139, 92, 246, 0.15) 0px, transparent 50%);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 2rem;
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        header {
+            margin-bottom: 3rem;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(to right, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+        }
+
+        .draft-card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--card-border);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.3s ease;
+        }
+
+        .draft-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--card-border);
+        }
+
+        .status-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .status-review { background: rgba(234, 179, 8, 0.2); color: #fde047; border: 1px solid rgba(234, 179, 8, 0.3); }
+        .status-pending { background: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.3); }
+
+        .meta-info {
+            display: flex;
+            gap: 1.5rem;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            align-items: center;
+        }
+
+        .confidence {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .confidence-bar {
+            width: 50px;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .confidence-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #10b981);
+        }
+
+        .content-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .content-block h3 {
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 0.75rem;
+        }
+
+        .original-text {
+            font-size: 0.95rem;
+            color: #cbd5e1;
+            background: rgba(0, 0, 0, 0.2);
+            padding: 1rem;
+            border-radius: 0.5rem;
+            max-height: 250px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border: 1px solid rgba(0,0,0,0.2);
+        }
+
+        .editor {
+            width: 100%;
+            height: 100%;
+            min-height: 250px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--card-border);
+            border-radius: 0.5rem;
+            color: var(--text-main);
+            padding: 1rem;
+            font-family: inherit;
+            font-size: 1rem;
+            resize: vertical;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .editor:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+        }
+
+        .actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--card-border);
+        }
+
+        button {
+            padding: 0.6rem 1.25rem;
+            border-radius: 0.5rem;
+            font-weight: 500;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.95rem;
+        }
+
+        .btn-ignore {
+            background: rgba(239, 68, 68, 0.1);
+            color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+
+        .btn-ignore:hover {
+            background: rgba(239, 68, 68, 0.2);
+            color: #fee2e2;
+        }
+
+        .btn-save {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-main);
+            border: 1px solid var(--card-border);
+        }
+
+        .btn-save:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .btn-publish {
+            background: var(--success);
+            color: white;
+            box-shadow: 0 4px 6px -1px rgba(16, 185, 129, 0.3);
+        }
+
+        .btn-publish:hover {
+            background: var(--success-hover);
+            box-shadow: 0 6px 8px -1px rgba(16, 185, 129, 0.4);
+            transform: translateY(-1px);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 4rem 0;
+            color: var(--text-muted);
+            background: var(--card-bg);
+            border-radius: 1rem;
+            border: 1px dashed var(--card-border);
+        }
+
+        .empty-state svg {
+            width: 4rem;
+            height: 4rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+            color: var(--text-muted);
+        }
+
+        .tabs {
+            display: flex;
+            justify-content: center;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            border-bottom: 1px solid var(--card-border);
+            padding-bottom: 1rem;
+        }
+
+        .tab {
+            color: var(--text-muted);
+            text-decoration: none;
+            padding: 0.5rem 1.5rem;
+            border-radius: 9999px;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            background: transparent;
+        }
+
+        .tab:hover {
+            color: var(--text-main);
+            background: rgba(255,255,255,0.05);
+        }
+
+        .tab.active {
+            color: white;
+            background: rgba(59, 130, 246, 0.2);
+            border: 1px solid rgba(59, 130, 246, 0.5);
+            box-shadow: 0 0 10px rgba(59, 130, 246, 0.2);
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 0.75rem;
+            padding: 1.25rem;
+            text-align: center;
+        }
+
+        .stat-card h4 {
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-card .stat-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text-main);
+        }
+
+        .stat-card.stat-success .stat-value { color: var(--success); }
+        .stat-card.stat-danger .stat-value { color: var(--danger); }
+        .stat-card.stat-warning .stat-value { color: #fde047; }
+        
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.1);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>AI Content Moderator</h1>
+            <p class="subtitle">Review, edit, and publish your AI-generated tweets.</p>
+            <div style="margin-top: 1rem; display: flex; justify-content: center; gap: 1rem;">
+                <a href="/settings" style="color: var(--accent); text-decoration: none; font-weight: 500;">⚙️ Settings</a>
+                <a href="/logs" style="color: var(--accent); text-decoration: none; font-weight: 500;">📄 System Logs</a>
+            </div>
+        </header>
+
+        {% if analytics %}
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h4>Today Processed</h4>
+                <div class="stat-value">{{ analytics.total_today }}</div>
+            </div>
+            <div class="stat-card stat-success">
+                <h4>Today Published</h4>
+                <div class="stat-value">{{ analytics.published_today }}</div>
+            </div>
+            <div class="stat-card stat-danger">
+                <h4>Today Ignored</h4>
+                <div class="stat-value">{{ analytics.ignored_today }}</div>
+            </div>
+            <div class="stat-card stat-warning">
+                <h4>Awaiting Review</h4>
+                <div class="stat-value">{{ analytics.pending_total }}</div>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="tabs">
+            <a href="/?tab=review" class="tab {% if current_tab == 'review' %}active{% endif %}">На розгляді</a>
+            <a href="/?tab=approved" class="tab {% if current_tab == 'approved' %}active{% endif %}">Опубліковані / Схвалені</a>
+            <a href="/?tab=ignored" class="tab {% if current_tab == 'ignored' %}active{% endif %}">Відхилені</a>
+        </div>
+
+        <main id="drafts-container">
+            {% if not drafts %}
+            <div class="empty-state">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path></svg>
+                <h2>All caught up!</h2>
+                <p>There are no new drafts to review at the moment.</p>
+            </div>
+            {% endif %}
+
+            {% for draft in drafts %}
+            <div class="draft-card" id="draft-{{ draft.id }}">
+                <div class="card-header">
+                    <div class="meta-info">
+                        <span class="status-badge status-{{ draft.status }}">{{ draft.status }}</span>
+                        <span><strong>ID:</strong> {{ draft.id }}</span>
+                        <span><strong>Reason:</strong> {{ draft.reason }}</span>
+                        <div class="confidence">
+                            <span><strong>Conf:</strong> {{ "%.2f"|format(draft.confidence|float if draft.confidence else 0) }}</span>
+                            <div class="confidence-bar">
+                                <div class="confidence-fill" style="width: {{ (draft.confidence|float if draft.confidence else 0) * 100 }}%"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <span class="date" style="color: var(--text-muted); font-size: 0.875rem;">{{ draft.created_at[:16] }}</span>
+                </div>
+                
+                <div class="content-grid">
+                    <div class="content-block">
+                        <h3>Original Telegram Post</h3>
+                        <div class="original-text">{{ draft.original_text }}</div>
+                    </div>
+                    <div class="content-block">
+                        <h3>AI Rewritten Tweet</h3>
+                        <textarea class="editor" id="editor-{{ draft.id }}">{{ draft.rewritten_text }}</textarea>
+                    </div>
+                </div>
+
+                <div class="actions">
+                    {% if current_tab == 'review' %}
+                        <button class="btn-ignore" onclick="ignoreDraft({{ draft.id }})">
+                            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                            Ignore & Delete
+                        </button>
+                        <button class="btn-save" onclick="saveDraft({{ draft.id }})">
+                            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
+                            Save Changes
+                        </button>
+                        <button class="btn-publish" onclick="publishDraft({{ draft.id }})">
+                            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
+                            Approve for Publish
+                        </button>
+                    {% else %}
+                        <button class="btn-save" onclick="saveDraft({{ draft.id }})">
+                            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
+                            Save Edit
+                        </button>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </main>
+    </div>
+
+    <script>
+        async function publishDraft(id) {
+            const text = document.getElementById(`editor-${id}`).value;
+            const btn = document.querySelector(`#draft-${id} .btn-publish`);
+            btn.innerHTML = 'Approving...';
+            
+            // First save the current text
+            await fetch(`/api/drafts/${id}/update`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rewritten_text: text })
+            });
+
+            // Then approve for publish
+            const response = await fetch(`/api/drafts/${id}/publish`, { method: 'POST' });
+            if (response.ok) {
+                removeCard(id);
+            } else {
+                alert("Failed to approve. Check console.");
+                btn.innerHTML = 'Approve for Publish';
+            }
+        }
+
+        async function ignoreDraft(id) {
+            if (!confirm("Are you sure you want to ignore this draft?")) return;
+            
+            const btn = document.querySelector(`#draft-${id} .btn-ignore`);
+            btn.innerHTML = 'Ignoring...';
+            
+            const response = await fetch(`/api/drafts/${id}/ignore`, { method: 'POST' });
+            if (response.ok) {
+                removeCard(id);
+            }
+        }
+
+        async function saveDraft(id) {
+            const text = document.getElementById(`editor-${id}`).value;
+            const button = document.querySelector(`#draft-${id} .btn-save`);
+            const originalText = button.innerHTML;
+            
+            button.innerHTML = 'Saving...';
+            
+            const response = await fetch(`/api/drafts/${id}/update`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rewritten_text: text })
+            });
+            
+            if (response.ok) {
+                button.innerHTML = 'Saved!';
+                setTimeout(() => button.innerHTML = originalText, 2000);
+            }
+        }
+
+        function removeCard(id) {
+            const card = document.getElementById(`draft-${id}`);
+            card.style.opacity = '0';
+            card.style.transform = 'scale(0.95)';
+            setTimeout(() => {
+                card.remove();
+                if (document.querySelectorAll('.draft-card').length === 0) {
+                    location.reload(); // Reload to show empty state
+                }
+            }, 300);
+        }
+    </script>
+</body>
+</html>

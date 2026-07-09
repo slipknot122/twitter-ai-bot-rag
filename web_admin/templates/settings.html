@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - AI Content Moderator</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --card-border: rgba(255, 255, 255, 0.1);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --success: #10b981;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.15) 0px, transparent 50%),
+                radial-gradient(at 100% 0%, rgba(139, 92, 246, 0.15) 0px, transparent 50%);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 2rem;
+            line-height: 1.5;
+        }
+
+        .container { max-width: 800px; margin: 0 auto; }
+        header { margin-bottom: 3rem; text-align: center; }
+        h1 {
+            font-size: 2.5rem; font-weight: 700;
+            background: linear-gradient(to right, #60a5fa, #a78bfa);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+        
+        .nav-links {
+            display: flex; justify-content: center; gap: 1rem; margin-bottom: 2rem;
+        }
+        .nav-links a { color: var(--accent); text-decoration: none; font-weight: 500; }
+        .nav-links a:hover { text-decoration: underline; }
+
+        .settings-card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--card-border); border-radius: 1rem;
+            padding: 2rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+
+        .form-group { margin-bottom: 1.5rem; }
+        .form-group label {
+            display: block; font-weight: 600; margin-bottom: 0.5rem; color: #cbd5e1;
+        }
+        .form-group p.help { font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+        
+        textarea, input[type="text"] {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--card-border); border-radius: 0.5rem;
+            color: var(--text-main); padding: 1rem; font-family: inherit; font-size: 0.95rem;
+        }
+        textarea { min-height: 300px; resize: vertical; }
+        textarea:focus, input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3); }
+
+        .toggle-group {
+            display: flex; align-items: center; gap: 1rem;
+            background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 0.5rem; border: 1px solid var(--card-border);
+        }
+        .toggle-group input[type="checkbox"] { width: 1.5rem; height: 1.5rem; accent-color: var(--accent); cursor: pointer; }
+
+        .btn-save {
+            width: 100%; padding: 1rem; background: var(--accent); color: white;
+            border: none; border-radius: 0.5rem; font-weight: 600; font-size: 1rem;
+            cursor: pointer; transition: background 0.2s ease; margin-top: 1rem;
+        }
+        .btn-save:hover { background: var(--accent-hover); }
+        .btn-save.success { background: var(--success); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Settings</h1>
+            <p class="subtitle">Manage AI Prompts and Bot Configuration</p>
+        </header>
+
+        <div class="nav-links">
+            <a href="/">&larr; Back to Dashboard</a>
+        </div>
+
+        <div class="settings-card">
+            <div class="form-group">
+                <label for="system-prompt">AI System Prompt (Editor Persona)</label>
+                <p class="help">This prompt defines how the AI moderates and rewrites tweets. You can freely change the persona, rules, and restrictions here.</p>
+                <textarea id="system-prompt">{{ system_prompt }}</textarea>
+            </div>
+
+            <div class="form-group toggle-group" style="margin-bottom: 2rem;">
+                <input type="checkbox" id="shadow-mode" {% if shadow_mode %}checked{% endif %}>
+                <div>
+                    <label style="margin-bottom:0;" for="shadow-mode">Enable Shadow Mode (DRY RUN)</label>
+                    <p class="help" style="margin-bottom:0;">If checked, the bot will pretend to publish to X but only print to console. Use this for testing.</p>
+                </div>
+            </div>
+
+            <h3 style="margin-bottom: 1rem; color: #cbd5e1; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem;">Scheduler & Retry Settings</h3>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                <div class="form-group">
+                    <label for="publish-delay">Publish Delay (minutes)</label>
+                    <p class="help">Time to wait between tweets.</p>
+                    <input type="number" id="publish-delay" value="{{ publish_delay_minutes }}">
+                </div>
+                <div class="form-group">
+                    <label for="publish-jitter">Jitter (%)</label>
+                    <p class="help">Randomize delay by ± percentage.</p>
+                    <input type="number" id="publish-jitter" value="{{ publish_jitter_percent }}">
+                </div>
+                <div class="form-group">
+                    <label for="max-retries">Max Retries</label>
+                    <p class="help">Number of retries for transient errors.</p>
+                    <input type="number" id="max-retries" value="{{ max_retries }}">
+                </div>
+                <div class="form-group">
+                    <label for="check-interval">Scheduler Check Interval (s)</label>
+                    <p class="help">How often scheduler checks DB.</p>
+                    <input type="number" id="check-interval" value="{{ scheduler_check_interval_seconds }}">
+                </div>
+            </div>
+
+            <button class="btn-save" onclick="saveSettings(this)">Save Settings</button>
+        </div>
+    </div>
+
+    <script>
+        async function saveSettings(btn) {
+            const prompt = document.getElementById('system-prompt').value;
+            const shadowMode = document.getElementById('shadow-mode').checked;
+            const delay = parseInt(document.getElementById('publish-delay').value);
+            const jitter = parseInt(document.getElementById('publish-jitter').value);
+            const retries = parseInt(document.getElementById('max-retries').value);
+            const interval = parseInt(document.getElementById('check-interval').value);
+            
+            btn.innerHTML = 'Saving...';
+            
+            const response = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    system_prompt: prompt, 
+                    shadow_mode: shadowMode,
+                    publish_delay_minutes: delay,
+                    publish_jitter_percent: jitter,
+                    max_retries: retries,
+                    scheduler_check_interval_seconds: interval
+                })
+            });
+
+            if(response.ok) {
+                btn.innerHTML = 'Saved Successfully!';
+                btn.classList.add('success');
+                setTimeout(() => {
+                    btn.innerHTML = 'Save Settings';
+                    btn.classList.remove('success');
+                }, 2000);
+            } else {
+                alert("Failed to save settings.");
+                btn.innerHTML = 'Save Settings';
+            }
+        }
+    </script>
+</body>
+</html>

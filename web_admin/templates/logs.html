@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Logs - AI Content Moderator</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --card-border: rgba(255, 255, 255, 0.1);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #3b82f6;
+            --info: #0ea5e9;
+            --warning: #eab308;
+            --error: #ef4444;
+            --success: #10b981;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 2rem;
+            line-height: 1.5;
+        }
+
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { margin-bottom: 2rem; text-align: center; }
+        h1 {
+            font-size: 2.5rem; font-weight: 700;
+            background: linear-gradient(to right, #60a5fa, #a78bfa);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .nav-links {
+            display: flex; justify-content: center; gap: 1rem; margin-bottom: 2rem;
+        }
+        .nav-links a { color: var(--accent); text-decoration: none; font-weight: 500; }
+        .nav-links a:hover { text-decoration: underline; }
+
+        .filters {
+            display: flex; justify-content: center; gap: 0.5rem; margin-bottom: 1.5rem; flex-wrap: wrap;
+        }
+        .filter-btn {
+            background: rgba(255,255,255,0.05); border: 1px solid var(--card-border);
+            color: var(--text-muted); padding: 0.5rem 1rem; border-radius: 9999px;
+            cursor: pointer; transition: all 0.2s; text-decoration: none; font-size: 0.875rem;
+        }
+        .filter-btn:hover { background: rgba(255,255,255,0.1); color: var(--text-main); }
+        .filter-btn.active { background: rgba(59, 130, 246, 0.2); color: white; border-color: rgba(59, 130, 246, 0.5); }
+
+        .logs-container {
+            background: #020617; border: 1px solid var(--card-border); border-radius: 0.75rem;
+            padding: 1rem; font-family: monospace; font-size: 0.85rem;
+            height: 60vh; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+        }
+
+        .log-line { border-bottom: 1px solid rgba(255,255,255,0.02); padding: 0.25rem 0; }
+        .log-line:hover { background: rgba(255,255,255,0.02); }
+        
+        .log-INFO { color: var(--info); }
+        .log-WARNING { color: var(--warning); }
+        .log-ERROR { color: var(--error); }
+        .log-SUCCESS { color: var(--success); }
+        .log-DEBUG { color: var(--text-muted); }
+
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.1); }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>System Logs</h1>
+            <p class="subtitle" style="color: var(--text-muted);">Real-time application logs</p>
+        </header>
+
+        <div class="nav-links">
+            <a href="/">&larr; Back to Dashboard</a>
+        </div>
+
+        <div class="filters">
+            <a href="/logs?filter=ALL" class="filter-btn {% if current_filter == 'ALL' %}active{% endif %}">ALL</a>
+            <a href="/logs?filter=INFO" class="filter-btn {% if current_filter == 'INFO' %}active{% endif %}">INFO</a>
+            <a href="/logs?filter=SUCCESS" class="filter-btn {% if current_filter == 'SUCCESS' %}active{% endif %}">SUCCESS</a>
+            <a href="/logs?filter=WARNING" class="filter-btn {% if current_filter == 'WARNING' %}active{% endif %}">WARNING</a>
+            <a href="/logs?filter=ERROR" class="filter-btn {% if current_filter == 'ERROR' %}active{% endif %}">ERROR</a>
+            <a href="/logs?filter=DEBUG" class="filter-btn {% if current_filter == 'DEBUG' %}active{% endif %}">DEBUG</a>
+        </div>
+
+        <div class="logs-container">
+            {% if not logs %}
+                <div style="color: var(--text-muted); text-align: center; padding: 2rem;">No logs found for this filter.</div>
+            {% else %}
+                {% for line in logs %}
+                    <div class="log-line 
+                        {% if 'INFO' in line %}log-INFO
+                        {% elif 'ERROR' in line %}log-ERROR
+                        {% elif 'SUCCESS' in line %}log-SUCCESS
+                        {% elif 'WARNING' in line %}log-WARNING
+                        {% elif 'DEBUG' in line %}log-DEBUG
+                        {% endif %}
+                    ">{{ line }}</div>
+                {% endfor %}
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>
