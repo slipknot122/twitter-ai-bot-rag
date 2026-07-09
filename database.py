@@ -302,7 +302,6 @@ class Database:
 
 
 
-# Singleton для імпорту в інших файлах
     def recover_stuck_drafts(self):
         """Відновлює драфти, що зависли в проміжних статусах після крашу.
         processing -> new (безпечно переобробити LLM-ом)
@@ -326,6 +325,7 @@ class Database:
                 f"{recovered_publishing} drafts -> review"
             )
 
+# Singleton для імпорту в інших файлах
 db = Database()
 
 if __name__ == "__main__":

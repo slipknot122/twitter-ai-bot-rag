@@ -32,18 +32,10 @@ class LLMProvider:
                 os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
 
             if "gemini" in self.model:
-                # Пріоритет моделей за вашим скріншотом (від найкращої до найпростішої з наявними лімітами)
                 models_to_try = [
                     "gemini/gemini-3.5-flash",
-                    "gemini/gemini-3-flash",
-                    "gemini/gemini-3-flash-preview",
-                    "gemini/gemini-2.5-flash",
-                    "gemini/gemini-2.0-flash",
-                    "gemini/gemini-flash-latest",
                     "gemini/gemini-3.1-flash-lite",
-                    "gemini/gemini-2.5-flash-lite",
-                    "gemini/gemini-2.0-flash-lite",
-                    "gemini/gemini-flash-lite-latest"
+                    "gemini/gemini-2.5-flash"
                 ]
             else:
                 models_to_try = [self.model]
