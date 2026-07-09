@@ -2,21 +2,19 @@ import tweepy
 from loguru import logger
 from config import settings
 from database import db
-from tenacity import retry, wait_exponential, stop_after_attempt
 
 class TwitterPublisher:
     def __init__(self):
         self.dry_run = settings.twitter_dry_run
         self.client = None
-        
+
         if not self.dry_run:
-            if not all([settings.twitter_api_key, settings.twitter_api_secret, 
+            if not all([settings.twitter_api_key, settings.twitter_api_secret,
                        settings.twitter_access_token, settings.twitter_access_token_secret]):
                 logger.error("Twitter credentials missing. Forcing DRY RUN mode.")
                 self.dry_run = True
             else:
                 try:
-                    # Ініціалізація клієнта Tweepy (API v2)
                     self.client = tweepy.Client(
                         consumer_key=settings.twitter_api_key,
                         consumer_secret=settings.twitter_api_secret,
@@ -28,36 +26,29 @@ class TwitterPublisher:
                     logger.error(f"Failed to initialize Twitter client: {e}")
                     self.dry_run = True
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def publish(self, draft_id: int, text: str) -> bool:
         """
         Публікує текст в Twitter. Повертає True, якщо успішно.
+        При помилці кидає виняток — retry-логіку обробляє RetryManager.
         """
         if self.dry_run:
             logger.info(f"[DRY RUN] Would publish tweet for Draft ID {draft_id}:")
             logger.info(f"[DRY RUN] Tweet text:\n{text}")
-            
-            # В режимі dry_run імітуємо публікацію
             db.record_published_tweet(draft_id, f"mock_tweet_{draft_id}")
             return True
 
         if not self.client:
-            logger.error("Twitter client is not available.")
-            db.update_draft_status(draft_id, "failed")
-            return False
+            # Кидаємо виняток замість тихого False — RetryManager
+            # класифікує це як permanent і переведе в failed
+            raise RuntimeError("401 unauthorized: Twitter client is not available")
 
-        try:
-            logger.info(f"Publishing Draft ID {draft_id} to Twitter...")
-            response = self.client.create_tweet(text=text)
-            tweet_id = response.data['id']
-            logger.success(f"Tweet published successfully! ID: {tweet_id}")
-            
-            db.record_published_tweet(draft_id, str(tweet_id))
-            return True
-        except Exception as e:
-            logger.error(f"Error publishing tweet for Draft ID {draft_id}: {e}")
-            db.update_draft_status(draft_id, "failed")
-            raise
+        logger.info(f"Publishing Draft ID {draft_id} to Twitter...")
+        response = self.client.create_tweet(text=text)
+        tweet_id = response.data['id']
+        logger.success(f"Tweet published successfully! ID: {tweet_id}")
+
+        db.record_published_tweet(draft_id, str(tweet_id))
+        return True
 
 publisher = TwitterPublisher()
 

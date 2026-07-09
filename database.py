@@ -303,6 +303,29 @@ class Database:
 
 
 # Singleton для імпорту в інших файлах
+    def recover_stuck_drafts(self):
+        """Відновлює драфти, що зависли в проміжних статусах після крашу.
+        processing -> new (безпечно переобробити LLM-ом)
+        publishing -> review (НЕ approved: твіт міг вже піти, людина має перевірити)
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE drafts SET status = 'new', updated_at = CURRENT_TIMESTAMP WHERE status = 'processing'"
+            )
+            recovered_processing = cursor.rowcount
+            cursor.execute(
+                "UPDATE drafts SET status = 'review', last_error = 'Recovered after crash during publishing', "
+                "updated_at = CURRENT_TIMESTAMP WHERE status = 'publishing'"
+            )
+            recovered_publishing = cursor.rowcount
+            conn.commit()
+        if recovered_processing or recovered_publishing:
+            logger.warning(
+                f"Crash recovery: {recovered_processing} drafts -> new, "
+                f"{recovered_publishing} drafts -> review"
+            )
+
 db = Database()
 
 if __name__ == "__main__":

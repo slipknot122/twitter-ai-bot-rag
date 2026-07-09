@@ -59,13 +59,22 @@ async def ai_worker_loop():
                 conn.commit()
                 
             if new_status == "approved" and result.get('tweet_text'):
-                semantic_memory.save(result.get('tweet_text'))
-                
-            logger.success(f"AI Worker: Draft ID {draft_id} processed. New status: {new_status}")
+                # Асинхронно зберігаємо в векторну БД, щоб не блокувати event loop
+                await asyncio.to_thread(semantic_memory.save, result.get('tweet_text'))
+
+            logger.success(f"Draft {draft_id} processed successfully. Status -> {new_status}")
             
         except Exception as e:
-            logger.error(f"AI Worker crashed processing draft: {e}")
-            await asyncio.sleep(5)
+            logger.error(f"Error processing draft {draft_id}: {e}")
+            # Якщо LLM впала (наприклад, помилка API), відправляємо на review, 
+            # щоб користувач міг перевірити і не втратив новину
+            db.update_draft_status(draft_id, "review")
+            # Також записуємо помилку
+            with db._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE drafts SET last_error = ? WHERE id = ?", (str(e), draft_id))
+                conn.commit()
+            continue
 
 if __name__ == "__main__":
     asyncio.run(ai_worker_loop())

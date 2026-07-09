@@ -54,7 +54,7 @@ class LLMProvider:
                     response = completion(
                         model=current_model,
                         messages=messages,
-                        temperature=0.2 # Низька температура для "редактора" (менше галюцинацій)
+                        temperature=settings.llm_temperature
                     )
                     result = response.choices[0].message.content
                     

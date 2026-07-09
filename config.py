@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="")
     gemini_api_key: str = Field(default="")
     llm_model: str = Field(default="gemini/gemini-3.5-flash")
+    llm_temperature: float = Field(default=0.7)
     
     # Database
     # Telethon Config

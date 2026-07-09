@@ -22,6 +22,9 @@ async def start_web_admin():
 async def main():
     logger.info("Twitter AI Bot: Starting all services...")
     
+    # Recovery: повертаємо завислі статуси після можливого крашу
+    db.recover_stuck_drafts()
+    
     # Запускаємо всі 4 сервіси одночасно
     tasks = [
         asyncio.create_task(start_listener(), name="TelegramListener"),

@@ -394,10 +394,16 @@
                     <div class="content-block">
                         <h3>Original Telegram Post</h3>
                         <div class="original-text">{{ draft.original_text }}</div>
+                        {% if draft.last_error %}
+                        <div style="margin-top: 1rem; padding: 0.75rem; background: rgba(239, 68, 68, 0.1); border-left: 4px solid var(--danger); border-radius: 0.25rem;">
+                            <strong style="color: var(--danger); font-size: 0.85rem; text-transform: uppercase;">System Error:</strong>
+                            <p style="color: #fca5a5; font-size: 0.85rem; margin-top: 0.25rem;">{{ draft.last_error }}</p>
+                        </div>
+                        {% endif %}
                     </div>
                     <div class="content-block">
                         <h3>AI Rewritten Tweet</h3>
-                        <textarea class="editor" id="editor-{{ draft.id }}">{{ draft.rewritten_text }}</textarea>
+                        <textarea class="editor" id="editor-{{ draft.id }}">{{ draft.rewritten_text if draft.rewritten_text else draft.original_text }}</textarea>
                     </div>
                 </div>
 
