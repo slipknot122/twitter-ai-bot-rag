@@ -31,21 +31,13 @@ async def handle_new_message(event):
 
     logger.info(f"Listener: New message from {channel} (ID: {message_id})")
 
-    if db.is_message_processed(message_id, channel):
-        logger.debug(f"Listener: Message {channel}:{message_id} already exists. Skipping.")
-        return
-
     try:
-        # Зберігаємо повідомлення в базу
-        processed_msg_id = db.mark_message_processed(message_id, channel)
-        
-        # Створюємо чернетку зі статусом 'new' (додаємо в чергу для AI Worker)
-        draft_id = db.create_draft(
-            processed_message_id=processed_msg_id,
-            original_text=text,
-            status='new'
-        )
-        logger.success(f"Listener: Message added to queue (Draft ID: {draft_id})")
+        # Атомарне збереження повідомлення і створення чернетки
+        draft_id = db.add_message_and_draft(message_id, channel, text)
+        if draft_id is None:
+            logger.debug(f"Listener: Message {channel}:{message_id} already exists. Skipping.")
+        else:
+            logger.success(f"Listener: Message added to queue (Draft ID: {draft_id})")
     except Exception as e:
         logger.error(f"Listener: Failed to add message to DB: {e}")
 

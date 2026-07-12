@@ -88,9 +88,9 @@ def publish_draft(draft_id: int):
             raise HTTPException(status_code=400, detail=str(e))
 
     logger.info(f"Web Admin: Approving draft {draft_id} for Scheduler")
-    db.update_draft_status(draft_id, "approved")
-    # Оновлюємо текст на валідований на випадок якщо він був змінений (strip і т.д.)
-    db.update_draft_text(draft_id, validated_text)
+    success = db.approve_draft(draft_id, {"rewritten_text": validated_text})
+    if not success:
+        raise HTTPException(status_code=409, detail="Failed to transition draft to approved state (possible race condition or invalid state)")
     
     if validated_text:
         semantic_memory.save(validated_text)
@@ -110,7 +110,9 @@ def ignore_draft(draft_id: int):
             raise HTTPException(status_code=400, detail="Only drafts in review status can be ignored")
 
     logger.info(f"Web Admin: Ignoring draft {draft_id}")
-    db.update_draft_status(draft_id, "ignored")
+    success = db.ignore_draft(draft_id)
+    if not success:
+        raise HTTPException(status_code=409, detail="Failed to transition draft to ignored state")
     return {"status": "success"}
 
 @app.post("/api/drafts/{draft_id}/update")

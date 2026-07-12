@@ -1,6 +1,6 @@
 import asyncio
 from loguru import logger
-from database import db
+from database import db, AmbiguousPublishStateError
 from typing import Callable, Any
 
 class RetryManager:
@@ -46,22 +46,25 @@ class RetryManager:
                 
             return True
             
+        except AmbiguousPublishStateError as ae:
+            logger.critical(f"RetryManager: Ambiguous DB failure after successful X call for Draft {draft_id}: {ae}. HALTING retries. Manual intervention required!")
+            return False
+            
         except Exception as e:
             is_transient = self._categorize_error(e)
             error_msg = f"{type(e).__name__}: {str(e)}"
             
             if not is_transient:
                 logger.error(f"RetryManager: Permanent error on Draft {draft_id}: {error_msg}. Moving to FAILED.")
-                db.update_draft_status(draft_id, "failed", last_error=error_msg)
+                db.mark_publish_failed(draft_id, error_msg)
                 return False
                 
             # Якщо тимчасова помилка
             current_retry += 1
-            db.increment_retry_count(draft_id, error_msg)
             
             if current_retry > max_retries:
                 logger.error(f"RetryManager: Max retries ({max_retries}) reached for Draft {draft_id}. Error: {error_msg}. Moving to FAILED.")
-                db.update_draft_status(draft_id, "failed", last_error=error_msg)
+                db.mark_publish_failed(draft_id, error_msg)
                 return False
             
             # Знаходимо затримку
@@ -72,16 +75,13 @@ class RetryManager:
             
             import datetime
             next_try = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay_seconds)
+            next_try_str = next_try.strftime("%Y-%m-%d %H:%M:%S")
             
-            with db._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE drafts SET status = 'approved', scheduled_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (next_try.strftime("%Y-%m-%d %H:%M:%S"), draft_id)
-                )
-                conn.commit()
-                
-            logger.info(f"RetryManager: Draft {draft_id} scheduled for retry at {next_try} UTC.")
+            success = db.schedule_publish_retry(draft_id, next_try_str, error_msg)
+            if success:
+                logger.info(f"RetryManager: Draft {draft_id} scheduled for retry at {next_try} UTC.")
+            else:
+                logger.error(f"RetryManager: Failed to schedule retry for draft {draft_id}.")
             return False
 
 retry_manager = RetryManager()

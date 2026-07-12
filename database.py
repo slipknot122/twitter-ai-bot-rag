@@ -1,7 +1,44 @@
 import sqlite3
-from typing import Optional, List, Dict, Any
+import json
+from typing import Optional, List, Dict, Any, Set
 from loguru import logger
 from config import settings
+import datetime
+
+class InvalidStateTransitionError(Exception):
+    pass
+
+class InvalidUpdateColumnError(Exception):
+    pass
+
+class AmbiguousPublishStateError(Exception):
+    pass
+
+ALLOWED_TRANSITIONS = {
+    ("new", "processing"),
+    ("processing", "review"),
+    ("processing", "approved"),
+    ("processing", "ignored"),
+    ("processing", "failed"),
+    ("review", "approved"),
+    ("review", "ignored"),
+    ("approved", "publishing"),
+    ("publishing", "published"),
+    ("publishing", "approved"),
+    ("publishing", "failed"),
+    # Recovery transitions
+    ("processing", "new"),
+    ("publishing", "review"),
+}
+
+ALLOWED_UPDATE_COLUMNS = {
+    "rewritten_text", "reason", "confidence", "status",
+    "image_prompt", "sentiment", "category",
+    "scheduled_at", "last_error", "retry_count", "last_retry_at",
+    "updated_at", "media_status", "media_error", "media_path",
+    "media_provider", "media_created_at", "media_mime_type",
+    "media_size_bytes", "media_width", "media_height"
+}
 
 class Database:
     def __init__(self, db_path: str = settings.db_path):
@@ -16,26 +53,27 @@ class Database:
         conn.execute('PRAGMA journal_mode=WAL;')
         # Рекомендується з WAL для кращої швидкості без втрати надійності
         conn.execute('PRAGMA synchronous=NORMAL;')
+        # Вмикаємо перевірку зовнішніх ключів на кожному з'єднанні
+        conn.execute('PRAGMA foreign_keys = ON;')
         
         return conn
 
     def _init_db(self):
-        """Ініціалізація таблиць."""
+        """Ініціалізація таблиць та міграції."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            # Таблиця для оброблених вхідних повідомлень
+            # 1. Schema migration
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS processed_messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_id TEXT NOT NULL,          -- Наприклад, message_id з Telegram
-                    source_channel TEXT NOT NULL,     -- Назва каналу
+                    source_id TEXT NOT NULL,
+                    source_channel TEXT NOT NULL,
                     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(source_id, source_channel)
                 )
             ''')
             
-            # Таблиця для чернеток (drafts)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,14 +82,13 @@ class Database:
                     rewritten_text TEXT,
                     reason TEXT,
                     confidence REAL,
-                    status TEXT DEFAULT 'new',    -- 'new', 'processing', 'review', 'approved', 'publishing', 'published', 'failed', 'ignored'
+                    status TEXT DEFAULT 'new',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (processed_message_id) REFERENCES processed_messages (id)
                 )
             ''')
             
-            # Таблиця для опублікованих твітів
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS published_tweets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +98,7 @@ class Database:
                     FOREIGN KEY (draft_id) REFERENCES drafts (id)
                 )
             ''')
-            # Таблиця для налаштувань, які можна редагувати через UI
+            
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
@@ -70,7 +107,6 @@ class Database:
                 )
             ''')
             
-            # Таблиця для векторної пам'яті
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS semantic_memory (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,8 +116,19 @@ class Database:
                 )
             ''')
             
-            # Додавання нових стовпців для існуючих БД
-            # SQLite не підтримує IF NOT EXISTS для ADD COLUMN, тому робимо через try-except
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS migration_conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    migration_name TEXT NOT NULL,
+                    source_table TEXT NOT NULL,
+                    source_row_id INTEGER NOT NULL,
+                    original_row_json TEXT NOT NULL,
+                    conflict_reason TEXT NOT NULL,
+                    backed_up_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(migration_name, source_table, source_row_id)
+                )
+            ''')
+            
             new_columns = [
                 "scheduled_at DATETIME NULL",
                 "retry_count INTEGER DEFAULT 0",
@@ -104,9 +151,82 @@ class Database:
                 try:
                     cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col}")
                 except sqlite3.OperationalError:
-                    pass # Колонка вже існує
+                    pass
+
+            conn.commit()
             
-            # Recovery: якщо процес помер під час генерації медіа — позначити як failed
+            # Транзакція для логічних міграцій
+            cursor.execute('BEGIN IMMEDIATE')
+            
+            # 2. Pending migration
+            cursor.execute("UPDATE drafts SET status = 'review' WHERE status = 'pending'")
+            
+            # 3. Duplicate backup/deduplication
+            # Deduplicate published_tweets by tweet_id
+            cursor.execute("""
+                SELECT id, draft_id, tweet_id, published_at FROM published_tweets
+                WHERE tweet_id IN (
+                    SELECT tweet_id FROM published_tweets GROUP BY tweet_id HAVING COUNT(*) > 1
+                )
+                ORDER BY published_at ASC, id ASC
+            """)
+            # Note: published_tweets has published_at, not created_at, fixing ORDER BY to published_at
+            # Actually just fetch all duplicates
+            cursor.execute("""
+                SELECT id, draft_id, tweet_id, published_at FROM published_tweets
+                WHERE tweet_id IN (
+                    SELECT tweet_id FROM published_tweets GROUP BY tweet_id HAVING COUNT(*) > 1
+                )
+                ORDER BY published_at ASC, id ASC
+            """)
+            rows = cursor.fetchall()
+            seen_tweets = set()
+            for r in rows:
+                if r['tweet_id'] not in seen_tweets:
+                    seen_tweets.add(r['tweet_id'])
+                else:
+                    # Duplicate! Backup and delete
+                    row_dict = dict(r)
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO migration_conflicts (migration_name, source_table, source_row_id, original_row_json, conflict_reason) VALUES (?, ?, ?, ?, ?)",
+                        ("phase2_dedup", "published_tweets", r["id"], json.dumps(row_dict), "duplicate tweet_id")
+                    )
+                    cursor.execute("DELETE FROM published_tweets WHERE id = ?", (r["id"],))
+
+            # Deduplicate published_tweets by draft_id
+            cursor.execute("""
+                SELECT id, draft_id, tweet_id, published_at FROM published_tweets
+                WHERE draft_id IN (
+                    SELECT draft_id FROM published_tweets GROUP BY draft_id HAVING COUNT(*) > 1
+                )
+                ORDER BY published_at ASC, id ASC
+            """)
+            rows = cursor.fetchall()
+            seen_drafts = set()
+            for r in rows:
+                if r['draft_id'] not in seen_drafts:
+                    seen_drafts.add(r['draft_id'])
+                else:
+                    row_dict = dict(r)
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO migration_conflicts (migration_name, source_table, source_row_id, original_row_json, conflict_reason) VALUES (?, ?, ?, ?, ?)",
+                        ("phase2_dedup", "published_tweets", r["id"], json.dumps(row_dict), "duplicate draft_id")
+                    )
+                    cursor.execute("DELETE FROM published_tweets WHERE id = ?", (r["id"],))
+
+            conn.commit()
+            
+            # 4. Unique indexes creation
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_created ON drafts(status, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_scheduled ON drafts(status, scheduled_at)')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_tweet_id ON published_tweets(tweet_id)')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_draft_id ON published_tweets(draft_id)')
+            
+            # 5. Transient status recovery
+            cursor.execute("UPDATE drafts SET status = 'new', updated_at = CURRENT_TIMESTAMP WHERE status = 'processing'")
+            cursor.execute("UPDATE drafts SET status = 'review', last_error = 'Recovered after crash during publishing', updated_at = CURRENT_TIMESTAMP WHERE status = 'publishing'")
+            
+            # Також media recovery (not part of main state machine but good to keep)
             cursor.execute(
                 "UPDATE drafts SET media_status = 'failed', "
                 "media_error = 'Process restart during generation' "
@@ -116,7 +236,6 @@ class Database:
             conn.commit()
             logger.debug(f"Database initialized at {self.db_path}")
 
-            # Реєструємо дефолтні налаштування для Scheduler, якщо їх ще немає
             if self.get_setting("publish_delay_minutes") is None:
                 self.set_setting("publish_delay_minutes", 45)
             if self.get_setting("publish_jitter_percent") is None:
@@ -125,12 +244,45 @@ class Database:
                 self.set_setting("max_retries", 3)
             if self.get_setting("scheduler_check_interval_seconds") is None:
                 self.set_setting("scheduler_check_interval_seconds", 60)
-                
-            # Реєструємо дефолтні налаштування для Semantic Memory
             if self.get_setting("semantic_top_k") is None:
                 self.set_setting("semantic_top_k", 2)
             if self.get_setting("minimum_similarity") is None:
                 self.set_setting("minimum_similarity", 0.82)
+
+    def _transition_draft(self, conn: sqlite3.Connection, draft_id: int, expected_statuses: Set[str], new_status: str, updates: dict = None) -> bool:
+        cursor = conn.cursor()
+        
+        # Check current status
+        cursor.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,))
+        row = cursor.fetchone()
+        if not row:
+            return False
+            
+        current_status = row['status']
+        if current_status not in expected_statuses:
+            return False
+            
+        if (current_status, new_status) not in ALLOWED_TRANSITIONS:
+            raise InvalidStateTransitionError(f"Forbidden transition: {current_status} -> {new_status}")
+            
+        updates = updates or {}
+        for k in updates.keys():
+            if k not in ALLOWED_UPDATE_COLUMNS:
+                raise InvalidUpdateColumnError(f"Column '{k}' is not in allowlist.")
+                
+        set_clauses = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+        params = [new_status]
+        
+        for k, v in updates.items():
+            set_clauses.append(f"{k} = ?")
+            params.append(v)
+            
+        params.extend([draft_id] + list(expected_statuses))
+        placeholders = ",".join(["?"] * len(expected_statuses))
+        
+        query = f"UPDATE drafts SET {', '.join(set_clauses)} WHERE id = ? AND status IN ({placeholders})"
+        cursor.execute(query, params)
+        return cursor.rowcount == 1
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         with self._get_connection() as conn:
@@ -138,7 +290,6 @@ class Database:
             cursor.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
             row = cursor.fetchone()
             if row:
-                import json
                 try:
                     return json.loads(row['value'])
                 except (json.JSONDecodeError, ValueError, TypeError):
@@ -148,7 +299,6 @@ class Database:
     def set_setting(self, key: str, value: Any):
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            import json
             str_val = json.dumps(value) if isinstance(value, (dict, list, bool, int, float)) else str(value)
             cursor.execute(
                 "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP",
@@ -156,98 +306,157 @@ class Database:
             )
             conn.commit()
 
-    def is_message_processed(self, source_id: str, source_channel: str) -> bool:
+    def add_message_and_draft(self, source_id: str, source_channel: str, original_text: str) -> Optional[int]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT 1 FROM processed_messages WHERE source_id = ? AND source_channel = ?",
-                (str(source_id), str(source_channel))
-            )
-            return cursor.fetchone() is not None
-
-    def mark_message_processed(self, source_id: str, source_channel: str) -> int:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO processed_messages (source_id, source_channel) VALUES (?, ?)",
-                (str(source_id), str(source_channel))
-            )
-            conn.commit()
-            return cursor.lastrowid
-
-    def create_draft(self, processed_message_id: int, original_text: str, rewritten_text: Optional[str] = None, status: str = 'new', reason: Optional[str] = None, confidence: Optional[float] = None) -> int:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO drafts (processed_message_id, original_text, rewritten_text, status, reason, confidence) VALUES (?, ?, ?, ?, ?, ?)",
-                (processed_message_id, original_text, rewritten_text, status, reason, confidence)
-            )
-            conn.commit()
-            return cursor.lastrowid
-
-    def update_draft_status(self, draft_id: int, status: str, last_error: Optional[str] = None):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Якщо статус rejected/ignored або approved, ми можемо скинути retry_count
-            if status in ['approved', 'ignored', 'failed']:
+            try:
+                conn.execute('BEGIN IMMEDIATE')
                 cursor.execute(
-                    "UPDATE drafts SET status = ?, updated_at = CURRENT_TIMESTAMP, last_error = ?, retry_count = 0 WHERE id = ?",
-                    (status, last_error, draft_id)
+                    "INSERT INTO processed_messages (source_id, source_channel) VALUES (?, ?)",
+                    (str(source_id), str(source_channel))
                 )
-            else:
+                processed_id = cursor.lastrowid
+                
                 cursor.execute(
-                    "UPDATE drafts SET status = ?, updated_at = CURRENT_TIMESTAMP, last_error = ? WHERE id = ?",
-                    (status, last_error, draft_id)
+                    "INSERT INTO drafts (processed_message_id, original_text, status) VALUES (?, ?, 'new')",
+                    (processed_id, original_text)
                 )
-            conn.commit()
-
-    def increment_retry_count(self, draft_id: int, error_msg: str):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE drafts SET retry_count = retry_count + 1, last_error = ?, last_retry_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (error_msg, draft_id)
-            )
-            conn.commit()
-
-    def record_published_tweet(self, draft_id: int, tweet_id: str):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO published_tweets (draft_id, tweet_id) VALUES (?, ?)",
-                (draft_id, str(tweet_id))
-            )
-            # Також оновлюємо статус чернетки
-            cursor.execute(
-                "UPDATE drafts SET status = 'published', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (draft_id,)
-            )
-            conn.commit()
+                draft_id = cursor.lastrowid
+                conn.commit()
+                return draft_id
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                return None
+            except Exception:
+                conn.rollback()
+                raise
 
     def fetch_next_new_draft(self) -> Optional[Dict[str, Any]]:
-        """Атомарно витягує наступне повідомлення для обробки, переводить його в PROCESSING."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # Знаходимо найстаріше нове повідомлення
+            conn.execute('BEGIN IMMEDIATE')
             cursor.execute("SELECT id FROM drafts WHERE status = 'new' ORDER BY created_at ASC LIMIT 1")
             row = cursor.fetchone()
             if not row:
                 return None
             draft_id = row['id']
             
-            # Намагаємось заблокувати його (захист від паралельних воркерів)
-            cursor.execute(
-                "UPDATE drafts SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'new'", 
-                (draft_id,)
-            )
-            if cursor.rowcount == 0:
-                return None # Інший воркер встиг перехопити
+            success = self._transition_draft(conn, draft_id, {"new"}, "processing")
+            if not success:
+                conn.rollback()
+                return None
                 
             cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
             draft = cursor.fetchone()
             conn.commit()
             return dict(draft) if draft else None
+
+    def complete_ai_processing(self, draft_id: int, new_status: str, updates: dict) -> bool:
+        with self._get_connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            success = self._transition_draft(conn, draft_id, {"processing"}, new_status, updates)
+            conn.commit()
+            return success
+
+    def approve_draft(self, draft_id: int, updates: dict = None) -> bool:
+        with self._get_connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            # review -> approved
+            updates = updates or {}
+            updates["retry_count"] = 0
+            success = self._transition_draft(conn, draft_id, {"review"}, "approved", updates)
+            conn.commit()
+            return success
+
+    def ignore_draft(self, draft_id: int) -> bool:
+        with self._get_connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            # review -> ignored
+            success = self._transition_draft(conn, draft_id, {"review"}, "ignored", {"retry_count": 0})
+            conn.commit()
+            return success
+
+    def fetch_next_approved_draft_for_publish(self) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            cursor.execute("SELECT id FROM drafts WHERE status = 'approved' AND (scheduled_at IS NULL OR scheduled_at <= CURRENT_TIMESTAMP) ORDER BY created_at ASC LIMIT 1")
+            row = cursor.fetchone()
+            if not row:
+                return None
+            draft_id = row['id']
+            
+            success = self._transition_draft(conn, draft_id, {"approved"}, "publishing")
+            if not success:
+                conn.rollback()
+                return None
+                
+            cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
+            draft = cursor.fetchone()
+            conn.commit()
+            return dict(draft) if draft else None
+
+    def record_publish_success(self, draft_id: int, tweet_id: str) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                success = self._transition_draft(conn, draft_id, {"publishing"}, "published")
+                if not success:
+                    conn.rollback()
+                    raise AmbiguousPublishStateError(f"Draft {draft_id} is not in publishing state.")
+                    
+                cursor.execute(
+                    "INSERT INTO published_tweets (draft_id, tweet_id) VALUES (?, ?)",
+                    (draft_id, str(tweet_id))
+                )
+                conn.commit()
+                return True
+            except Exception as e:
+                conn.rollback()
+                raise AmbiguousPublishStateError(f"Failed to record publish success for draft {draft_id}: {str(e)}")
+
+    def schedule_publish_retry(self, draft_id: int, scheduled_at_str: str, error_msg: str) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            
+            cursor.execute("SELECT retry_count FROM drafts WHERE id = ?", (draft_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            current_retry = row['retry_count'] + 1
+            
+            success = self._transition_draft(
+                conn, 
+                draft_id, 
+                {"publishing"}, 
+                "approved", 
+                {
+                    "scheduled_at": scheduled_at_str, 
+                    "retry_count": current_retry,
+                    "last_error": error_msg,
+                    "last_retry_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                }
+            )
+            conn.commit()
+            return success
+
+    def mark_publish_failed(self, draft_id: int, error_msg: str) -> bool:
+        with self._get_connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            success = self._transition_draft(
+                conn, 
+                draft_id, 
+                {"publishing"}, 
+                "failed", 
+                {
+                    "last_error": error_msg,
+                    "retry_count": 0
+                }
+            )
+            conn.commit()
+            return success
 
     def get_drafts_by_status(self, statuses: List[str]) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
@@ -260,55 +469,31 @@ class Database:
     def get_last_published_time(self) -> Optional[str]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # Шукаємо останній опублікований або такий що публікується твіт
             cursor.execute("SELECT updated_at FROM drafts WHERE status IN ('published', 'publishing') ORDER BY updated_at DESC LIMIT 1")
             row = cursor.fetchone()
             return row['updated_at'] if row else None
 
-    def fetch_next_approved_draft_for_publish(self) -> Optional[Dict[str, Any]]:
-        """Атомарно витягує наступний APPROVED твіт і переводить його в PUBLISHING."""
+    def update_draft_text(self, draft_id: int, new_text: str):
+        # Allow updating text in review state
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # Беремо найстаріший APPROVED, який готовий до публікації
-            # Якщо є scheduled_at, можна додавати логіку `AND (scheduled_at IS NULL OR scheduled_at <= CURRENT_TIMESTAMP)`
-            cursor.execute("SELECT id FROM drafts WHERE status = 'approved' AND (scheduled_at IS NULL OR scheduled_at <= CURRENT_TIMESTAMP) ORDER BY created_at ASC LIMIT 1")
-            row = cursor.fetchone()
-            if not row:
-                return None
-            draft_id = row['id']
-            
-            # Намагаємось заблокувати його
-            cursor.execute(
-                "UPDATE drafts SET status = 'publishing', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'approved'", 
-                (draft_id,)
-            )
-            if cursor.rowcount == 0:
-                return None # Інший процес встиг перехопити
-                
-            cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
-            draft = cursor.fetchone()
+            cursor.execute("UPDATE drafts SET rewritten_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('review')", (new_text, draft_id))
             conn.commit()
-            return dict(draft) if draft else None
 
     def get_analytics(self) -> Dict[str, Any]:
-        """Повертає базову аналітику для дашборду."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            # Всього сьогодні
             cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE date(created_at) = date('now')")
             total_today = cursor.fetchone()['c']
             
-            # Опубліковано сьогодні
             cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE status IN ('published', 'approved', 'publishing') AND date(updated_at) = date('now')")
             published_today = cursor.fetchone()['c']
             
-            # Відхилено сьогодні
             cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE status IN ('ignored', 'failed') AND date(updated_at) = date('now')")
             ignored_today = cursor.fetchone()['c']
             
-            # На розгляді (загалом, не тільки сьогодні)
-            cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE status IN ('review', 'pending')")
+            cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE status IN ('review')")
             pending_total = cursor.fetchone()['c']
             
             return {
@@ -318,48 +503,4 @@ class Database:
                 "pending_total": pending_total
             }
 
-
-
-
-    def recover_stuck_drafts(self):
-        """Відновлює драфти, що зависли в проміжних статусах після крашу.
-        processing -> new (безпечно переобробити LLM-ом)
-        publishing -> review (НЕ approved: твіт міг вже піти, людина має перевірити)
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE drafts SET status = 'new', updated_at = CURRENT_TIMESTAMP WHERE status = 'processing'"
-            )
-            recovered_processing = cursor.rowcount
-            cursor.execute(
-                "UPDATE drafts SET status = 'review', last_error = 'Recovered after crash during publishing', "
-                "updated_at = CURRENT_TIMESTAMP WHERE status = 'publishing'"
-            )
-            recovered_publishing = cursor.rowcount
-            conn.commit()
-        if recovered_processing or recovered_publishing:
-            logger.warning(
-                f"Crash recovery: {recovered_processing} drafts -> new, "
-                f"{recovered_publishing} drafts -> review"
-            )
-
-# Singleton для імпорту в інших файлах
 db = Database()
-
-if __name__ == "__main__":
-    logger.info("Testing database connection and initialization...")
-    test_db = Database("test_db.sqlite")
-    
-    # Test processed
-    msg_id = test_db.mark_message_processed("123", "test_channel")
-    assert test_db.is_message_processed("123", "test_channel") == True
-    
-    # Test draft
-    draft_id = test_db.create_draft(msg_id, "Original", "Rewritten")
-    test_db.update_draft_status(draft_id, "approved")
-    
-    # Test publish
-    test_db.record_published_tweet(draft_id, "999999")
-    
-    logger.success("Database operations verified successfully!")

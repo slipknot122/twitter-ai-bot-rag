@@ -53,7 +53,7 @@ class TwitterPublisher:
             logger.info(f"[DRY RUN] Tweet text:\n{text}")
             if full_media_path and full_media_path.exists():
                 logger.info(f"[DRY RUN] Attached Media: {full_media_path}")
-            db.record_published_tweet(draft_id, f"mock_tweet_{draft_id}")
+            db.record_publish_success(draft_id, f"mock_tweet_{draft_id}")
             return True
 
         if not self.client or not self.api_v1:
@@ -77,7 +77,7 @@ class TwitterPublisher:
         tweet_id = response.data['id']
         logger.success(f"Tweet published successfully! ID: {tweet_id}")
 
-        db.record_published_tweet(draft_id, str(tweet_id))
+        db.record_publish_success(draft_id, str(tweet_id))
         return True
 
 publisher = TwitterPublisher()

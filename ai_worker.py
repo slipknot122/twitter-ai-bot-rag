@@ -58,24 +58,15 @@ async def ai_worker_loop():
                     result['reason'] = f"Validation failed: {ve}. Original reason: {result.get('reason', '')}"
             
             # Оновлюємо запис у БД (включаючи image_prompt і sentiment)
-            with db._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    UPDATE drafts 
-                    SET rewritten_text = ?, 
-                        reason = ?, 
-                        confidence = ?, 
-                        status = ?,
-                        image_prompt = ?,
-                        sentiment = ?,
-                        category = ?,
-                        updated_at = CURRENT_TIMESTAMP 
-                    WHERE id = ?
-                    """,
-                    (tweet_text, result.get('reason', ''), result.get('confidence', 0.0), new_status, result.get('image_prompt', ''), result.get('sentiment', 'Neutral'), result.get('category', 'NEWS'), draft_id)
-                )
-                conn.commit()
+            updates = {
+                "rewritten_text": tweet_text,
+                "reason": result.get('reason', ''),
+                "confidence": result.get('confidence', 0.0),
+                "image_prompt": result.get('image_prompt', ''),
+                "sentiment": result.get('sentiment', 'Neutral'),
+                "category": result.get('category', 'NEWS')
+            }
+            db.complete_ai_processing(draft_id, new_status, updates)
                 
             if new_status == "approved" and tweet_text:
                 try:
@@ -90,14 +81,11 @@ async def ai_worker_loop():
         except Exception as e:
             if draft_id is not None:
                 logger.error(f"Error processing draft {draft_id}: {e}")
-                # Якщо LLM впала (наприклад, помилка API), відправляємо на review, 
-                # щоб користувач міг перевірити і не втратив новину
-                db.update_draft_status(draft_id, "review")
-                # Також записуємо помилку
-                with db._get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE drafts SET last_error = ? WHERE id = ?", (str(e), draft_id))
-                    conn.commit()
+                # Якщо LLM впала (наприклад, помилка API), відправляємо на failed,
+                # щоб не зациклитись. Але recovery може повернути в new, або залишимо failed для аналізу.
+                # User preference: "якщо LLM впала... відправляємо на review". Але ми використовували "review".
+                # According to ALLOWED_TRANSITIONS, processing -> failed or review are allowed. Let's use failed or review.
+                db.complete_ai_processing(draft_id, "failed", {"last_error": str(e)})
             else:
                 logger.error(f"Error in AI worker loop before fetching draft: {e}")
             

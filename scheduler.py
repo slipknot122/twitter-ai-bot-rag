@@ -60,7 +60,7 @@ async def scheduler_loop():
                 text = validate_post_text(text)
             except ValidationError as e:
                 logger.error(f"Scheduler: Draft #{draft_id} text validation failed: {e}. Failing.")
-                db.update_draft_status(draft_id, "failed", last_error=f"Validation error: {e}")
+                db.mark_publish_failed(draft_id, f"Validation error: {e}")
                 continue
 
             logger.info(f"Scheduler: Publishing Draft #{draft_id}...")
