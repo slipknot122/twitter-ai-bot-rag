@@ -19,6 +19,11 @@ from semantic_memory import semantic_memory
 from media_builder import media_builder, MediaGenerationError
 from loguru import logger
 
+from config import settings
+
+if settings.web_admin_host not in {"127.0.0.1", "localhost", "::1"}:
+    raise RuntimeError("Web admin must bind to localhost for security reasons.")
+
 app = FastAPI(title="Twitter AI Bot Admin")
 
 templates_dir = Path(__file__).parent / "templates"
@@ -316,5 +321,48 @@ def logs_page(request: Request, filter: str = "ALL"):
             "request": request,
             "logs": logs_content,
             "current_filter": filter
+        }
+    )
+
+@app.get("/status", response_class=HTMLResponse)
+def status_page(request: Request):
+    # Check Gemini
+    from config import settings
+    gemini_configured = bool(settings.gemini_api_key)
+    
+    # Check Telegram
+    telegram_configured = bool(settings.telegram_api_id and settings.telegram_api_hash and settings.telegram_session_string)
+    
+    # Check X (Twitter)
+    twitter_configured = bool(settings.twitter_api_key and settings.twitter_api_secret and settings.twitter_access_token and settings.twitter_access_token_secret)
+    
+    # Check Cloudflare
+    cloudflare_configured = bool(settings.cloudflare_account_id and settings.cloudflare_api_token)
+    
+    # Check Pollinations
+    # Pollinations works without a key currently, so it's configured if we have the model string or by default.
+    pollinations_configured = True 
+    
+    # Check Database
+    db_status = "Available"
+    try:
+        with db._get_connection() as conn:
+            conn.execute("SELECT 1")
+    except Exception:
+        db_status = "Error"
+        
+    return templates.TemplateResponse(
+        request=request, name="status.html", context={
+            "request": request,
+            "gemini_status": "Configured" if gemini_configured else "Missing",
+            "telegram_status": "Configured" if telegram_configured else "Missing",
+            "twitter_status": "Configured" if twitter_configured else "Missing",
+            "cloudflare_status": "Configured" if cloudflare_configured else "Missing",
+            "pollinations_status": "Configured" if pollinations_configured else "Missing",
+            "twitter_dry_run": settings.twitter_dry_run,
+            "admin_bind": settings.web_admin_host,
+            "db_status": db_status,
+            "media_enabled": settings.media_generation_enabled,
+            "media_providers": settings.media_provider_order
         }
     )

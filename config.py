@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     
     # App config
     telegram_channels: List[str] = Field(default_factory=list) # e.g. ["test_channel"]
+    web_admin_host: str = Field(default="127.0.0.1")
 
     # --- Media Generation ---
     media_generation_enabled: bool = Field(default=False)

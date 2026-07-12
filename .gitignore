@@ -5,6 +5,10 @@ __pycache__/
 
 # Environments
 .env
+.env.*
+!.env.example
+*.env.bak
+.env.backup*
 .venv
 env/
 venv/
