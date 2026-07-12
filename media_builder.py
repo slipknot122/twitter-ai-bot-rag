@@ -63,6 +63,85 @@ class MediaProvider(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Google Imagen Provider
+# ---------------------------------------------------------------------------
+
+class GoogleImagenProvider:
+    """
+    Google Imagen (через Gemini API).
+    Використовує ключ GEMINI_API_KEY з конфігу.
+    """
+    name = "google"
+
+    def __init__(self):
+        self.api_key = settings.gemini_api_key
+        # Використовуємо актуальну Imagen 4 (якщо є доступ)
+        self.model = "imagen-4.0-generate-001"
+
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
+
+    def generate(self, prompt: str, output_path: Path,
+                 width: int, height: int, timeout: int) -> Path:
+        if not self.is_configured():
+            raise PermanentMediaError("Google Gemini API key not configured")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:predict?key={self.api_key}"
+        
+        # Визначаємо aspect ratio
+        aspect_ratio = "1:1"
+        if width > height:
+            aspect_ratio = "16:9" if width / height >= 1.5 else "4:3"
+        elif height > width:
+            aspect_ratio = "9:16" if height / width >= 1.5 else "3:4"
+
+        payload = {
+            "instances": [{"prompt": prompt}],
+            "parameters": {
+                "sampleCount": 1,
+                "aspectRatio": aspect_ratio,
+                "outputOptions": {"mimeType": "image/jpeg"}
+            }
+        }
+
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout)
+        except requests.Timeout:
+            raise TransientMediaError("Google Imagen: timeout")
+        except requests.ConnectionError as e:
+            raise TransientMediaError(f"Google Imagen: connection error: {e}")
+
+        if resp.status_code == 400:
+            err = resp.json().get("error", {}).get("message", "")
+            if "paid plans" in err.lower() or "not supported" in err.lower():
+                # Якщо акаунт безкоштовний, падаємо транзитно, щоб спрацював Pollinations
+                raise TransientMediaError(f"Google Imagen: Free tier limit or not available ({err})")
+            raise PermanentMediaError(f"Google Imagen: Bad Request (400) - {err}")
+            
+        if resp.status_code == 429:
+            raise TransientMediaError("Google Imagen: rate limited (429)")
+            
+        if resp.status_code != 200:
+            raise TransientMediaError(f"Google Imagen: unexpected status {resp.status_code}. {resp.text}")
+
+        data = resp.json()
+        predictions = data.get("predictions", [])
+        if not predictions:
+            raise TransientMediaError("Google Imagen: no predictions returned")
+            
+        b64_image = predictions[0].get("bytesBase64Encoded")
+        if not b64_image:
+            raise TransientMediaError("Google Imagen: no image bytes in response")
+
+        import base64
+        try:
+            image_bytes = base64.b64decode(b64_image)
+            return image_bytes
+        except Exception as e:
+            raise TransientMediaError(f"Google Imagen: failed to decode base64: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Cloudflare Workers AI Provider
 # ---------------------------------------------------------------------------
 
@@ -297,6 +376,7 @@ class MediaBuilder:
 
     def __init__(self):
         self._providers: dict[str, object] = {
+            "google": GoogleImagenProvider(),
             "cloudflare": CloudflareProvider(),
             "pollinations": PollinationsProvider(),
         }

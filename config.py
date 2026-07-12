@@ -32,7 +32,7 @@ class Settings(BaseSettings):
 
     # --- Media Generation ---
     media_generation_enabled: bool = Field(default=False)
-    media_provider_order: str = Field(default="cloudflare,pollinations")
+    media_provider_order: str = Field(default="google,cloudflare,pollinations")
     
     # Cloudflare Workers AI
     cloudflare_account_id: str = Field(default="")
