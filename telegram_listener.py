@@ -8,7 +8,15 @@ from database import db
 # Ми використовуємо session name 'bot_session', який створить файл bot_session.session
 client = TelegramClient('bot_session', settings.telegram_api_id, settings.telegram_api_hash)
 
-@client.on(events.NewMessage(chats=settings.telegram_channels))
+# Telethon requires integer IDs for negative chat IDs, but they come as strings from config
+parsed_channels = []
+for c in settings.telegram_channels:
+    try:
+        parsed_channels.append(int(c))
+    except ValueError:
+        parsed_channels.append(c)
+
+@client.on(events.NewMessage(chats=parsed_channels))
 async def handle_new_message(event):
     """
     Обробник нових повідомлень з Telegram.

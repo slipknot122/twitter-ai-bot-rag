@@ -30,6 +30,29 @@ class Settings(BaseSettings):
     # App config
     telegram_channels: List[str] = Field(default_factory=list) # e.g. ["test_channel"]
 
+    # --- Media Generation ---
+    media_generation_enabled: bool = Field(default=False)
+    media_provider_order: str = Field(default="cloudflare,pollinations")
+    
+    # Cloudflare Workers AI
+    cloudflare_account_id: str = Field(default="")
+    cloudflare_api_token: str = Field(default="")
+    cloudflare_image_model: str = Field(default="@cf/black-forest-labs/flux-1-schnell")
+    
+    # Pollinations (fallback)
+    pollinations_api_key: str = Field(default="")
+    pollinations_image_model: str = Field(default="flux")
+    
+    # Hugging Face (prepared, not connected in V1)
+    hf_token: str = Field(default="")
+    hf_image_model: str = Field(default="black-forest-labs/FLUX.1-schnell")
+    
+    # Image settings
+    media_image_width: int = Field(default=1200)
+    media_image_height: int = Field(default=675)
+    media_generation_timeout: int = Field(default=60)
+    media_max_bytes: int = Field(default=10_000_000)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

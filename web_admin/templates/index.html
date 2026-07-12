@@ -324,6 +324,122 @@
         ::-webkit-scrollbar-thumb:hover {
             background: rgba(255, 255, 255, 0.3);
         }
+
+        /* Media Preview */
+        .media-section {
+            margin-top: 1.5rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--card-border);
+        }
+
+        .media-section h3 {
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 0.75rem;
+        }
+
+        .media-preview-container {
+            display: flex;
+            gap: 1.5rem;
+            align-items: flex-start;
+        }
+
+        .media-preview-img {
+            max-width: 300px;
+            max-height: 200px;
+            border-radius: 0.5rem;
+            border: 1px solid var(--card-border);
+            object-fit: cover;
+        }
+
+        .media-controls {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .prompt-input {
+            width: 100%;
+            min-height: 60px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--card-border);
+            border-radius: 0.5rem;
+            color: var(--text-main);
+            padding: 0.75rem;
+            font-family: inherit;
+            font-size: 0.9rem;
+            resize: vertical;
+        }
+
+        .prompt-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .media-buttons {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .btn-media {
+            padding: 0.4rem 0.8rem;
+            border-radius: 0.4rem;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            border: 1px solid rgba(139, 92, 246, 0.3);
+            background: rgba(139, 92, 246, 0.1);
+            color: #c4b5fd;
+            transition: all 0.2s ease;
+        }
+
+        .btn-media:hover {
+            background: rgba(139, 92, 246, 0.2);
+            color: #ddd6fe;
+        }
+
+        .btn-media:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-media-remove {
+            border-color: rgba(239, 68, 68, 0.3);
+            background: rgba(239, 68, 68, 0.1);
+            color: #fca5a5;
+        }
+
+        .btn-media-remove:hover {
+            background: rgba(239, 68, 68, 0.2);
+        }
+
+        .media-status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.2rem 0.6rem;
+            border-radius: 9999px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .media-status-none { background: rgba(100, 116, 139, 0.2); color: #94a3b8; }
+        .media-status-generating {
+            background: rgba(139, 92, 246, 0.2);
+            color: #c4b5fd;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        .media-status-ready { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; }
+        .media-status-failed { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
     </style>
 </head>
 <body>
@@ -407,6 +523,62 @@
                     </div>
                 </div>
 
+                <!-- Media Preview Section -->
+                <div class="media-section" id="media-section-{{ draft.id }}">
+                    <h3>
+                        🖼️ Media Preview
+                        <span class="media-status-badge media-status-{{ draft.media_status|default('none') }}" id="media-badge-{{ draft.id }}">
+                            {% if draft.media_status == 'generating' %}⏳ Generating...
+                            {% elif draft.media_status == 'ready' %}✅ Ready ({{ draft.media_provider }})
+                            {% elif draft.media_status == 'failed' %}❌ Failed
+                            {% else %}○ No image
+                            {% endif %}
+                        </span>
+                    </h3>
+
+                    <div class="media-preview-container">
+                        <!-- Image preview -->
+                        <div id="media-preview-{{ draft.id }}">
+                            {% if draft.media_status == 'ready' and draft.media_path %}
+                            <img src="/media/{{ draft.media_path.split('/')[-1] }}" class="media-preview-img" alt="Generated preview">
+                            {% elif draft.media_status == 'generating' %}
+                            <div style="width:200px;height:120px;display:flex;align-items:center;justify-content:center;background:rgba(139,92,246,0.1);border-radius:0.5rem;border:1px dashed rgba(139,92,246,0.3);">
+                                <span style="color:#c4b5fd;font-size:0.9rem;">⏳ Generating...</span>
+                            </div>
+                            {% endif %}
+                        </div>
+
+                        <!-- Controls -->
+                        <div class="media-controls">
+                            <label style="color:var(--text-muted);font-size:0.8rem;">Image Prompt:</label>
+                            <textarea class="prompt-input" id="prompt-{{ draft.id }}" placeholder="Describe the image you want (min 20 chars)...">{{ draft.image_prompt if draft.image_prompt else '' }}</textarea>
+
+                            <div class="media-buttons">
+                                {% if draft.media_status == 'ready' %}
+                                <button class="btn-media" onclick="generateImage({{ draft.id }}, true)">🔄 Regenerate</button>
+                                <button class="btn-media btn-media-remove" onclick="removeImage({{ draft.id }})">🗑️ Remove</button>
+                                {% elif draft.media_status == 'generating' %}
+                                <button class="btn-media" disabled>⏳ Generating...</button>
+                                {% else %}
+                                <button class="btn-media" onclick="generateImage({{ draft.id }}, false)">🎨 Generate Image</button>
+                                {% endif %}
+                            </div>
+
+                            {% if draft.media_error %}
+                            <div style="padding:0.5rem;background:rgba(239,68,68,0.1);border-left:3px solid var(--danger);border-radius:0.25rem;font-size:0.8rem;color:#fca5a5;">
+                                {{ draft.media_error }}
+                            </div>
+                            {% endif %}
+
+                            {% if draft.media_status == 'ready' %}
+                            <div style="font-size:0.75rem;color:var(--text-muted);">
+                                {{ draft.media_width }}×{{ draft.media_height }} · {{ (draft.media_size_bytes / 1024)|int }}KB · {{ draft.media_provider }}
+                            </div>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+
                 <div class="actions">
                     {% if current_tab == 'review' %}
                         <button class="btn-ignore" onclick="ignoreDraft({{ draft.id }})">
@@ -421,6 +593,15 @@
                             <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
                             Approve for Publish
                         </button>
+                    {% elif current_tab == 'approved' %}
+                        <button class="btn-ignore" onclick="ignoreDraft({{ draft.id }})">
+                            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                            Cancel & Move to Ignored
+                        </button>
+                        <button class="btn-save" onclick="saveDraft({{ draft.id }})">
+                            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
+                            Save Edit
+                        </button>
                     {% else %}
                         <button class="btn-save" onclick="saveDraft({{ draft.id }})">
                             <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
@@ -434,6 +615,142 @@
     </div>
 
     <script>
+        // Media generation polling intervals
+        const _pollingIntervals = {};
+
+        async function generateImage(id, regenerate) {
+            const promptEl = document.getElementById(`prompt-${id}`);
+            const prompt = promptEl ? promptEl.value.trim() : '';
+
+            if (prompt.length < 20) {
+                alert('Image prompt must be at least 20 characters.');
+                return;
+            }
+
+            try {
+                const resp = await fetch(`/api/drafts/${id}/image`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image_prompt: prompt, regenerate: regenerate })
+                });
+
+                if (resp.status === 409) {
+                    alert('Image generation already in progress!');
+                    return;
+                }
+                if (resp.status === 400) {
+                    const data = await resp.json();
+                    alert(data.detail || 'Bad request');
+                    return;
+                }
+                if (resp.status === 202) {
+                    updateMediaUI(id, 'generating', null, null);
+                    startPolling(id);
+                }
+            } catch (e) {
+                console.error('Generate image error:', e);
+            }
+        }
+
+        async function removeImage(id) {
+            if (!confirm('Remove this image?')) return;
+            try {
+                const resp = await fetch(`/api/drafts/${id}/image`, { method: 'DELETE' });
+                if (resp.ok) {
+                    updateMediaUI(id, 'none', null, null);
+                }
+            } catch (e) {
+                console.error('Remove image error:', e);
+            }
+        }
+
+        function startPolling(id) {
+            if (_pollingIntervals[id]) return;
+            _pollingIntervals[id] = setInterval(() => pollImageStatus(id), 3000);
+        }
+
+        async function pollImageStatus(id) {
+            try {
+                const resp = await fetch(`/api/drafts/${id}/image/status`);
+                if (!resp.ok) return;
+                const data = await resp.json();
+
+                if (data.media_status === 'ready') {
+                    clearInterval(_pollingIntervals[id]);
+                    delete _pollingIntervals[id];
+                    updateMediaUI(id, 'ready', data.media_url, data);
+                } else if (data.media_status === 'failed') {
+                    clearInterval(_pollingIntervals[id]);
+                    delete _pollingIntervals[id];
+                    updateMediaUI(id, 'failed', null, data);
+                }
+            } catch (e) {
+                console.error('Poll error:', e);
+            }
+        }
+
+        function updateMediaUI(id, status, mediaUrl, data) {
+            const badge = document.getElementById(`media-badge-${id}`);
+            const preview = document.getElementById(`media-preview-${id}`);
+            const section = document.getElementById(`media-section-${id}`);
+
+            // Update badge
+            if (badge) {
+                badge.className = `media-status-badge media-status-${status}`;
+                if (status === 'generating') badge.textContent = '⏳ Generating...';
+                else if (status === 'ready') badge.textContent = `✅ Ready (${data?.media_provider || ''})`;
+                else if (status === 'failed') badge.textContent = '❌ Failed';
+                else badge.textContent = '○ No image';
+            }
+
+            // Update preview image
+            if (preview) {
+                if (status === 'ready' && mediaUrl) {
+                    preview.innerHTML = `<img src="${mediaUrl}?t=${Date.now()}" class="media-preview-img" alt="Generated preview">`;
+                } else if (status === 'generating') {
+                    preview.innerHTML = '<div style="width:200px;height:120px;display:flex;align-items:center;justify-content:center;background:rgba(139,92,246,0.1);border-radius:0.5rem;border:1px dashed rgba(139,92,246,0.3);"><span style="color:#c4b5fd;font-size:0.9rem;">⏳ Generating...</span></div>';
+                } else {
+                    preview.innerHTML = '';
+                }
+            }
+
+            // Update buttons (reload section for simplicity)
+            const buttonsDiv = section?.querySelector('.media-buttons');
+            if (buttonsDiv) {
+                if (status === 'ready') {
+                    buttonsDiv.innerHTML = `
+                        <button class="btn-media" onclick="generateImage(${id}, true)">🔄 Regenerate</button>
+                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">🗑️ Remove</button>`;
+                } else if (status === 'generating') {
+                    buttonsDiv.innerHTML = '<button class="btn-media" disabled>⏳ Generating...</button>';
+                } else if (status === 'failed') {
+                    buttonsDiv.innerHTML = `<button class="btn-media" onclick="generateImage(${id}, false)">🎨 Retry Generate</button>`;
+                } else {
+                    buttonsDiv.innerHTML = `<button class="btn-media" onclick="generateImage(${id}, false)">🎨 Generate Image</button>`;
+                }
+            }
+
+            // Show/hide error
+            if (data?.media_error && status === 'failed') {
+                let errDiv = section?.querySelector('[data-media-error]');
+                if (!errDiv) {
+                    errDiv = document.createElement('div');
+                    errDiv.setAttribute('data-media-error', '1');
+                    errDiv.style.cssText = 'padding:0.5rem;background:rgba(239,68,68,0.1);border-left:3px solid var(--danger);border-radius:0.25rem;font-size:0.8rem;color:#fca5a5;margin-top:0.5rem;';
+                    section?.querySelector('.media-controls')?.appendChild(errDiv);
+                }
+                errDiv.textContent = data.media_error;
+            }
+        }
+
+        // Start polling for any cards already in 'generating' state
+        document.addEventListener('DOMContentLoaded', () => {
+            document.querySelectorAll('.media-status-generating').forEach(badge => {
+                const id = badge.id.replace('media-badge-', '');
+                if (id) startPolling(parseInt(id));
+            });
+        });
+
         async function publishDraft(id) {
             const text = document.getElementById(`editor-${id}`).value;
             const btn = document.querySelector(`#draft-${id} .btn-publish`);

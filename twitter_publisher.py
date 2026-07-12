@@ -1,5 +1,6 @@
 import tweepy
 from loguru import logger
+from pathlib import Path
 from config import settings
 from database import db
 
@@ -7,6 +8,7 @@ class TwitterPublisher:
     def __init__(self):
         self.dry_run = settings.twitter_dry_run
         self.client = None
+        self.api_v1 = None
 
         if not self.dry_run:
             if not all([settings.twitter_api_key, settings.twitter_api_secret,
@@ -15,35 +17,63 @@ class TwitterPublisher:
                 self.dry_run = True
             else:
                 try:
+                    # Client v2 for tweeting
                     self.client = tweepy.Client(
                         consumer_key=settings.twitter_api_key,
                         consumer_secret=settings.twitter_api_secret,
                         access_token=settings.twitter_access_token,
                         access_token_secret=settings.twitter_access_token_secret
                     )
-                    logger.success("Twitter Client initialized.")
+                    
+                    # API v1.1 for media upload
+                    auth = tweepy.OAuth1UserHandler(
+                        settings.twitter_api_key,
+                        settings.twitter_api_secret,
+                        settings.twitter_access_token,
+                        settings.twitter_access_token_secret
+                    )
+                    self.api_v1 = tweepy.API(auth)
+                    
+                    logger.success("Twitter Client (v2 + v1.1) initialized.")
                 except Exception as e:
                     logger.error(f"Failed to initialize Twitter client: {e}")
                     self.dry_run = True
 
-    def publish(self, draft_id: int, text: str) -> bool:
+    def publish(self, draft_id: int, text: str, media_path: str = None) -> bool:
         """
         Публікує текст в Twitter. Повертає True, якщо успішно.
         При помилці кидає виняток — retry-логіку обробляє RetryManager.
         """
+        full_media_path = None
+        if media_path:
+            full_media_path = Path(settings.db_path).parent / media_path
+
         if self.dry_run:
             logger.info(f"[DRY RUN] Would publish tweet for Draft ID {draft_id}:")
             logger.info(f"[DRY RUN] Tweet text:\n{text}")
+            if full_media_path and full_media_path.exists():
+                logger.info(f"[DRY RUN] Attached Media: {full_media_path}")
             db.record_published_tweet(draft_id, f"mock_tweet_{draft_id}")
             return True
 
-        if not self.client:
+        if not self.client or not self.api_v1:
             # Кидаємо виняток замість тихого False — RetryManager
             # класифікує це як permanent і переведе в failed
             raise RuntimeError("401 unauthorized: Twitter client is not available")
 
         logger.info(f"Publishing Draft ID {draft_id} to Twitter...")
-        response = self.client.create_tweet(text=text)
+        
+        media_ids = None
+        if full_media_path and full_media_path.exists():
+            try:
+                logger.info(f"Uploading media: {full_media_path.name}")
+                media = self.api_v1.media_upload(filename=str(full_media_path))
+                media_ids = [media.media_id]
+            except Exception as e:
+                logger.error(f"Failed to upload media: {e}")
+                raise RuntimeError(f"Media upload failed: {e}")
+
+        response = self.client.create_tweet(text=text, media_ids=media_ids)
         tweet_id = response.data['id']
         logger.success(f"Tweet published successfully! ID: {tweet_id}")
 

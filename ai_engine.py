@@ -23,7 +23,10 @@ You MUST output ONLY valid JSON format exactly like this, with no markdown code 
   "action": "PUBLISH",
   "confidence": 0.95,
   "reason": "market analysis",
-  "tweet_text": "Your English rewritten post here... (Leave empty string if action is IGNORE or REVIEW with no rewrite possible)"
+  "tweet_text": "Your English rewritten post here... (Leave empty string if action is IGNORE or REVIEW with no rewrite possible)",
+  "image_prompt": "A short English description (50-200 chars) for AI image generation. Describe a vivid, eye-catching scene that represents the news topic. Use cinematic style. Leave empty string if action is IGNORE.",
+  "sentiment": "Neutral", // MUST be exactly one of: "Bullish", "Bearish", "Neutral"
+  "category": "NEWS" // Return ONLY ONE of the allowed categories provided below.
 }
 
 REWRITE RULES (If action is PUBLISH or REVIEW):
@@ -45,7 +48,10 @@ class AIEngine:
         # Витягуємо налаштування з БД або використовуємо дефолтні
         current_prompt = db.get_setting("system_prompt", EDITOR_SYSTEM_PROMPT)
         current_temp = db.get_setting("llm_temperature", 0.7)
+        allowed_categories_str = db.get_setting("allowed_categories", "MARKET, LISTING, HACK, SECURITY, AIRDROP, FUNDING, REGULATION, PARTNERSHIP, TOKEN, AI, NFT, MEME, DEFI, STABLECOIN, EXCHANGE, NEWS")
         
+        # Динамічно додаємо інструкцію про категорії в кінець системного промпта
+        dynamic_prompt = f"{current_prompt}\n\nALLOWED CATEGORIES: You must choose exactly one category from this list: {allowed_categories_str}"
         
         # 1. Будуємо Soft Context
         context_str = context_builder.build_context(text)
@@ -58,9 +64,7 @@ class AIEngine:
         try:
             llm_output = llm.generate(
                 prompt=final_prompt,
-                system_prompt=current_prompt,
-                # Якщо llm_provider підтримує передачу temperature, можна додати:
-                # temperature=current_temp 
+                system_prompt=dynamic_prompt
             )
             
             # Парсимо JSON
@@ -79,6 +83,18 @@ class AIEngine:
             confidence = float(data.get("confidence", 0.0))
             reason = data.get("reason", "unknown")
             tweet_text = data.get("tweet_text", "")
+            image_prompt = data.get("image_prompt", "")
+            sentiment = data.get("sentiment", "Neutral")
+            category_raw = data.get("category", "NEWS").upper()
+
+            # Нормалізація категорії (Fallback на NEWS, якщо AI вигадав щось своє)
+            # Ми розбиваємо рядок allowed_categories на список
+            allowed_list = [c.strip().upper() for c in allowed_categories_str.split(',')]
+            if category_raw not in allowed_list:
+                logger.warning(f"AI returned unknown category '{category_raw}'. Fallback to NEWS.")
+                category = "NEWS"
+            else:
+                category = category_raw
 
             if action == "PUBLISH" and confidence < 0.75:
                 action = "REVIEW"
@@ -88,7 +104,10 @@ class AIEngine:
                 "action": action,
                 "confidence": confidence,
                 "reason": reason,
-                "tweet_text": tweet_text
+                "tweet_text": tweet_text,
+                "image_prompt": image_prompt,
+                "sentiment": sentiment,
+                "category": category
             }
             
         except json.JSONDecodeError as e:

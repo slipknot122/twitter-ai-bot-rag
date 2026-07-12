@@ -1,10 +1,14 @@
 import sys
 import os
+import asyncio
+import datetime
 from pathlib import Path
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from typing import Optional
+from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Додаємо кореневу папку в sys.path, щоб імпортувати наші модулі
 sys.path.append(str(Path(__file__).parent.parent))
@@ -12,12 +16,21 @@ sys.path.append(str(Path(__file__).parent.parent))
 from database import db
 from twitter_publisher import publisher
 from semantic_memory import semantic_memory
+from media_builder import media_builder, MediaGenerationError
 from loguru import logger
 
 app = FastAPI(title="Twitter AI Bot Admin")
 
 templates_dir = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(templates_dir))
+
+# Роздача media файлів через /media/{filename}
+media_dir = Path(__file__).parent.parent / "media"
+media_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=str(media_dir)), name="media")
+
+# Background tasks set — захист від garbage collection (рекомендація рев'юера)
+_background_tasks: set[asyncio.Task] = set()
 
 class UpdateDraftRequest(BaseModel):
     rewritten_text: str
@@ -29,6 +42,8 @@ class SettingsRequest(BaseModel):
     publish_jitter_percent: int
     max_retries: int
     scheduler_check_interval_seconds: int
+    image_overlay: str
+    allowed_categories: str
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, tab: str = "review"):
@@ -81,6 +96,168 @@ def update_draft(draft_id: int, request: UpdateDraftRequest):
         conn.commit()
     return {"status": "success"}
 
+
+# ---------------------------------------------------------------------------
+# Media Generation API
+# ---------------------------------------------------------------------------
+
+class GenerateImageRequest(BaseModel):
+    image_prompt: Optional[str] = Field(default=None, min_length=20, max_length=1500)
+    regenerate: bool = False
+
+
+@app.post("/api/drafts/{draft_id}/image", status_code=202)
+async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] = None):
+    """
+    Запускає генерацію зображення у фоні. Повертає 202 Accepted.
+    Атомарна зміна статусу захищає від подвійного кліку.
+    """
+    # 1. Отримуємо драфт
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, image_prompt, media_status, media_path FROM drafts WHERE id = ?", (draft_id,))
+        draft = cursor.fetchone()
+
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # 2. Визначаємо промпт: з тіла запиту або з БД
+    prompt = None
+    if request and request.image_prompt:
+        prompt = request.image_prompt
+    elif draft["image_prompt"]:
+        prompt = draft["image_prompt"]
+    
+    if not prompt or len(prompt.strip()) < 20:
+        raise HTTPException(status_code=400, detail="image_prompt is required (min 20 chars)")
+
+    # 3. Атомарна зміна статусу (захист від подвійного кліку)
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE drafts SET media_status = 'generating', media_error = NULL, "
+            "image_prompt = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND media_status != 'generating'",
+            (prompt, draft_id)
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=409, detail="Image generation already in progress")
+
+    # 4. Запускаємо фонову задачу (захищену від GC)
+    task = asyncio.create_task(_generate_image_background(draft_id, prompt, draft["media_path"] if request and request.regenerate else None))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    return {"draft_id": draft_id, "media_status": "generating"}
+
+
+async def _generate_image_background(draft_id: int, prompt: str, old_media_path: Optional[str] = None):
+    """
+    Фонова генерація зображення. При regeneration старий файл видаляється
+    тільки ПІСЛЯ успішної генерації нового.
+    """
+    try:
+        result = await asyncio.to_thread(media_builder.generate, draft_id, prompt)
+
+        if result:
+            # Успіх — оновлюємо БД
+            now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            with db._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE drafts SET media_status = 'ready', media_path = ?, "
+                    "media_provider = ?, media_mime_type = ?, media_size_bytes = ?, "
+                    "media_width = ?, media_height = ?, media_error = NULL, "
+                    "media_created_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (result["media_path"], result["media_provider"], result["mime_type"],
+                     result["size_bytes"], result["width"], result["height"], now_utc, draft_id)
+                )
+                conn.commit()
+
+            # Видаляємо старий файл тільки після успіху нового
+            if old_media_path and old_media_path != result["media_path"]:
+                media_builder.delete_media_file(old_media_path)
+
+            logger.success(f"Background image generation completed for draft {draft_id}")
+        else:
+            # Усі провайдери впали
+            with db._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE drafts SET media_status = 'failed', "
+                    "media_error = 'All providers failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (draft_id,)
+                )
+                conn.commit()
+
+    except Exception as e:
+        logger.error(f"Background image generation error for draft {draft_id}: {e}")
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE drafts SET media_status = 'failed', "
+                "media_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (str(e)[:500], draft_id)
+            )
+            conn.commit()
+
+
+@app.delete("/api/drafts/{draft_id}/image")
+def delete_image(draft_id: int):
+    """Безпечне видалення зображення."""
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT media_path FROM drafts WHERE id = ?", (draft_id,))
+        draft = cursor.fetchone()
+
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Видаляємо файл (з перевіркою path traversal)
+    if draft["media_path"]:
+        media_builder.delete_media_file(draft["media_path"])
+
+    # Очищаємо всі media-поля
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE drafts SET media_status = 'none', media_path = NULL, "
+            "media_error = NULL, media_provider = NULL, media_mime_type = NULL, "
+            "media_size_bytes = NULL, media_width = NULL, media_height = NULL, "
+            "media_created_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (draft_id,)
+        )
+        conn.commit()
+
+    return {"status": "success"}
+
+
+@app.get("/api/drafts/{draft_id}/image/status")
+def get_image_status(draft_id: int):
+    """Polling endpoint для статусу генерації."""
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT media_status, media_path, media_error, media_provider, "
+            "media_width, media_height, media_size_bytes, image_prompt "
+            "FROM drafts WHERE id = ?", (draft_id,)
+        )
+        draft = cursor.fetchone()
+
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    result = dict(draft)
+    # Не відправляємо абсолютний filesystem path — тільки URL для браузера
+    if result.get("media_path"):
+        filename = Path(result["media_path"]).name
+        result["media_url"] = f"/media/{filename}"
+    else:
+        result["media_url"] = None
+
+    return result
+
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request):
     # Import inside to avoid circular deps if any
@@ -91,6 +268,8 @@ def settings_page(request: Request):
     publish_jitter_percent = db.get_setting("publish_jitter_percent", 15)
     max_retries = db.get_setting("max_retries", 3)
     scheduler_check_interval_seconds = db.get_setting("scheduler_check_interval_seconds", 60)
+    image_overlay = db.get_setting("image_overlay", "btc_price")
+    allowed_categories = db.get_setting("allowed_categories", "MARKET, LISTING, HACK, SECURITY, AIRDROP, FUNDING, REGULATION, PARTNERSHIP, TOKEN, AI, NFT, MEME, DEFI, STABLECOIN, EXCHANGE, NEWS")
     
     return templates.TemplateResponse(
         request=request, name="settings.html", context={
@@ -100,7 +279,9 @@ def settings_page(request: Request):
             "publish_delay_minutes": publish_delay_minutes,
             "publish_jitter_percent": publish_jitter_percent,
             "max_retries": max_retries,
-            "scheduler_check_interval_seconds": scheduler_check_interval_seconds
+            "scheduler_check_interval_seconds": scheduler_check_interval_seconds,
+            "image_overlay": image_overlay,
+            "allowed_categories": allowed_categories
         }
     )
 
@@ -113,6 +294,8 @@ def update_settings(request: SettingsRequest):
     db.set_setting("publish_jitter_percent", request.publish_jitter_percent)
     db.set_setting("max_retries", request.max_retries)
     db.set_setting("scheduler_check_interval_seconds", request.scheduler_check_interval_seconds)
+    db.set_setting("image_overlay", request.image_overlay)
+    db.set_setting("allowed_categories", request.allowed_categories)
     return {"status": "success"}
 
 @app.get("/logs", response_class=HTMLResponse)

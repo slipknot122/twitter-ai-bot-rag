@@ -58,7 +58,8 @@ async def scheduler_loop():
             logger.info(f"Scheduler: Publishing Draft #{draft_id}...")
 
             def do_publish():
-                publisher.publish(draft_id, text)
+                media_path = draft.get("media_path") if draft.get("media_status") == "ready" else None
+                publisher.publish(draft_id, text, media_path=media_path)
 
             success = await retry_manager.execute_with_retries(draft_id, do_publish)
 

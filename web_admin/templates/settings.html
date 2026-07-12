@@ -109,6 +109,24 @@
                 </div>
             </div>
 
+            <h3 style="margin-bottom: 1rem; color: #cbd5e1; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem;">Image Overlay Widget</h3>
+            <div style="display: grid; grid-template-columns: 1fr; gap: 1rem; margin-bottom: 2rem;">
+                <div class="form-group">
+                    <label for="image-overlay">Widget Style</label>
+                    <p class="help">Choose what type of information to overlay on the generated image.</p>
+                    <select id="image-overlay" style="width: 100%; padding: 0.8rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); color: #fff; border-radius: 4px;">
+                        <option value="none" {% if image_overlay == 'none' %}selected{% endif %}>None (Clean Image)</option>
+                        <option value="btc_price" {% if image_overlay == 'btc_price' %}selected{% endif %}>BTC Price & Sentiment (Large)</option>
+                        <option value="category_badge" {% if image_overlay == 'category_badge' %}selected{% endif %}>Category Badge (Compact)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="allowed-categories">Allowed AI Categories</label>
+                    <p class="help">Comma-separated list of topics the AI can assign (e.g. MARKET, AIRDROP, HACK, LISTING). These will be drawn as badges if "Category Badge" is selected.</p>
+                    <textarea id="allowed-categories" style="min-height: 80px;">{{ allowed_categories }}</textarea>
+                </div>
+            </div>
+
             <h3 style="margin-bottom: 1rem; color: #cbd5e1; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem;">Scheduler & Retry Settings</h3>
 
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
@@ -142,6 +160,8 @@
         async function saveSettings(btn) {
             const prompt = document.getElementById('system-prompt').value;
             const shadowMode = document.getElementById('shadow-mode').checked;
+            const imageOverlay = document.getElementById('image-overlay').value;
+            const allowedCategories = document.getElementById('allowed-categories').value;
             const delay = parseInt(document.getElementById('publish-delay').value);
             const jitter = parseInt(document.getElementById('publish-jitter').value);
             const retries = parseInt(document.getElementById('max-retries').value);
@@ -155,6 +175,8 @@
                 body: JSON.stringify({ 
                     system_prompt: prompt, 
                     shadow_mode: shadowMode,
+                    image_overlay: imageOverlay,
+                    allowed_categories: allowedCategories,
                     publish_delay_minutes: delay,
                     publish_jitter_percent: jitter,
                     max_retries: retries,

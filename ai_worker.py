@@ -42,7 +42,7 @@ async def ai_worker_loop():
             
             new_status = status_map.get(action, "review")
             
-            # Оновлюємо запис у БД
+            # Оновлюємо запис у БД (включаючи image_prompt і sentiment)
             with db._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -51,11 +51,14 @@ async def ai_worker_loop():
                     SET rewritten_text = ?, 
                         reason = ?, 
                         confidence = ?, 
-                        status = ?, 
+                        status = ?,
+                        image_prompt = ?,
+                        sentiment = ?,
+                        category = ?,
                         updated_at = CURRENT_TIMESTAMP 
                     WHERE id = ?
                     """,
-                    (result.get('tweet_text', ''), result.get('reason', ''), result.get('confidence', 0.0), new_status, draft_id)
+                    (result.get('tweet_text', ''), result.get('reason', ''), result.get('confidence', 0.0), new_status, result.get('image_prompt', ''), result.get('sentiment', 'Neutral'), result.get('category', 'NEWS'), draft_id)
                 )
                 conn.commit()
                 

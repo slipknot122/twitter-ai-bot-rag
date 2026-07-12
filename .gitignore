@@ -32,3 +32,6 @@ bot.log
 
 *-shm
 *-wal
+
+# Generated media
+media/

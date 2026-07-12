@@ -86,13 +86,32 @@ class Database:
                 "scheduled_at DATETIME NULL",
                 "retry_count INTEGER DEFAULT 0",
                 "last_error TEXT NULL",
-                "last_retry_at DATETIME NULL"
+                "last_retry_at DATETIME NULL",
+                "media_path TEXT NULL",
+                "image_prompt TEXT NULL",
+                "media_status TEXT NOT NULL DEFAULT 'none'",
+                "media_error TEXT NULL",
+                "media_provider TEXT NULL",
+                "media_created_at TEXT NULL",
+                "media_mime_type TEXT NULL",
+                "media_size_bytes INTEGER NULL",
+                "media_width INTEGER NULL",
+                "media_height INTEGER NULL",
+                "sentiment TEXT NULL",
+                "category TEXT NULL"
             ]
             for col in new_columns:
                 try:
                     cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col}")
                 except sqlite3.OperationalError:
                     pass # Колонка вже існує
+            
+            # Recovery: якщо процес помер під час генерації медіа — позначити як failed
+            cursor.execute(
+                "UPDATE drafts SET media_status = 'failed', "
+                "media_error = 'Process restart during generation' "
+                "WHERE media_status = 'generating'"
+            )
             
             conn.commit()
             logger.debug(f"Database initialized at {self.db_path}")
