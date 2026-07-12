@@ -43,10 +43,10 @@ class UpdateDraftRequest(BaseModel):
 class SettingsRequest(BaseModel):
     system_prompt: str
     shadow_mode: bool
-    publish_delay_minutes: int
-    publish_jitter_percent: int
-    max_retries: int
-    scheduler_check_interval_seconds: int
+    publish_delay_minutes: int = Field(ge=1, le=1440)
+    publish_jitter_percent: int = Field(ge=0, le=100)
+    max_retries: int = Field(ge=0, le=10)
+    scheduler_check_interval_seconds: int = Field(ge=10, le=3600)
     image_overlay: str
     allowed_categories: str
 
@@ -70,21 +70,40 @@ def index(request: Request, tab: str = "review"):
 
 @app.post("/api/drafts/{draft_id}/publish")
 def publish_draft(draft_id: int):
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status, rewritten_text FROM drafts WHERE id = ?", (draft_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        if row['status'] not in ['review', 'pending']:
+            raise HTTPException(status_code=400, detail="Only drafts in review status can be approved")
+            
+        text = row['rewritten_text']
+        if not text or len(text.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Text is too short or empty")
+
     logger.info(f"Web Admin: Approving draft {draft_id} for Scheduler")
     db.update_draft_status(draft_id, "approved")
     
-    # Витягуємо текст для збереження у пам'ять
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT rewritten_text FROM drafts WHERE id = ?", (draft_id,))
-        row = cursor.fetchone()
-        if row and row['rewritten_text']:
-            semantic_memory.save(row['rewritten_text'])
+    if text:
+        semantic_memory.save(text)
             
     return {"status": "success"}
 
 @app.post("/api/drafts/{draft_id}/ignore")
 def ignore_draft(draft_id: int):
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        if row['status'] not in ['review', 'pending']:
+            raise HTTPException(status_code=400, detail="Only drafts in review status can be ignored")
+
     logger.info(f"Web Admin: Ignoring draft {draft_id}")
     db.update_draft_status(draft_id, "ignored")
     return {"status": "success"}
@@ -331,7 +350,8 @@ def status_page(request: Request):
     gemini_configured = bool(settings.gemini_api_key)
     
     # Check Telegram
-    telegram_configured = bool(settings.telegram_api_id and settings.telegram_api_hash and settings.telegram_session_string)
+    import os
+    telegram_configured = bool(settings.telegram_api_id and settings.telegram_api_hash and (settings.telegram_session_string or os.path.exists("bot_session.session")))
     
     # Check X (Twitter)
     twitter_configured = bool(settings.twitter_api_key and settings.twitter_api_secret and settings.twitter_access_token and settings.twitter_access_token_secret)

@@ -33,11 +33,14 @@ async def ai_worker_loop():
             # Маппимо екшени на статуси БД
             action = result.get('action', 'FAILED')
             
+            shadow_mode = db.get_setting("shadow_mode", True)
+            publish_status = "review" if shadow_mode else "approved"
+            
             status_map = {
-                "PUBLISH": "approved", # Одразу готові до публікації
+                "PUBLISH": publish_status,
                 "REVIEW": "review",
                 "IGNORE": "ignored",
-                "FAILED": "review" # Змінено з failed на review, щоб людина побачила помилку LLM
+                "FAILED": "review"
             }
             
             new_status = status_map.get(action, "review")

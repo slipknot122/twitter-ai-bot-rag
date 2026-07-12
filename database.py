@@ -141,7 +141,7 @@ class Database:
                 import json
                 try:
                     return json.loads(row['value'])
-                except:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     return row['value']
             return default
 

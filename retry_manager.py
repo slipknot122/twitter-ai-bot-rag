@@ -71,7 +71,7 @@ class RetryManager:
             logger.warning(f"RetryManager: Transient error on Draft {draft_id}: {error_msg}. Retry {current_retry}/{max_retries} in {delay_seconds} seconds.")
             
             import datetime
-            next_try = datetime.datetime.utcnow() + datetime.timedelta(seconds=delay_seconds)
+            next_try = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay_seconds)
             
             with db._get_connection() as conn:
                 cursor = conn.cursor()

@@ -2,7 +2,7 @@ from litellm import completion, embedding
 from loguru import logger
 from config import settings
 from tenacity import retry, wait_exponential, stop_after_attempt
-from typing import List
+from typing import List, Optional
 import os
 
 class LLMProvider:
@@ -11,8 +11,8 @@ class LLMProvider:
         # LiteLLM automatically picks up OPENAI_API_KEY from environment variables
         # If no key is set and we try to call it, litellm will throw an error.
         
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+    def generate(self, prompt: str, system_prompt: str = "", temperature: Optional[float] = None) -> str:
         """
         Відправляє запит до LLM через LiteLLM.
         """
@@ -46,7 +46,7 @@ class LLMProvider:
                     response = completion(
                         model=current_model,
                         messages=messages,
-                        temperature=settings.llm_temperature
+                        temperature=temperature if temperature is not None else settings.llm_temperature
                     )
                     result = response.choices[0].message.content
                     

@@ -32,11 +32,17 @@ class MediaGenerationError(Exception):
     """Базова помилка генерації медіа."""
     pass
 
-
 class PermanentMediaError(MediaGenerationError):
-    """Постійна помилка (не робити fallback): 401, 403, 400, moderation."""
+    """Постійна помилка, але може стосуватися лише одного провайдера."""
     pass
 
+class ProviderAuthError(PermanentMediaError):
+    """Помилка автентифікації конкретного провайдера (fallback дозволено)."""
+    pass
+
+class ContentRejectionError(PermanentMediaError):
+    """Помилка модерації або невалідний промпт (fallback ЗАБОРОНЕНО)."""
+    pass
 
 class TransientMediaError(MediaGenerationError):
     """Тимчасова помилка (fallback дозволено): timeout, 429, 5xx, мережа."""
@@ -56,8 +62,8 @@ class MediaProvider(Protocol):
                  width: int, height: int, timeout: int) -> Path:
         """
         Генерує зображення за промптом і зберігає на диск.
-        Повертає Path до збереженого файлу.
-        Кидає PermanentMediaError або TransientMediaError.
+        Повертає байти збереженого файлу (або Path, залежно від реалізації).
+        Кидає PermanentMediaError, ProviderAuthError, ContentRejectionError або TransientMediaError.
         """
         ...
 
@@ -82,9 +88,9 @@ class GoogleImagenProvider:
         return bool(self.api_key)
 
     def generate(self, prompt: str, output_path: Path,
-                 width: int, height: int, timeout: int) -> Path:
+                 width: int, height: int, timeout: int) -> bytes:
         if not self.is_configured():
-            raise PermanentMediaError("Google Gemini API key not configured")
+            raise ProviderAuthError("Google Gemini API key not configured")
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:predict?key={self.api_key}"
         
@@ -114,9 +120,11 @@ class GoogleImagenProvider:
         if resp.status_code == 400:
             err = resp.json().get("error", {}).get("message", "")
             if "paid plans" in err.lower() or "not supported" in err.lower():
-                # Якщо акаунт безкоштовний, падаємо транзитно, щоб спрацював Pollinations
                 raise TransientMediaError(f"Google Imagen: Free tier limit or not available ({err})")
-            raise PermanentMediaError(f"Google Imagen: Bad Request (400) - {err}")
+            raise ContentRejectionError(f"Google Imagen: Bad Request (400) - {err}")
+            
+        if resp.status_code in (401, 403):
+            raise ProviderAuthError(f"Google Imagen: auth error {resp.status_code}")
             
         if resp.status_code == 429:
             raise TransientMediaError("Google Imagen: rate limited (429)")
@@ -162,9 +170,9 @@ class CloudflareProvider:
         return bool(self.account_id and self.api_token)
 
     def generate(self, prompt: str, output_path: Path,
-                 width: int, height: int, timeout: int) -> Path:
+                 width: int, height: int, timeout: int) -> bytes:
         if not self.is_configured():
-            raise PermanentMediaError("Cloudflare credentials not configured")
+            raise ProviderAuthError("Cloudflare credentials not configured")
 
         url = (
             f"https://api.cloudflare.com/client/v4/accounts/"
@@ -191,9 +199,9 @@ class CloudflareProvider:
 
         # Класифікація помилок
         if resp.status_code in (401, 403):
-            raise PermanentMediaError(f"Cloudflare: auth error {resp.status_code}")
+            raise ProviderAuthError(f"Cloudflare: auth error {resp.status_code}")
         if resp.status_code == 400:
-            raise PermanentMediaError(f"Cloudflare: bad request: {resp.text[:300]}")
+            raise ContentRejectionError(f"Cloudflare: bad request: {resp.text[:300]}")
         if resp.status_code == 429:
             raise TransientMediaError("Cloudflare: rate limited (429)")
         if resp.status_code >= 500:
@@ -250,7 +258,7 @@ class PollinationsProvider:
         return True
 
     def generate(self, prompt: str, output_path: Path,
-                 width: int, height: int, timeout: int) -> Path:
+                 width: int, height: int, timeout: int) -> bytes:
         encoded_prompt = urllib.parse.quote(prompt)
         url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
         params = {
@@ -272,9 +280,9 @@ class PollinationsProvider:
             raise TransientMediaError(f"Pollinations: connection error: {e}")
 
         if resp.status_code in (401, 403):
-            raise PermanentMediaError(f"Pollinations: auth error {resp.status_code}")
+            raise ProviderAuthError(f"Pollinations: auth error {resp.status_code}")
         if resp.status_code == 400:
-            raise PermanentMediaError(f"Pollinations: bad request")
+            raise ContentRejectionError(f"Pollinations: bad request")
         if resp.status_code == 429:
             raise TransientMediaError("Pollinations: rate limited (429)")
         if resp.status_code >= 500:
@@ -485,11 +493,17 @@ class MediaBuilder:
                     **metadata,
                 }
 
-            except PermanentMediaError as e:
-                logger.error(f"MediaBuilder: Permanent error from {provider_name}: {e}")
+            except ContentRejectionError as e:
+                logger.error(f"MediaBuilder: Content rejection from {provider_name}: {e}")
                 last_error = str(e)
                 # НЕ переходимо до наступного — це постійна помилка
                 break
+
+            except ProviderAuthError as e:
+                logger.warning(f"MediaBuilder: Auth error from {provider_name}: {e}")
+                last_error = str(e)
+                # Переходимо до наступного провайдера
+                continue
 
             except TransientMediaError as e:
                 logger.warning(f"MediaBuilder: Transient error from {provider_name}: {e}")

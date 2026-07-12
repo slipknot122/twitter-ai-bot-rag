@@ -64,7 +64,8 @@ class AIEngine:
         try:
             llm_output = llm.generate(
                 prompt=final_prompt,
-                system_prompt=dynamic_prompt
+                system_prompt=dynamic_prompt,
+                temperature=current_temp
             )
             
             # Парсимо JSON
