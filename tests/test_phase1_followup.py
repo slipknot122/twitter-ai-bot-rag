@@ -88,10 +88,8 @@ async def test_shadow_mode_publish(mock_ai_engine, mock_db):
         await ai_worker_loop()
     except KeyboardInterrupt:
         pass
-    mock_db.update_draft_status.assert_not_called()
-    # verify that the update execute is called with "review"
-    args = mock_db._get_connection.return_value.__enter__.return_value.cursor.return_value.execute.call_args[0]
-    assert args[1][3] == "review" # new_status
+    mock_db.complete_ai_processing.assert_called_once()
+    assert mock_db.complete_ai_processing.call_args[0][1] == "review"
     
     # TEST 2: shadow_mode = False -> approved
     mock_db.reset_mock()
@@ -101,8 +99,8 @@ async def test_shadow_mode_publish(mock_ai_engine, mock_db):
         await ai_worker_loop()
     except KeyboardInterrupt:
         pass
-    args = mock_db._get_connection.return_value.__enter__.return_value.cursor.return_value.execute.call_args[0]
-    assert args[1][3] == "approved" # new_status
+    mock_db.complete_ai_processing.assert_called_once()
+    assert mock_db.complete_ai_processing.call_args[0][1] == "approved"
 
 @pytest.mark.anyio
 @patch('ai_worker.db')
@@ -118,8 +116,8 @@ async def test_shadow_mode_other_actions(mock_ai_engine, mock_db):
         await ai_worker_loop()
     except KeyboardInterrupt:
         pass
-    args = mock_db._get_connection.return_value.__enter__.return_value.cursor.return_value.execute.call_args[0]
-    assert args[1][3] == "review"
+    mock_db.complete_ai_processing.assert_called_once()
+    assert mock_db.complete_ai_processing.call_args[0][1] == "review"
 
     mock_db.reset_mock()
     mock_db.fetch_next_new_draft.side_effect = [mock_draft, KeyboardInterrupt("Stop loop")]
@@ -131,8 +129,8 @@ async def test_shadow_mode_other_actions(mock_ai_engine, mock_db):
         await ai_worker_loop()
     except KeyboardInterrupt:
         pass
-    args = mock_db._get_connection.return_value.__enter__.return_value.cursor.return_value.execute.call_args[0]
-    assert args[1][3] == "ignored"
+    mock_db.complete_ai_processing.assert_called_once()
+    assert mock_db.complete_ai_processing.call_args[0][1] == "ignored"
 
 # --- Media Fallback HTTP 400 Tests ---
 

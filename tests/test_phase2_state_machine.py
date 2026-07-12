@@ -52,11 +52,23 @@ def test_ingestion_rollback(db):
 
 def test_concurrent_duplicate_telegram(db):
     """test_concurrent_duplicate_telegram: Only one draft for a single telegram message id."""
-    draft1 = db.add_message_and_draft("1234", "chan1", "text")
-    draft2 = db.add_message_and_draft("1234", "chan1", "text")
+    barrier = threading.Barrier(2)
+    results = []
+
+    def insert_task():
+        barrier.wait()
+        res = db.add_message_and_draft("1234", "chan1", "text")
+        results.append(res)
+
+    t1 = threading.Thread(target=insert_task)
+    t2 = threading.Thread(target=insert_task)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     
-    assert draft1 is not None
-    assert draft2 is None # Duplicate ignored safely
+    assert None in results
+    assert len([r for r in results if r is not None]) == 1
 
 def test_update_column_allowlist(db):
     """test_update_column_allowlist: Raises exception."""
@@ -80,19 +92,41 @@ def test_double_approve_and_claim(db):
     db.fetch_next_new_draft() # -> processing
     db.complete_ai_processing(draft_id, "review", {})
     
-    # First approve succeeds
-    assert db.approve_draft(draft_id) is True
-    # Second approve fails (rowcount == 0) because expected status is "review"
-    assert db.approve_draft(draft_id) is False
+    barrier = threading.Barrier(2)
+    approve_results = []
+    def approve_task():
+        barrier.wait()
+        res = db.approve_draft(draft_id)
+        approve_results.append(res)
+        
+    t1 = threading.Thread(target=approve_task)
+    t2 = threading.Thread(target=approve_task)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     
-    # Claiming for publish
-    draft_info = db.fetch_next_approved_draft_for_publish()
-    assert draft_info is not None
-    assert draft_info['id'] == draft_id
+    assert approve_results.count(True) == 1
+    assert approve_results.count(False) == 1
     
-    # Second claim fails
-    draft_info2 = db.fetch_next_approved_draft_for_publish()
-    assert draft_info2 is None
+    barrier2 = threading.Barrier(2)
+    claim_results = []
+    def claim_task():
+        barrier2.wait()
+        res = db.fetch_next_approved_draft_for_publish()
+        claim_results.append(res)
+        
+    t3 = threading.Thread(target=claim_task)
+    t4 = threading.Thread(target=claim_task)
+    t3.start()
+    t4.start()
+    t3.join()
+    t4.join()
+    
+    successes = [r for r in claim_results if r is not None]
+    assert len(successes) == 1
+    assert claim_results.count(None) == 1
+    assert successes[0]['id'] == draft_id
 
 def test_failed_is_terminal(db):
     """test_failed_is_terminal: `failed` cannot return to active."""
@@ -107,25 +141,34 @@ def test_failed_is_terminal(db):
 
 def test_atomic_publish_success_rollback(db):
     """test_atomic_publish_success_rollback: Rollback of publish success if one step fails."""
-    draft_id = db.add_message_and_draft("msg5", "chan1", "text")
+    draft_id1 = db.add_message_and_draft("msg5", "chan1", "text")
     db.fetch_next_new_draft()
-    db.complete_ai_processing(draft_id, "review", {})
-    db.approve_draft(draft_id)
+    db.complete_ai_processing(draft_id1, "review", {})
+    db.approve_draft(draft_id1)
     db.fetch_next_approved_draft_for_publish() # -> publishing
     
     # First success
-    db.record_publish_success(draft_id, "tweet_999")
+    db.record_publish_success(draft_id1, "tweet_999")
     
-    # Second attempt to record success for SAME draft (simulating ambiguous state where DB already recorded it but retry happened)
-    # The transition publishing->published will fail because it's already published
+    # Now create a second draft
+    draft_id2 = db.add_message_and_draft("msg6", "chan1", "text")
+    db.fetch_next_new_draft()
+    db.complete_ai_processing(draft_id2, "review", {})
+    db.approve_draft(draft_id2)
+    db.fetch_next_approved_draft_for_publish() # -> publishing
+    
+    # Attempt to record success with SAME tweet_id, which violates unique index
     with pytest.raises(AmbiguousPublishStateError):
-        db.record_publish_success(draft_id, "tweet_999_dup")
+        db.record_publish_success(draft_id2, "tweet_999")
         
-    # Check published_tweets doesn't have duplicate
+    # Check draft2 remains in publishing because the transaction rolled back
     with db._get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) as c FROM published_tweets WHERE draft_id = ?", (draft_id,))
-        assert cursor.fetchone()['c'] == 1
+        cursor.execute("SELECT status FROM drafts WHERE id = ?", (draft_id2,))
+        assert cursor.fetchone()['status'] == 'publishing'
+        
+        cursor.execute("SELECT COUNT(*) as c FROM published_tweets WHERE draft_id = ?", (draft_id2,))
+        assert cursor.fetchone()['c'] == 0
 
 def test_migration_conflicts_preserves_rows(temp_db_path):
     """test_migration_conflicts_preserves_rows: Removed rows end up as JSON."""
@@ -174,12 +217,8 @@ def test_exact_recovery_transitions(db):
     db.approve_draft(draft_id2)
     db.fetch_next_approved_draft_for_publish() # -> publishing
     
-    # Trigger recovery manually (usually done in _init_db)
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE drafts SET status = 'new' WHERE status = 'processing'")
-        cursor.execute("UPDATE drafts SET status = 'review' WHERE status = 'publishing'")
-        conn.commit()
+    # Init db again to trigger startup recovery
+    db._init_db()
         
     with db._get_connection() as conn:
         cursor = conn.cursor()
@@ -212,6 +251,8 @@ def test_ambiguous_publish_state_error(db):
     """test_ambiguous_publish_state_error: AmbiguousPublishStateError halts retry."""
     import retry_manager as rm_module
     from retry_manager import RetryManager
+    from unittest.mock import patch, AsyncMock
+    import asyncio
     
     # Patch global db
     original_db = rm_module.db
@@ -226,19 +267,47 @@ def test_ambiguous_publish_state_error(db):
         db.approve_draft(draft_id)
         db.fetch_next_approved_draft_for_publish()
         
-        async def mock_publish():
-            db.record_publish_success(draft_id, "tw_1")
-            # Second time will raise AmbiguousPublishStateError
-            db.record_publish_success(draft_id, "tw_2")
+        mock_create_tweet = AsyncMock()
+        mock_create_tweet.return_value = "tw_1"
+        
+        with patch.object(db, 'record_publish_success', side_effect=AmbiguousPublishStateError("DB CRASH")) as mock_record:
+            async def mock_publish():
+                tweet_id = await mock_create_tweet("text", None)
+                db.record_publish_success(draft_id, tweet_id)
+                
+            success = asyncio.run(rm.execute_with_retries(draft_id, mock_publish))
+            assert success is False
             
-        import asyncio
-        success = asyncio.run(rm.execute_with_retries(draft_id, mock_publish))
-        assert success is False
+            # create_tweet must be called EXACTLY once
+            mock_create_tweet.assert_called_once()
+            mock_record.assert_called_once()
         
         with db._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,))
-            assert cursor.fetchone()['status'] == 'published'
+            assert cursor.fetchone()['status'] == 'publishing'
     finally:
         rm_module.db = original_db
+
+def test_fastapi_admin_approve(db):
+    from web_admin.main import app
+    import web_admin.main as web_main
+    original_db = web_main.db
+    web_main.db = db
+    client = TestClient(app)
+    
+    try:
+        draft_id = db.add_message_and_draft("msg_web", "chan1", "text")
+        db.fetch_next_new_draft()
+        db.complete_ai_processing(draft_id, "review", {"rewritten_text": "This is a valid long enough text for twitter."})
+        
+        # First approve
+        resp1 = client.post(f"/api/drafts/{draft_id}/publish")
+        assert resp1.status_code == 200
+        
+        # Second approve
+        resp2 = client.post(f"/api/drafts/{draft_id}/publish")
+        assert resp2.status_code == 400
+    finally:
+        web_main.db = original_db
 

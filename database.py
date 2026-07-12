@@ -26,13 +26,10 @@ ALLOWED_TRANSITIONS = {
     ("publishing", "published"),
     ("publishing", "approved"),
     ("publishing", "failed"),
-    # Recovery transitions
-    ("processing", "new"),
-    ("publishing", "review"),
 }
 
 ALLOWED_UPDATE_COLUMNS = {
-    "rewritten_text", "reason", "confidence", "status",
+    "rewritten_text", "reason", "confidence",
     "image_prompt", "sentiment", "category",
     "scheduled_at", "last_error", "retry_count", "last_retry_at",
     "updated_at", "media_status", "media_error", "media_path",
@@ -162,14 +159,7 @@ class Database:
             cursor.execute("UPDATE drafts SET status = 'review' WHERE status = 'pending'")
             
             # 3. Duplicate backup/deduplication
-            # Deduplicate published_tweets by tweet_id
-            cursor.execute("""
-                SELECT id, draft_id, tweet_id, published_at FROM published_tweets
-                WHERE tweet_id IN (
-                    SELECT tweet_id FROM published_tweets GROUP BY tweet_id HAVING COUNT(*) > 1
-                )
-                ORDER BY published_at ASC, id ASC
-            """)
+
             # Note: published_tweets has published_at, not created_at, fixing ORDER BY to published_at
             # Actually just fetch all duplicates
             cursor.execute("""
@@ -214,26 +204,18 @@ class Database:
                     )
                     cursor.execute("DELETE FROM published_tweets WHERE id = ?", (r["id"],))
 
-            conn.commit()
-            
             # 4. Unique indexes creation
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_created ON drafts(status, created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_scheduled ON drafts(status, scheduled_at)')
             cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_tweet_id ON published_tweets(tweet_id)')
             cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_draft_id ON published_tweets(draft_id)')
             
-            # 5. Transient status recovery
-            cursor.execute("UPDATE drafts SET status = 'new', updated_at = CURRENT_TIMESTAMP WHERE status = 'processing'")
-            cursor.execute("UPDATE drafts SET status = 'review', last_error = 'Recovered after crash during publishing', updated_at = CURRENT_TIMESTAMP WHERE status = 'publishing'")
-            
-            # Також media recovery (not part of main state machine but good to keep)
-            cursor.execute(
-                "UPDATE drafts SET media_status = 'failed', "
-                "media_error = 'Process restart during generation' "
-                "WHERE media_status = 'generating'"
-            )
-            
             conn.commit()
+            
+            # 5. Transient status recovery
+            self._recover_stuck_drafts(cursor)
+            conn.commit()
+            
             logger.debug(f"Database initialized at {self.db_path}")
 
             if self.get_setting("publish_delay_minutes") is None:
@@ -249,8 +231,20 @@ class Database:
             if self.get_setting("minimum_similarity") is None:
                 self.set_setting("minimum_similarity", 0.82)
 
+    def _recover_stuck_drafts(self, cursor: sqlite3.Cursor):
+        cursor.execute("UPDATE drafts SET status = 'new', updated_at = CURRENT_TIMESTAMP WHERE status = 'processing'")
+        cursor.execute("UPDATE drafts SET status = 'review', last_error = 'Recovered after crash during publishing', updated_at = CURRENT_TIMESTAMP WHERE status = 'publishing'")
+        # Also media recovery
+        cursor.execute(
+            "UPDATE drafts SET media_status = 'failed', "
+            "media_error = 'Process restart during generation' "
+            "WHERE media_status = 'generating'"
+        )
+
     def _transition_draft(self, conn: sqlite3.Connection, draft_id: int, expected_statuses: Set[str], new_status: str, updates: dict = None) -> bool:
         cursor = conn.cursor()
+        
+        expected_tuple = tuple(expected_statuses)
         
         # Check current status
         cursor.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,))
@@ -259,7 +253,7 @@ class Database:
             return False
             
         current_status = row['status']
-        if current_status not in expected_statuses:
+        if current_status not in expected_tuple:
             return False
             
         if (current_status, new_status) not in ALLOWED_TRANSITIONS:
@@ -277,8 +271,8 @@ class Database:
             set_clauses.append(f"{k} = ?")
             params.append(v)
             
-        params.extend([draft_id] + list(expected_statuses))
-        placeholders = ",".join(["?"] * len(expected_statuses))
+        params.extend([draft_id] + list(expected_tuple))
+        placeholders = ",".join(["?"] * len(expected_tuple))
         
         query = f"UPDATE drafts SET {', '.join(set_clauses)} WHERE id = ? AND status IN ({placeholders})"
         cursor.execute(query, params)
@@ -412,9 +406,11 @@ class Database:
                 )
                 conn.commit()
                 return True
+            except AmbiguousPublishStateError:
+                raise
             except Exception as e:
                 conn.rollback()
-                raise AmbiguousPublishStateError(f"Failed to record publish success for draft {draft_id}: {str(e)}")
+                raise AmbiguousPublishStateError(f"Failed to record publish success for draft {draft_id}: {str(e)}") from e
 
     def schedule_publish_retry(self, draft_id: int, scheduled_at_str: str, error_msg: str) -> bool:
         with self._get_connection() as conn:
