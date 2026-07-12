@@ -92,23 +92,7 @@ def test_media_builder_error_handling():
         assert mock_provider1.generate.called
         assert mock_provider2.generate.called
     
-def test_telegram_status_logic():
-    # settings logic validation
-    class MockSettings:
-        def __init__(self, api_id, hash, string):
-            self.telegram_api_id = api_id
-            self.telegram_api_hash = hash
-            self.telegram_session_string = string
 
-    # missing file, empty string
-    settings = MockSettings(123, "abc", "")
-    is_configured_1 = bool(settings.telegram_api_id and settings.telegram_api_hash and (settings.telegram_session_string or os.path.exists("not_a_real_file.session")))
-    assert not is_configured_1
-    
-    # missing file, has string
-    settings = MockSettings(123, "abc", "string123")
-    is_configured_2 = bool(settings.telegram_api_id and settings.telegram_api_hash and (settings.telegram_session_string or os.path.exists("not_a_real_file.session")))
-    assert is_configured_2
 
 @patch('llm_provider.settings')
 def test_temperature_passed_to_llm(mock_settings):

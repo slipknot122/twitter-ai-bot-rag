@@ -121,7 +121,9 @@ class GoogleImagenProvider:
             err = resp.json().get("error", {}).get("message", "")
             if "paid plans" in err.lower() or "not supported" in err.lower():
                 raise TransientMediaError(f"Google Imagen: Free tier limit or not available ({err})")
-            raise ContentRejectionError(f"Google Imagen: Bad Request (400) - {err}")
+            if "safety" in err.lower() or "policy" in err.lower() or "moderation" in err.lower() or "block" in err.lower():
+                raise ContentRejectionError(f"Google Imagen: Moderation rejection (400) - {err}")
+            raise TransientMediaError(f"Google Imagen: Provider-specific error (400) - {err}")
             
         if resp.status_code in (401, 403):
             raise ProviderAuthError(f"Google Imagen: auth error {resp.status_code}")
@@ -201,7 +203,10 @@ class CloudflareProvider:
         if resp.status_code in (401, 403):
             raise ProviderAuthError(f"Cloudflare: auth error {resp.status_code}")
         if resp.status_code == 400:
-            raise ContentRejectionError(f"Cloudflare: bad request: {resp.text[:300]}")
+            err_text = resp.text[:300].lower()
+            if "moderation" in err_text or "policy" in err_text or "safety" in err_text or "content" in err_text:
+                raise ContentRejectionError(f"Cloudflare: Moderation rejection: {resp.text[:300]}")
+            raise TransientMediaError(f"Cloudflare: Provider-specific error (400): {resp.text[:300]}")
         if resp.status_code == 429:
             raise TransientMediaError("Cloudflare: rate limited (429)")
         if resp.status_code >= 500:
@@ -282,7 +287,7 @@ class PollinationsProvider:
         if resp.status_code in (401, 403):
             raise ProviderAuthError(f"Pollinations: auth error {resp.status_code}")
         if resp.status_code == 400:
-            raise ContentRejectionError(f"Pollinations: bad request")
+            raise TransientMediaError(f"Pollinations: Provider-specific error (400)")
         if resp.status_code == 429:
             raise TransientMediaError("Pollinations: rate limited (429)")
         if resp.status_code >= 500:

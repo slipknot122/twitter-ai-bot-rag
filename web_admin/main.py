@@ -81,14 +81,19 @@ def publish_draft(draft_id: int):
             raise HTTPException(status_code=400, detail="Only drafts in review status can be approved")
             
         text = row['rewritten_text']
-        if not text or len(text.strip()) < 10:
-            raise HTTPException(status_code=400, detail="Text is too short or empty")
+        from utils import validate_post_text, ValidationError
+        try:
+            validated_text = validate_post_text(text)
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     logger.info(f"Web Admin: Approving draft {draft_id} for Scheduler")
     db.update_draft_status(draft_id, "approved")
+    # Оновлюємо текст на валідований на випадок якщо він був змінений (strip і т.д.)
+    db.update_draft_text(draft_id, validated_text)
     
-    if text:
-        semantic_memory.save(text)
+    if validated_text:
+        semantic_memory.save(validated_text)
             
     return {"status": "success"}
 
@@ -110,14 +115,14 @@ def ignore_draft(draft_id: int):
 
 @app.post("/api/drafts/{draft_id}/update")
 def update_draft(draft_id: int, request: UpdateDraftRequest):
+    from utils import validate_post_text, ValidationError
+    try:
+        validated_text = validate_post_text(request.rewritten_text)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+        
     logger.info(f"Web Admin: Updating draft {draft_id}")
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE drafts SET rewritten_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (request.rewritten_text, draft_id)
-        )
-        conn.commit()
+    db.update_draft_text(draft_id, validated_text)
     return {"status": "success"}
 
 
@@ -350,8 +355,8 @@ def status_page(request: Request):
     gemini_configured = bool(settings.gemini_api_key)
     
     # Check Telegram
-    import os
-    telegram_configured = bool(settings.telegram_api_id and settings.telegram_api_hash and (settings.telegram_session_string or os.path.exists("bot_session.session")))
+    from utils import is_telegram_configured
+    telegram_configured = is_telegram_configured()
     
     # Check X (Twitter)
     twitter_configured = bool(settings.twitter_api_key and settings.twitter_api_secret and settings.twitter_access_token and settings.twitter_access_token_secret)

@@ -45,6 +45,18 @@ async def ai_worker_loop():
             
             new_status = status_map.get(action, "review")
             
+            tweet_text = result.get('tweet_text', '')
+            
+            # Додаємо валідацію тексту, якщо він йде на публікацію
+            if new_status == "approved":
+                from utils import validate_post_text, ValidationError
+                try:
+                    tweet_text = validate_post_text(tweet_text)
+                except ValidationError as ve:
+                    logger.warning(f"Draft {draft_id}: Text validation failed: {ve}")
+                    new_status = "review"
+                    result['reason'] = f"Validation failed: {ve}. Original reason: {result.get('reason', '')}"
+            
             # Оновлюємо запис у БД (включаючи image_prompt і sentiment)
             with db._get_connection() as conn:
                 cursor = conn.cursor()
@@ -61,14 +73,14 @@ async def ai_worker_loop():
                         updated_at = CURRENT_TIMESTAMP 
                     WHERE id = ?
                     """,
-                    (result.get('tweet_text', ''), result.get('reason', ''), result.get('confidence', 0.0), new_status, result.get('image_prompt', ''), result.get('sentiment', 'Neutral'), result.get('category', 'NEWS'), draft_id)
+                    (tweet_text, result.get('reason', ''), result.get('confidence', 0.0), new_status, result.get('image_prompt', ''), result.get('sentiment', 'Neutral'), result.get('category', 'NEWS'), draft_id)
                 )
                 conn.commit()
                 
-            if new_status == "approved" and result.get('tweet_text'):
+            if new_status == "approved" and tweet_text:
                 try:
                     # Асинхронно зберігаємо в векторну БД, щоб не блокувати event loop
-                    await asyncio.to_thread(semantic_memory.save, result.get('tweet_text'))
+                    await asyncio.to_thread(semantic_memory.save, tweet_text)
                 except Exception as mem_e:
                     logger.warning(f"Draft {draft_id}: Failed to save to semantic memory: {mem_e}")
                     # Не змінюємо статус, бо контент згенеровано успішно, просто попереджаємо

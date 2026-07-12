@@ -55,9 +55,12 @@ async def scheduler_loop():
             draft_id = draft["id"]
             text = draft.get("rewritten_text") or draft.get("original_text")
             
-            if not text or len(text.strip()) < 10:
-                logger.error(f"Scheduler: Draft #{draft_id} text is empty or too short. Failing.")
-                db.update_draft_status(draft_id, "failed", last_error="Text too short or empty")
+            from utils import validate_post_text, ValidationError
+            try:
+                text = validate_post_text(text)
+            except ValidationError as e:
+                logger.error(f"Scheduler: Draft #{draft_id} text validation failed: {e}. Failing.")
+                db.update_draft_status(draft_id, "failed", last_error=f"Validation error: {e}")
                 continue
 
             logger.info(f"Scheduler: Publishing Draft #{draft_id}...")
