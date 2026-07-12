@@ -204,7 +204,7 @@ class CloudflareProvider:
             raise ProviderAuthError(f"Cloudflare: auth error {resp.status_code}")
         if resp.status_code == 400:
             err_text = resp.text[:300].lower()
-            if "moderation" in err_text or "policy" in err_text or "safety" in err_text or "content" in err_text:
+            if "moderation" in err_text or "policy" in err_text or "safety" in err_text:
                 raise ContentRejectionError(f"Cloudflare: Moderation rejection: {resp.text[:300]}")
             raise TransientMediaError(f"Cloudflare: Provider-specific error (400): {resp.text[:300]}")
         if resp.status_code == 429:

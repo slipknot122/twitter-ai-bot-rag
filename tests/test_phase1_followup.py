@@ -137,29 +137,30 @@ async def test_shadow_mode_other_actions(mock_ai_engine, mock_db):
 # --- Media Fallback HTTP 400 Tests ---
 
 @patch('media_builder.requests.post')
-def test_cloudflare_400_moderation(mock_post):
+def test_cloudflare_400_policy_violation(mock_post):
     provider = CloudflareProvider()
     provider.account_id = "123"
     provider.api_token = "abc"
     
     mock_resp = MagicMock()
     mock_resp.status_code = 400
-    mock_resp.text = "Error: safety policy violation"
+    mock_resp.text = "Error: content policy violation"
     mock_post.return_value = mock_resp
     
     with pytest.raises(ContentRejectionError):
         provider.generate("prompt", None, 512, 512, 10)
 
 @patch('media_builder.requests.post')
-def test_cloudflare_400_unknown(mock_post):
+def test_cloudflare_400_unsupported_content_type(mock_post):
     provider = CloudflareProvider()
     provider.account_id = "123"
     provider.api_token = "abc"
     
     mock_resp = MagicMock()
     mock_resp.status_code = 400
-    mock_resp.text = "Error: internal provider issue"
+    mock_resp.text = "Error: unsupported content-type"
     mock_post.return_value = mock_resp
     
+    # Should raise TransientMediaError to allow fallback
     with pytest.raises(TransientMediaError):
         provider.generate("prompt", None, 512, 512, 10)
