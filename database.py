@@ -814,6 +814,7 @@ class Database:
                 """
                 UPDATE drafts 
                 SET media_status = 'ready',
+                    media_generation_token = NULL,
                     media_path = ?,
                     media_provider = ?,
                     media_mime_type = ?,
@@ -861,19 +862,22 @@ class Database:
             old_media_path = row['media_path']
             
             if is_transient and attempt_count < max_attempts:
+                import uuid
                 # Exponential backoff: 30s, 60s, 120s
                 delay = 30 * (2 ** (attempt_count - 1))
                 next_attempt = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)).isoformat()
+                new_token = str(uuid.uuid4())
                 cursor.execute(
                     """
                     UPDATE drafts 
                     SET media_status = 'pending',
+                        media_generation_token = ?,
                         media_next_attempt_at = ?,
                         media_error_code = ?,
                         media_error_message = ?
                     WHERE id = ? AND media_generation_token = ?
                     """,
-                    (next_attempt, error_code, error_message, draft_id, token)
+                    (new_token, next_attempt, error_code, error_message, draft_id, token)
                 )
             else:
                 new_status = 'ready' if old_media_path else 'failed'
@@ -881,6 +885,7 @@ class Database:
                     """
                     UPDATE drafts 
                     SET media_status = ?,
+                        media_generation_token = NULL,
                         media_error_code = ?,
                         media_error_message = ?
                     WHERE id = ? AND media_generation_token = ?

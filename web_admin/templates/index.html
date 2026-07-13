@@ -735,9 +735,25 @@
                 const resp = await fetch(`/api/drafts/${id}/image`, { method: 'DELETE' });
                 if (resp.ok) {
                     updateMediaUI(id, 'none', null, null);
+                } else if (resp.status === 409) {
+                    alert("Cannot remove image in current state.");
                 }
             } catch (e) {
                 console.error('Remove image error:', e);
+            }
+        }
+
+        async function cancelImage(id) {
+            if (!confirm('Cancel media generation?')) return;
+            try {
+                const resp = await fetch(`/api/drafts/${id}/image/cancel`, { method: 'POST' });
+                if (resp.ok) {
+                    updateMediaUI(id, 'cancelled', null, null);
+                } else if (resp.status === 409) {
+                    alert("Cannot cancel media in current state.");
+                }
+            } catch (e) {
+                console.error('Cancel image error:', e);
             }
         }
 
@@ -827,7 +843,7 @@
                     const btnCanc = document.createElement('button');
                     btnCanc.className = 'btn-media btn-media-remove';
                     btnCanc.textContent = 'Cancel';
-                    btnCanc.onclick = () => removeImage(id);
+                    btnCanc.onclick = () => cancelImage(id);
                     
                     buttonsDiv.append(btnProc, btnCanc);
                 } else if (status === 'failed') {

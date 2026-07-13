@@ -164,6 +164,19 @@ async def generate_image(draft_id: int, request: GenerateImageRequest):
     return {"draft_id": draft_id, "media_status": "pending"}
 
 
+@app.post("/api/drafts/{draft_id}/image/cancel")
+def cancel_image(draft_id: int):
+    """Скасовує генерацію медіа."""
+    with db._get_connection() as conn:
+        row = conn.cursor().execute("SELECT id FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Draft not found")
+            
+    success = db.cancel_media_generation(draft_id)
+    if not success:
+        raise HTTPException(status_code=409, detail="Cannot cancel media in current state")
+    return {"status": "success"}
+
 @app.delete("/api/drafts/{draft_id}/image")
 def delete_image(draft_id: int):
     """Безпечне видалення зображення."""

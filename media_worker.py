@@ -1,5 +1,4 @@
 import asyncio
-import traceback
 from loguru import logger
 from database import db
 from media_builder import media_builder, TransientMediaError, PermanentMediaError, ContentRejectionError, ProviderAuthError
@@ -32,7 +31,7 @@ def process_media_job(draft_id: int, token: str, prompt: str):
                 is_transient=True
             )
             
-    except TransientMediaError as e:
+    except TransientMediaError:
         logger.warning(f"Media Worker: Transient error for draft {draft_id}")
         db.fail_media_generation(
             draft_id=draft_id,
@@ -52,7 +51,7 @@ def process_media_job(draft_id: int, token: str, prompt: str):
             is_transient=False
         )
         
-    except Exception as e:
+    except Exception:
         logger.error(f"Media Worker: Unexpected exception for draft {draft_id}")
         db.fail_media_generation(
             draft_id=draft_id,
@@ -109,7 +108,7 @@ async def media_worker_loop():
                     timeout=settings.media_worker_timeout_seconds
                 )
             except asyncio.TimeoutError:
-                logger.error(f"Media Worker: Job for draft {draft_id} timed out after 540s.")
+                logger.error(f"Media Worker: Job for draft {draft_id} timed out after {settings.media_worker_timeout_seconds}s.")
                 # We update the DB immediately to invalidate token and trigger retry policy
                 db.fail_media_generation(
                     draft_id=draft_id,
