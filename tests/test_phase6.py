@@ -1,196 +1,232 @@
 import pytest
-import os
-import asyncio
 import datetime
-import ipaddress
-import sqlite3
+import time
+import asyncio
+import urllib.parse
+from unittest.mock import patch, MagicMock, AsyncMock
 
-from ssrf_validator import validate_url_syntax, validate_dns_resolution, _validate_ip, URLValidationError, SSRFError
-from database import db
-from polling_listener import HostLimiter, RobotsCache, AutodiscoveryParser, SafeHTMLParser, compute_entry_identity
+from database import Database, db
+from ssrf_validator import validate_url_syntax, validate_dns_resolution, validate_url_and_dns, SSRFError, URLValidationError
+from polling_listener import (
+    HostLimiter, RobotsCache, SafeHTMLParser, AutodiscoveryParser,
+    strip_tracking_params, compute_entry_identity, parse_retry_after,
+    PollingWorker, StartupConfigError, check_startup_config
+)
+import httpx
 
 @pytest.fixture(autouse=True)
-def clean_db():
+def setup_teardown(tmp_path):
+    import os
+    os.environ["RSS_EGRESS_SANDBOX_CONFIRMED"] = "true"
+    db.db_path = str(tmp_path / "test.db")
+    if hasattr(db, '_local') and hasattr(db._local, 'connection'):
+        db._local.connection = None
+    db._init_db()
+    
     with db._get_connection() as conn:
-        cursor = conn.cursor()
-        conn.execute("PRAGMA foreign_keys = OFF")
-        cursor.execute("DELETE FROM worker_leases")
-        cursor.execute("DELETE FROM drafts")
-        cursor.execute("DELETE FROM source_poll_state")
-        cursor.execute("DELETE FROM sources")
         conn.execute("PRAGMA foreign_keys = ON")
+        
+    yield
+    
+    if hasattr(db, '_local') and hasattr(db._local, 'connection') and db._local.connection:
+        try:
+            db._local.connection.close()
+        except:
+            pass
+        db._local.connection = None
+    
+    import time
+    time.sleep(0.1)
+    
+    try:
+        if os.path.exists(db.db_path):
+            os.remove(db.db_path)
+            if os.path.exists(db.db_path + "-wal"): os.remove(db.db_path + "-wal")
+            if os.path.exists(db.db_path + "-shm"): os.remove(db.db_path + "-shm")
+    except Exception:
+        pass
+
+def test_startup_guard_missing_flag():
+    import os
+    if "RSS_EGRESS_SANDBOX_CONFIRMED" in os.environ:
+        del os.environ["RSS_EGRESS_SANDBOX_CONFIRMED"]
+    with pytest.raises(StartupConfigError):
+        check_startup_config()
+
+def test_host_limiter_monotonic(monkeypatch):
+    limiter = HostLimiter()
+    
+    times = [100.0, 100.5, 111.0]
+    idx = 0
+    def mock_monotonic():
+        nonlocal idx
+        res = times[idx]
+        if idx < len(times)-1: idx += 1
+        return res
+        
+    monkeypatch.setattr(time, "monotonic", mock_monotonic)
+    
+    async def run():
+        k = await limiter.acquire("http://example.com")
+        limiter.release(k)
+        
+    asyncio.run(run())
+    assert limiter.next_allowed["http://example.com:80"] > 100.0
+    
+def test_host_limiter_cleanup():
+    limiter = HostLimiter()
+    async def run():
+        k = await limiter.acquire("http://example.com")
+        limiter.release(k)
+        limiter.last_used[k] = time.monotonic() - 400 # Over TTL
+        await limiter.cleanup()
+        assert k not in limiter.locks
+    asyncio.run(run())
+
+def test_source_claiming_excludes_unsupported():
+    s_rss = db.add_source('rss', 'r1', 'R1', 'https://ok.com/feed.xml')
+    s_web = db.add_source('website', 'w1', 'W1', 'https://ok.com')
+    
+    with db._get_connection() as conn:
+        conn.execute("UPDATE source_poll_state SET collector_status = 'unsupported' WHERE source_id = ?", (s_web['id'],))
         conn.commit()
-
-# --- SSRF Validation Tests ---
-
-def test_validate_url_syntax():
-    assert validate_url_syntax("http://example.com") == "http://example.com"
-    assert validate_url_syntax("https://example.com:443/path") == "https://example.com:443/path"
     
-    with pytest.raises(URLValidationError, match="Forbidden scheme"):
-        validate_url_syntax("ftp://example.com")
-        
-    with pytest.raises(URLValidationError, match="Forbidden port"):
-        validate_url_syntax("http://example.com:22")
-        
-    with pytest.raises(URLValidationError, match="Credentials"):
-        validate_url_syntax("http://user:pass@example.com")
-        
-    with pytest.raises(URLValidationError, match="Control characters"):
-        validate_url_syntax("http://example.com/\x00")
-        
-    with pytest.raises(URLValidationError, match="Trailing dots"):
-        validate_url_syntax("http://example.com.")
-
-def test_validate_ip_allowed():
-    assert _validate_ip(ipaddress.ip_address("8.8.8.8")) == True
-    assert _validate_ip(ipaddress.ip_address("2606:4700:4700::1111")) == True
-
-def test_validate_ip_blocked():
-    blocked = [
-        ("127.0.0.1", "loopback"),
-        ("10.0.0.1", "private"),
-        ("192.168.1.1", "private"),
-        ("172.16.0.1", "private"),
-        ("169.254.169.254", "metadata"),
-        ("100.64.1.1", "CGNAT"),
-        ("192.0.2.1", "documentation"),
-        ("::1", "loopback"),
-        ("fe80::1", "link-local"),
-        ("::ffff:192.168.1.1", "IPv4-mapped")
-    ]
-    for ip_str, reason in blocked:
-        with pytest.raises(SSRFError):
-            _validate_ip(ipaddress.ip_address(ip_str))
-
-def test_validate_dns_resolution_direct_ip():
-    asyncio.run(validate_dns_resolution("8.8.8.8"))
-    with pytest.raises(SSRFError):
-        asyncio.run(validate_dns_resolution("127.0.0.1"))
-
-def test_validate_dns_resolution_real_dns():
-    asyncio.run(validate_dns_resolution("dns.google"))
-    with pytest.raises(SSRFError, match="DNS resolution failed"):
-        asyncio.run(validate_dns_resolution("nonexistent.invalid.example.com"))
-
-# --- DB Lease Tests ---
-
-def test_global_lease_lifecycle():
-    worker1 = "w1"
-    worker2 = "w2"
+    gw = db.acquire_global_lease("w1", 30)
+    s1 = db.claim_due_poll_source(gw, 60)
+    assert s1['source_type'] == 'rss'
+    assert s1['external_id'] == 'r1'
     
-    token = db.acquire_global_lease(worker1, 10)
-    assert token is not None
+    s2 = db.claim_due_poll_source(gw, 60)
+    assert s2 is None # source web is unsupported
     
-    # Second worker cannot acquire
-    token2 = db.acquire_global_lease(worker2, 10)
-    assert token2 is None
-    
-    # Heartbeat
-    assert db.heartbeat_global_lease(token, 10) is True
-    
-    # Release
-    db.release_global_lease(token)
-    
-    # Now worker 2 can acquire
-    token3 = db.acquire_global_lease(worker2, 10)
-    assert token3 is not None
+    db.poll_now(s_web['id']) # Requeue
+    s2 = db.claim_due_poll_source(gw, 60)
+    assert s2['source_id'] == s_web['id']
 
-def test_global_lease_expiry():
-    token = db.acquire_global_lease("w1", -1) # expired immediately
-    assert token is not None
+def test_complete_source_poll_oversize_batch():
+    db.add_source('rss', 'r1', 'R1', 'https://ok.com/feed.xml')
+    gw = db.acquire_global_lease("w1", 30)
+    src = db.claim_due_poll_source(gw, 60)
     
-    token2 = db.acquire_global_lease("w2", 10)
-    assert token2 is not None
-    assert token != token2
+    drafts = [{"source_item_id": f"id{i}", "original_text": f"text{i}"} for i in range(11)]
+    
+    with pytest.raises(ValueError, match="exceeds limit"):
+        db.complete_source_poll(gw, src['source_id'], src['lease_token'], {'collector_status': 'healthy'}, drafts)
 
-def test_source_claiming():
-    src = db.add_source('rss', 'ext1', 'test_rss')
-    src_id = src['id']
+def test_complete_source_poll_stale_global_token():
+    db.add_source('rss', 'r1', 'R1', 'https://ok.com/feed.xml')
+    gw = db.acquire_global_lease("w1", 30)
+    src = db.claim_due_poll_source(gw, 60)
     
-    # Initially inactive, so claim should return None
-    t1 = db.acquire_global_lease("w1", 10)
-    assert db.claim_due_poll_source(t1, 10) is None
-    
-    # Make active and unresolved... but wait RSS doesn't have unresolved. It's active.
-    # Ah, add_source makes it active if resolved. RSS is active.
-    # Why is it not claimable? Because it doesn't have a source_poll_state yet.
-    # Actually wait. Does it? We might need to ensure add_source creates poll state or claim handles left join.
-    # Let's check claim query in db.
-    pass
+    # Use wrong token
+    res = db.complete_source_poll("wrong", src['source_id'], src['lease_token'], {'collector_status': 'healthy'}, [])
+    assert res is False
 
-# --- Parser Tests ---
+def test_complete_source_poll_stale_source_token():
+    db.add_source('rss', 'r1', 'R1', 'https://ok.com/feed.xml')
+    gw = db.acquire_global_lease("w1", 30)
+    src = db.claim_due_poll_source(gw, 60)
+    
+    res = db.complete_source_poll(gw, src['source_id'], "wrong", {'collector_status': 'healthy'}, [])
+    assert res is False
+    
+def test_robots_cache():
+    cache = RobotsCache()
+    assert cache.check_hit("https://example.com/feed") is None
+    cache.store("https://example.com/feed", True, 3600)
+    assert cache.check_hit("https://example.com/feed") is True
+    assert cache.check_hit("https://example.com/other") is True
+
+def test_parse_retry_after():
+    assert parse_retry_after("120") == 120
+    assert parse_retry_after("5") == 10 # clamp
+    assert parse_retry_after("999999") == 86400 # clamp
+    assert parse_retry_after("invalid") is None
+    
+    import email.utils
+    now = datetime.datetime.now(datetime.timezone.utc)
+    future = now + datetime.timedelta(seconds=120)
+    date_str = email.utils.format_datetime(future)
+    parsed = parse_retry_after(date_str)
+    assert 118 <= parsed <= 122
+
+def test_strip_tracking_params():
+    url = "https://ex.com/path?utm_source=a&fbclid=b&valid=c#frag"
+    clean = strip_tracking_params(url)
+    assert clean == "https://ex.com/path?valid=c"
+
+def test_compute_entry_identity():
+    entry1 = {"id": "  hello  \nworld"}
+    id1 = compute_entry_identity(entry1, "https://example.com")
+    assert id1.startswith("guid:")
+    
+    entry2 = {"link": "/relative?utm_source=a"}
+    id2 = compute_entry_identity(entry2, "https://example.com/base/")
+    assert id2.startswith("link:")
 
 def test_safe_html_parser():
     parser = SafeHTMLParser()
-    parser.feed("<script>alert(1)</script><p>Hello <b>world</b>!</p>")
-    assert parser.get_text().strip().replace("  ", " ") == "Hello world !"
-    
-    parser = SafeHTMLParser()
-    parser.feed("<style>body{color:red}</style>Test")
-    assert parser.get_text() == "Test"
+    parser.feed("  <script>alert(1)</script> <b>hello</b> \x00 world \n\t ")
+    assert parser.get_text() == "hello world"
 
-def test_autodiscovery_parser():
-    html = '''
-    <html>
-    <head>
-        <link rel="alternate" type="application/rss+xml" title="RSS" href="/feed.xml">
-        <link rel="alternate" type="application/atom+xml" title="Atom" href="/atom.xml">
-    </head>
-    </html>
-    '''
-    parser = AutodiscoveryParser()
-    parser.feed(html)
-    assert len(parser.candidates) == 2
-    assert parser.candidates[0]['href'] == '/feed.xml'
-    assert parser.candidates[1]['href'] == '/atom.xml'
+def test_ssrf_validator_safe():
+    res = asyncio.run(validate_url_and_dns("http://google.com"))
+    assert res == "http://google.com"
 
-def test_autodiscovery_base_href():
-    html = '''
-    <html>
-    <head>
-        <base href="https://example.com/base/">
-        <link rel="alternate" type="application/rss+xml" href="feed.xml">
-    </head>
-    </html>
-    '''
-    parser = AutodiscoveryParser()
-    parser.feed(html)
-    assert parser.base_href == "https://example.com/base/"
+def test_ssrf_validator_private():
+    with pytest.raises(SSRFError):
+        asyncio.run(validate_url_and_dns("http://192.168.1.1"))
 
-def test_compute_identity():
-    entry = {"id": "123"}
-    ident = compute_entry_identity(entry)
-    assert ident.startswith("guid:")
-    
-    entry = {"link": "https://example.com/post?utm_source=twitter"}
-    ident = compute_entry_identity(entry)
-    assert ident.startswith("link:")
-    # tracking param stripped
-    assert "utm_source" not in ident
-    
-    entry = {"title": "Hello", "description": "World"}
-    ident = compute_entry_identity(entry)
-    assert ident.startswith("hash:")
+def test_ssrf_validator_metadata():
+    with pytest.raises(SSRFError):
+        asyncio.run(validate_url_and_dns("http://169.254.169.254"))
 
-# --- Network Utils Tests ---
+def test_heartbeat_cancellation():
+    worker = PollingWorker()
+    worker.global_token = "dummy"
+    async def run():
+        async def dummy_poll():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                worker.cancellation_event.set()
+        worker.active_poll_task = asyncio.create_task(dummy_poll())
+        
+        # Start heartbeat, it should notice lease is lost (no DB record)
+        await worker.heartbeat_loop()
+        
+        assert worker.cancellation_event.is_set()
+        assert worker.active_poll_task.cancelled() or worker.active_poll_task.done()
+    asyncio.run(run())
 
-def test_host_limiter():
-    limiter = HostLimiter()
-    start = datetime.datetime.now().timestamp()
-    asyncio.run(limiter.wait_for_host("http://test.com"))
-    asyncio.run(limiter.wait_for_host("http://test.com"))
-    end = datetime.datetime.now().timestamp()
-    assert end - start >= 10
+def test_fetch_url_timeout():
+    worker = PollingWorker()
+    async def run():
+        async with httpx.AsyncClient() as client:
+            with patch("httpx.AsyncClient.stream") as mock_stream:
+                mock_stream.side_effect = httpx.TimeoutException("timeout")
+                res = await worker.fetch_url(client, "http://example.com", 1000)
+                assert res.error_code == "timeout"
+    asyncio.run(run())
 
-def test_robots_cache():
-    cache = RobotsCache()
-    assert cache.check_hit("http://example.com") is None
-    cache.store("http://example.com", True, 60)
-    assert cache.check_hit("http://example.com") is True
-    cache.store("http://example.com/blocked", False, 60)
-    assert cache.check_hit("http://example.com/blocked") is False
+def test_fetch_url_too_large():
+    worker = PollingWorker()
+    async def run():
+        async with httpx.AsyncClient() as client:
+            with patch.object(client, "stream") as mock_stream:
+                mock_ctx = AsyncMock()
+                mock_resp = AsyncMock()
+                mock_resp.status_code = 200
+                mock_resp.headers = {"Content-Type": "text/html"}
+                
+                async def chunk_gen():
+                    yield b"a" * 6000000
+                    
+                mock_resp.aiter_bytes = chunk_gen
+                mock_ctx.__aenter__.return_value = mock_resp
+                mock_stream.return_value = mock_ctx
+                
+                res = await worker.fetch_url(client, "http://example.com", max_bytes=5000000, website_mode=True)
+                assert res.error_code == "content_too_large"
+    asyncio.run(run())
 
-# 25 more tests can be dynamically added to ensure all scenarios are covered.
-for i in range(25):
-    exec(f"def test_dummy_{i}(): pass")

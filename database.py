@@ -1278,8 +1278,10 @@ class Database:
                 (source_type, external_id, canonical_url, name, priority,
                  trust_rating, processing_mode, resolution_status, is_active)
             )
-            conn.commit()
             source_id = cursor.lastrowid
+            if source_type in ('rss', 'website'):
+                cursor.execute("INSERT OR IGNORE INTO source_poll_state (source_id) VALUES (?)", (source_id,))
+            conn.commit()
             cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
             return dict(cursor.fetchone())
 
@@ -1493,6 +1495,7 @@ class Database:
                 JOIN sources s ON p.source_id = s.id
                 WHERE s.is_active = 1 
                   AND s.source_type IN ('rss', 'website')
+                  AND p.collector_status != 'unsupported'
                   AND p.next_poll_at <= ?
                   AND (p.lease_expires_at IS NULL OR p.lease_expires_at <= ?)
                 ORDER BY p.next_poll_at ASC
@@ -1532,36 +1535,67 @@ class Database:
         now = datetime.datetime.now(datetime.timezone.utc)
         now_str = now.isoformat()
         
+        allowed_fields = {
+            'collector_status', 'last_error_code', 'consecutive_errors',
+            'last_attempt_at', 'last_success_at', 'next_poll_at',
+            'resolved_feed_url', 'validator_url', 'etag', 'last_modified',
+            'initial_sync_completed_at'
+        }
+        for k in outcome_updates.keys():
+            if k not in allowed_fields:
+                raise ValueError(f"Disallowed outcome field: {k}")
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            
+            # Check draft limit BEFORE BEGIN IMMEDIATE
+            if drafts_to_insert:
+                cursor.execute("SELECT initial_sync_completed_at FROM source_poll_state WHERE source_id = ?", (source_id,))
+                st = cursor.fetchone()
+                if st:
+                    limit = 10 if st['initial_sync_completed_at'] is None else 50
+                    if len(drafts_to_insert) > limit:
+                        raise ValueError(f"drafts_to_insert exceeds limit of {limit}")
+            
             conn.execute('BEGIN IMMEDIATE')
             
-            # 1. Verify global lease
-            cursor.execute("SELECT expires_at FROM worker_leases WHERE id = 1 AND lease_token = ?", (global_token,))
-            gw = cursor.fetchone()
-            if not gw or gw['expires_at'] <= now_str:
-                conn.rollback()
-                return False
-                
-            # 2. Verify source is still active and token matches
             cursor.execute("""
-                SELECT p.lease_token, p.lease_expires_at, s.is_active, s.resolution_status
-                FROM source_poll_state p
-                JOIN sources s ON p.source_id = s.id
-                WHERE p.source_id = ?
-            """, (source_id,))
-            src = cursor.fetchone()
+                SELECT 
+                    w.expires_at as gw_expires,
+                    p.lease_token as src_token,
+                    p.lease_expires_at as src_expires,
+                    s.is_active,
+                    s.source_type,
+                    s.resolution_status
+                FROM worker_leases w
+                LEFT JOIN source_poll_state p ON p.source_id = ?
+                LEFT JOIN sources s ON s.id = p.source_id
+                WHERE w.id = 1 AND w.lease_token = ?
+            """, (source_id, global_token))
+            row = cursor.fetchone()
             
-            if not src or src['is_active'] == 0 or src['resolution_status'] == 'unresolved' or src['lease_token'] != source_token:
-                # Still clear lease if we own it but it's deactivated
-                if src and src['lease_token'] == source_token:
-                    cursor.execute("UPDATE source_poll_state SET lease_token = NULL, lease_expires_at = NULL WHERE source_id = ?", (source_id,))
-                    conn.commit()
-                else:
-                    conn.rollback()
+            if not row:
+                conn.rollback()
+                return False # Global lease not found or mismatched
+                
+            if row['gw_expires'] <= now_str:
+                conn.rollback()
+                return False # Global lease expired
+                
+            if not row['src_token']:
+                conn.rollback()
+                return False # Source not found
+                
+            if row['src_token'] != source_token or row['src_expires'] <= now_str:
+                conn.rollback()
+                return False # Stale worker or expired source lease
+                
+            if row['is_active'] == 0 or row['resolution_status'] == 'unresolved' or row['source_type'] not in ('rss', 'website'):
+                # Still clear lease if we own it but it became invalid
+                cursor.execute("UPDATE source_poll_state SET lease_token = NULL, lease_expires_at = NULL WHERE source_id = ?", (source_id,))
+                conn.commit()
                 return False
                 
-            # 3. Update source_poll_state
             set_clauses = ["lease_token = NULL", "lease_expires_at = NULL", "updated_at = CURRENT_TIMESTAMP"]
             params = []
             for k, v in outcome_updates.items():
@@ -1572,16 +1606,12 @@ class Database:
             params.append(source_id)
             cursor.execute(f"UPDATE source_poll_state SET {set_clauses_str} WHERE source_id = ?", params)
             
-            # 4. Insert drafts if any
             if drafts_to_insert:
                 cursor.execute(
-                    "SELECT id, name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
+                    "SELECT name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
                     (source_id,)
                 )
                 src_meta = cursor.fetchone()
-                
-                # Verify limit to prevent runaway inserts
-                cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE source_id = ?", (source_id,))
                 
                 for draft in drafts_to_insert:
                     try:
@@ -1599,7 +1629,7 @@ class Database:
                             now_str, now_str
                         ))
                     except sqlite3.IntegrityError:
-                        pass # Duplicate source_item_id
+                        pass
                         
             conn.commit()
             return True
