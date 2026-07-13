@@ -55,7 +55,19 @@ def validate_url_syntax(url: str) -> str:
 
     return url
 
-async def validate_dns_resolution(hostname: str):
+from typing import Protocol, Any, Optional
+
+class ResolverProtocol(Protocol):
+    async def getaddrinfo(self, host: str, port: int | None, *, type: int = ...) -> Any: ...
+
+class SystemResolver:
+    async def getaddrinfo(self, host: str, port: int | None, *, type: int = socket.SOCK_STREAM) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.getaddrinfo(host, port, type=type)
+
+system_resolver = SystemResolver()
+
+async def validate_dns_resolution(hostname: str, resolver: ResolverProtocol = system_resolver):
     """
     Resolves the hostname and validates all returned IPs against SSRF policies.
     Raises SSRFError if ANY resolved IP is in a forbidden range.
@@ -69,9 +81,10 @@ async def validate_dns_resolution(hostname: str):
         pass # Not a direct IP, need DNS resolution
 
     try:
-        loop = asyncio.get_running_loop()
-        addr_info = await loop.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        addr_info = await resolver.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except socket.gaierror as e:
+        raise SSRFError(f"DNS resolution failed: {e}")
+    except Exception as e:
         raise SSRFError(f"DNS resolution failed: {e}")
 
     if not addr_info:
@@ -139,12 +152,12 @@ def _validate_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
     # If it passed all checks, it's considered safe (public routable IP)
     return True
 
-async def validate_url_and_dns(url: str) -> str:
+async def validate_url_and_dns(url: str, *, resolver: ResolverProtocol = system_resolver) -> str:
     """
     Combined validation for URL syntax, policy, and DNS SSRF.
     Returns the normalized URL on success, or raises URLValidationError / SSRFError.
     """
     normalized_url = validate_url_syntax(url)
     parsed = urllib.parse.urlparse(normalized_url)
-    await validate_dns_resolution(parsed.hostname)
+    await validate_dns_resolution(parsed.hostname, resolver=resolver)
     return normalized_url
