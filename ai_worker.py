@@ -107,6 +107,7 @@ def process_draft(draft_id: int, db_instance):
         try:
             first_audit, model_used = auditor.audit(original_text, candidate_text, None)
         except AuditFailure as af:
+            media_req = settings.media_generation_enabled and not settings.twitter_dry_run and bool(image_prompt)
             db_instance.complete_ai_processing(draft_id, "review", {
                 "rewritten_text": candidate_text, # preserve candidate
                 "audit_status": "failed",
@@ -116,7 +117,7 @@ def process_draft(draft_id: int, db_instance):
                 "sentiment": sentiment,
                 "image_prompt": image_prompt,
                 "revision_count": 0
-            })
+            }, media_request=media_req)
             return
 
         # 4. Determine if revision is needed
@@ -129,6 +130,7 @@ def process_draft(draft_id: int, db_instance):
                 "first_audit": first_audit.model_dump(),
                 "final_audit": None
             })
+            media_req = settings.media_generation_enabled and not settings.twitter_dry_run and bool(image_prompt)
             db_instance.complete_ai_processing(draft_id, "review", {
                 "rewritten_text": candidate_text,
                 "audit_status": "passed",
@@ -142,7 +144,7 @@ def process_draft(draft_id: int, db_instance):
                 "sentiment": sentiment,
                 "image_prompt": image_prompt,
                 "revision_count": 0
-            })
+            }, media_request=media_req)
             return
             
         # 5. Revise
@@ -157,6 +159,7 @@ def process_draft(draft_id: int, db_instance):
                 "first_audit": first_audit.model_dump(),
                 "final_audit": None
             })
+            media_req = settings.media_generation_enabled and not settings.twitter_dry_run and bool(image_prompt)
             db_instance.complete_ai_processing(draft_id, "review", {
                 "rewritten_text": candidate_text, # Best valid
                 "audit_status": "failed",
@@ -170,7 +173,7 @@ def process_draft(draft_id: int, db_instance):
                 "sentiment": sentiment,
                 "image_prompt": image_prompt,
                 "revision_count": 1 # we attempted exactly once
-            })
+            }, media_request=media_req)
             return
 
         # 6. Second audit
@@ -183,6 +186,7 @@ def process_draft(draft_id: int, db_instance):
                 "first_audit": first_audit.model_dump(),
                 "final_audit": None
             })
+            media_req = settings.media_generation_enabled and not settings.twitter_dry_run and bool(image_prompt)
             db_instance.complete_ai_processing(draft_id, "review", {
                 "rewritten_text": candidate_text, # fallback to candidate
                 "audit_status": "failed",
@@ -196,7 +200,7 @@ def process_draft(draft_id: int, db_instance):
                 "sentiment": sentiment,
                 "image_prompt": image_prompt,
                 "revision_count": 1
-            })
+            }, media_request=media_req)
             return
 
         # 7. Final processing after second audit
@@ -207,6 +211,7 @@ def process_draft(draft_id: int, db_instance):
             "final_audit": second_audit.model_dump()
         })
         
+        media_req = settings.media_generation_enabled and not settings.twitter_dry_run and bool(image_prompt)
         db_instance.complete_ai_processing(draft_id, "review", {
             "rewritten_text": revised_text,
             "audit_status": "needs_review" if still_needs_revision else "passed",
@@ -220,7 +225,7 @@ def process_draft(draft_id: int, db_instance):
             "sentiment": sentiment,
             "image_prompt": image_prompt,
             "revision_count": 1
-        })
+        }, media_request=media_req)
             
     except Exception as e:
         safe_code = classify_safe_error(e)

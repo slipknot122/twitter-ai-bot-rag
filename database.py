@@ -128,29 +128,37 @@ class Database:
                 )
             ''')
             
-            new_columns = [
-                "scheduled_at DATETIME NULL",
-                "retry_count INTEGER DEFAULT 0",
-                "last_error TEXT NULL",
-                "last_retry_at DATETIME NULL",
-                "media_path TEXT NULL",
-                "image_prompt TEXT NULL",
-                "media_status TEXT NOT NULL DEFAULT 'none'",
-                "media_error TEXT NULL",
-                "media_provider TEXT NULL",
-                "media_created_at TEXT NULL",
-                "media_mime_type TEXT NULL",
-                "media_size_bytes INTEGER NULL",
-                "media_width INTEGER NULL",
-                "media_height INTEGER NULL",
-                "sentiment TEXT NULL",
-                "category TEXT NULL"
-            ]
-            for col in new_columns:
-                try:
-                    cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col}")
-                except sqlite3.OperationalError:
-                    pass
+            cursor.execute("PRAGMA table_info(drafts)")
+            existing_columns = {row['name'] for row in cursor.fetchall()}
+            
+            new_columns = {
+                "scheduled_at": "DATETIME NULL",
+                "retry_count": "INTEGER DEFAULT 0",
+                "last_error": "TEXT NULL",
+                "last_retry_at": "DATETIME NULL",
+                "image_prompt": "TEXT NULL",
+                "sentiment": "TEXT NULL",
+                "category": "TEXT NULL",
+                "media_status": "TEXT NOT NULL DEFAULT 'none'",
+                "media_error_code": "TEXT NULL",
+                "media_error_message": "TEXT NULL",
+                "media_path": "TEXT NULL",
+                "media_provider": "TEXT NULL",
+                "media_created_at": "TEXT NULL",
+                "media_requested_at": "TEXT NULL",
+                "media_started_at": "TEXT NULL",
+                "media_lease_expires_at": "TEXT NULL",
+                "media_next_attempt_at": "TEXT NULL",
+                "media_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "media_generation_token": "TEXT NULL",
+                "media_mime_type": "TEXT NULL",
+                "media_size_bytes": "INTEGER NULL",
+                "media_width": "INTEGER NULL",
+                "media_height": "INTEGER NULL"
+            }
+            for col_name, col_def in new_columns.items():
+                if col_name not in existing_columns:
+                    cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col_name} {col_def}")
 
             conn.commit()
             
@@ -228,6 +236,7 @@ class Database:
             # 5. Unique indexes creation
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_created ON drafts(status, created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_scheduled ON drafts(status, scheduled_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_media_status_requested ON drafts(media_status, media_requested_at)')
             cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_tweet_id ON published_tweets(tweet_id)')
             cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_draft_id ON published_tweets(draft_id)')
             
@@ -257,9 +266,11 @@ class Database:
         cursor.execute("UPDATE drafts SET status = 'review', last_error = 'Recovered after crash during publishing', updated_at = CURRENT_TIMESTAMP WHERE status = 'publishing'")
         # Also media recovery
         cursor.execute(
-            "UPDATE drafts SET media_status = 'failed', "
-            "media_error = 'Process restart during generation' "
-            "WHERE media_status = 'generating'"
+            "UPDATE drafts SET media_status = 'pending', "
+            "media_generation_token = NULL "
+            "WHERE media_status = 'generating' "
+            "AND media_lease_expires_at < ?",
+            (datetime.datetime.now(datetime.timezone.utc).isoformat(),)
         )
 
     def _transition_draft(self, conn: sqlite3.Connection, draft_id: int, expected_statuses: Set[str], new_status: str, updates: dict = None) -> bool:
@@ -374,14 +385,39 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def complete_ai_processing(self, draft_id: int, new_status: str, updates: dict = None) -> bool:
+    def complete_ai_processing(self, draft_id: int, new_status: str, updates: dict = None, media_request: bool = False) -> bool:
         """
         Атомарно зберігає фінальний текст, результати аудиту та переводить статус.
+        Також, якщо media_request=True, встановлює media_status='pending' і генерує generation_token.
         """
+        import uuid
         with self._get_connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             success = self._transition_draft(conn, draft_id, {"processing"}, new_status, updates)
-            conn.commit()
+            if success and media_request:
+                new_token = str(uuid.uuid4())
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE drafts 
+                    SET media_status = 'pending',
+                        media_generation_token = ?,
+                        media_requested_at = ?,
+                        media_attempt_count = 0,
+                        media_next_attempt_at = NULL,
+                        media_error_code = NULL,
+                        media_error_message = NULL,
+                        media_path = NULL,
+                        media_provider = NULL
+                    WHERE id = ? AND media_status IN ('none', 'failed')
+                    """,
+                    (new_token, now_iso, draft_id)
+                )
+            if success:
+                conn.commit()
+            else:
+                conn.rollback()
             return success
 
     def approve_draft(self, draft_id: int, updates: dict = None) -> bool:
@@ -431,6 +467,12 @@ class Database:
                 if not success:
                     conn.rollback()
                     raise AmbiguousPublishStateError(f"Draft {draft_id} is not in publishing state.")
+                
+                cursor.execute(
+                    "UPDATE drafts SET media_status = 'cancelled', media_generation_token = NULL "
+                    "WHERE id = ? AND media_status IN ('pending', 'generating')",
+                    (draft_id,)
+                )
                     
                 cursor.execute(
                     "INSERT INTO published_tweets (draft_id, tweet_id) VALUES (?, ?)",
@@ -502,11 +544,216 @@ class Database:
             return row['updated_at'] if row else None
 
     def update_draft_text(self, draft_id: int, new_text: str):
-        # Allow updating text in review state
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE drafts SET rewritten_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('review')", (new_text, draft_id))
+            cursor.execute(
+                "UPDATE drafts SET rewritten_text = ?, status = 'review' WHERE id = ? AND status IN ('review', 'pending')",
+                (new_text, draft_id)
+            )
             conn.commit()
+
+    # --- Phase 4: Media State Machine ---
+
+    def queue_media_generation(self, draft_id: int) -> bool:
+        import uuid
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            
+            cursor.execute("SELECT media_status FROM drafts WHERE id = ?", (draft_id,))
+            row = cursor.fetchone()
+            if not row or row['media_status'] in ('pending', 'generating', 'ready'):
+                conn.rollback()
+                return False
+                
+            new_token = str(uuid.uuid4())
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            
+            cursor.execute(
+                """
+                UPDATE drafts 
+                SET media_status = 'pending',
+                    media_generation_token = ?,
+                    media_requested_at = ?,
+                    media_attempt_count = 0,
+                    media_next_attempt_at = NULL,
+                    media_error_code = NULL,
+                    media_error_message = NULL,
+                    media_path = NULL,
+                    media_provider = NULL
+                WHERE id = ?
+                """,
+                (new_token, now_iso, draft_id)
+            )
+            
+            success = cursor.rowcount == 1
+            if success:
+                conn.commit()
+            else:
+                conn.rollback()
+            return success
+
+    def cancel_media_generation(self, draft_id: int) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                UPDATE drafts 
+                SET media_status = 'cancelled',
+                    media_generation_token = NULL
+                WHERE id = ? AND media_status IN ('pending', 'generating')
+                """,
+                (draft_id,)
+            )
+            success = cursor.rowcount == 1
+            conn.commit()
+            return success
+
+    def claim_next_pending_media(self, timeout_seconds: int = 120) -> Optional[Dict[str, Any]]:
+        import uuid
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            
+            cursor.execute(
+                """
+                SELECT id FROM drafts 
+                WHERE media_status = 'pending' 
+                  AND (media_next_attempt_at IS NULL OR media_next_attempt_at <= ?)
+                ORDER BY media_requested_at ASC, id ASC 
+                LIMIT 1
+                """,
+                (now_iso,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+                
+            draft_id = row["id"]
+            new_token = str(uuid.uuid4())
+            expires_at = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=timeout_seconds)).isoformat()
+            
+            cursor.execute(
+                """
+                UPDATE drafts 
+                SET media_status = 'generating',
+                    media_generation_token = ?,
+                    media_started_at = ?,
+                    media_lease_expires_at = ?,
+                    media_attempt_count = media_attempt_count + 1
+                WHERE id = ? AND media_status = 'pending'
+                """,
+                (new_token, now_iso, expires_at, draft_id)
+            )
+            
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+                
+            cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
+            claimed_row = cursor.fetchone()
+            conn.commit()
+            return dict(claimed_row)
+
+    def complete_media_generation(self, draft_id: int, token: str, meta: dict) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            
+            cursor.execute("SELECT media_path FROM drafts WHERE id = ? AND media_status = 'generating' AND media_generation_token = ?", (draft_id, token))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return False
+                
+            old_media_path = row['media_path']
+            new_media_path = meta.get("media_path")
+            
+            cursor.execute(
+                """
+                UPDATE drafts 
+                SET media_status = 'ready',
+                    media_path = ?,
+                    media_provider = ?,
+                    media_mime_type = ?,
+                    media_size_bytes = ?,
+                    media_width = ?,
+                    media_height = ?,
+                    media_created_at = ?
+                WHERE id = ? AND media_status = 'generating' AND media_generation_token = ?
+                """,
+                (
+                    new_media_path, meta.get("media_provider"),
+                    meta.get("mime_type"), meta.get("size_bytes"),
+                    meta.get("width"), meta.get("height"),
+                    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    draft_id, token
+                )
+            )
+            success = cursor.rowcount == 1
+            if success:
+                conn.commit()
+                # If we successfully regenerated and there was an old file, delete it
+                if old_media_path and old_media_path != new_media_path:
+                    from media_builder import media_builder
+                    media_builder.delete_media_file(old_media_path)
+            else:
+                conn.rollback()
+            return success
+
+    def fail_media_generation(self, draft_id: int, token: str, error_code: str, error_message: str, is_transient: bool, max_attempts: int = 3) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            
+            cursor.execute(
+                "SELECT media_attempt_count FROM drafts WHERE id = ? AND media_status = 'generating' AND media_generation_token = ?",
+                (draft_id, token)
+            )
+            row = cursor.fetchone()
+            
+            if not row:
+                conn.rollback()
+                return False
+                
+            attempt_count = row['media_attempt_count']
+            
+            if is_transient and attempt_count < max_attempts:
+                # Exponential backoff: 30s, 60s, 120s
+                delay = 30 * (2 ** (attempt_count - 1))
+                next_attempt = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)).isoformat()
+                cursor.execute(
+                    """
+                    UPDATE drafts 
+                    SET media_status = 'pending',
+                        media_next_attempt_at = ?,
+                        media_error_code = ?,
+                        media_error_message = ?
+                    WHERE id = ? AND media_generation_token = ?
+                    """,
+                    (next_attempt, error_code, error_message, draft_id, token)
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE drafts 
+                    SET media_status = 'failed',
+                        media_error_code = ?,
+                        media_error_message = ?
+                    WHERE id = ? AND media_generation_token = ?
+                    """,
+                    (error_code, error_message, draft_id, token)
+                )
+                
+            success = cursor.rowcount == 1
+            if success:
+                conn.commit()
+            else:
+                conn.rollback()
+            return success
 
     def get_analytics(self) -> Dict[str, Any]:
         with self._get_connection() as conn:

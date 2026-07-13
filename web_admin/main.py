@@ -143,16 +143,14 @@ def update_draft(draft_id: int, request: UpdateDraftRequest):
 
 class GenerateImageRequest(BaseModel):
     image_prompt: Optional[str] = Field(default=None, min_length=20, max_length=1500)
-    regenerate: bool = False
+    action: str = Field(default="generate", description="generate, retry, or regenerate")
 
 
 @app.post("/api/drafts/{draft_id}/image", status_code=202)
 async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] = None):
     """
-    Запускає генерацію зображення у фоні. Повертає 202 Accepted.
-    Атомарна зміна статусу захищає від подвійного кліку.
+    Чергує медіа на генерацію. Повертає 202 Accepted.
     """
-    # 1. Отримуємо драфт
     with db._get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, image_prompt, media_status, media_path FROM drafts WHERE id = ?", (draft_id,))
@@ -161,7 +159,6 @@ async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] 
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
 
-    # 2. Визначаємо промпт: з тіла запиту або з БД
     prompt = None
     if request and request.image_prompt:
         prompt = request.image_prompt
@@ -169,78 +166,21 @@ async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] 
         prompt = draft["image_prompt"]
     
     if not prompt or len(prompt.strip()) < 20:
-        raise HTTPException(status_code=400, detail="image_prompt is required (min 20 chars)")
+        raise HTTPException(status_code=422, detail="image_prompt is required (min 20 chars)")
 
-    # 3. Атомарна зміна статусу (захист від подвійного кліку)
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE drafts SET media_status = 'generating', media_error = NULL, "
-            "image_prompt = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = ? AND media_status != 'generating'",
-            (prompt, draft_id)
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=409, detail="Image generation already in progress")
-
-    # 4. Запускаємо фонову задачу (захищену від GC)
-    task = asyncio.create_task(_generate_image_background(draft_id, prompt, draft["media_path"] if request and request.regenerate else None))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-    return {"draft_id": draft_id, "media_status": "generating"}
-
-
-async def _generate_image_background(draft_id: int, prompt: str, old_media_path: Optional[str] = None):
-    """
-    Фонова генерація зображення. При regeneration старий файл видаляється
-    тільки ПІСЛЯ успішної генерації нового.
-    """
-    try:
-        result = await asyncio.to_thread(media_builder.generate, draft_id, prompt)
-
-        if result:
-            # Успіх — оновлюємо БД
-            now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            with db._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE drafts SET media_status = 'ready', media_path = ?, "
-                    "media_provider = ?, media_mime_type = ?, media_size_bytes = ?, "
-                    "media_width = ?, media_height = ?, media_error = NULL, "
-                    "media_created_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (result["media_path"], result["media_provider"], result["mime_type"],
-                     result["size_bytes"], result["width"], result["height"], now_utc, draft_id)
-                )
-                conn.commit()
-
-            # Видаляємо старий файл тільки після успіху нового
-            if old_media_path and old_media_path != result["media_path"]:
-                media_builder.delete_media_file(old_media_path)
-
-            logger.success(f"Background image generation completed for draft {draft_id}")
-        else:
-            # Усі провайдери впали
-            with db._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE drafts SET media_status = 'failed', "
-                    "media_error = 'All providers failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (draft_id,)
-                )
-                conn.commit()
-
-    except Exception as e:
-        logger.error(f"Background image generation error for draft {draft_id}: {e}")
+    # Update prompt if changed
+    if prompt != draft["image_prompt"]:
         with db._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE drafts SET media_status = 'failed', "
-                "media_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (str(e)[:500], draft_id)
-            )
+            cursor.execute("UPDATE drafts SET image_prompt = ? WHERE id = ?", (prompt, draft_id))
             conn.commit()
+
+    # Queue logic
+    success = db.queue_media_generation(draft_id)
+    if not success:
+        raise HTTPException(status_code=409, detail="Image generation already in progress or already ready (use regenerate action if ready)")
+
+    return {"draft_id": draft_id, "media_status": "pending"}
 
 
 @app.delete("/api/drafts/{draft_id}/image")
@@ -254,11 +194,9 @@ def delete_image(draft_id: int):
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
 
-    # Видаляємо файл (з перевіркою path traversal)
     if draft["media_path"]:
         media_builder.delete_media_file(draft["media_path"])
-
-    # Очищаємо всі media-поля
+        
     with db._get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(

@@ -7,6 +7,7 @@ from database import db
 from telegram_listener import start_listener
 from ai_worker import ai_worker_loop
 from scheduler import scheduler_loop
+from media_worker import media_worker_loop
 from web_admin.main import app as web_app
 
 # Налаштовуємо логування у файл
@@ -29,6 +30,7 @@ async def main():
     tasks = [
         asyncio.create_task(start_listener(), name="TelegramListener"),
         asyncio.create_task(ai_worker_loop(), name="AIWorker"),
+        asyncio.create_task(media_worker_loop(), name="MediaWorker"),
         asyncio.create_task(scheduler_loop(), name="Scheduler"),
         asyncio.create_task(start_web_admin(), name="WebAdmin")
     ]

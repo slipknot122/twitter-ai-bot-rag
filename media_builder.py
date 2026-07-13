@@ -362,10 +362,24 @@ def _validate_and_save_image(
     except Exception as e:
         # Cleanup tmp якщо щось пішло не так
         if tmp_path.exists():
-            tmp_path.unlink()
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
         raise TransientMediaError(f"Failed to save image: {e}")
     finally:
         img.close()
+
+    # 5. Security & Path Validation
+    try:
+        resolved_path = output_path.resolve(strict=True)
+        media_root = output_path.parent.resolve(strict=True)
+        if not str(resolved_path).startswith(str(media_root)):
+            raise TransientMediaError("Path traversal detected after save")
+        if output_path.is_symlink() or not output_path.is_file():
+            raise TransientMediaError("Output is not a regular file")
+    except Exception as e:
+        raise TransientMediaError(f"File validation failed: {e}")
 
     final_size = output_path.stat().st_size
 
@@ -401,7 +415,7 @@ class MediaBuilder:
         raw = settings.media_provider_order
         return [p.strip() for p in raw.split(",") if p.strip()]
 
-    def generate(self, draft_id: int, prompt: str) -> Optional[dict]:
+    def generate(self, draft_id: int, prompt: str, token: Optional[str] = None) -> Optional[dict]:
         """
         Генерує зображення каскадно. Повертає dict з метаданими або None.
         
@@ -415,14 +429,21 @@ class MediaBuilder:
                 "height": 768,
             }
             або None якщо всі провайдери впали.
+            Також може кинути Exception (який обробить Media Worker).
         """
         if not settings.media_generation_enabled:
             logger.debug("Media generation is disabled in settings")
             return None
 
         # Генеруємо безпечне ім'я файлу (код формує, не LLM)
-        short_uuid = uuid.uuid4().hex[:8]
-        filename = f"draft_{draft_id}_{short_uuid}.jpg"
+        if token:
+            # Token є UUID, очищаємо його
+            safe_token = "".join(c for c in str(token) if c.isalnum())
+            filename = f"draft_{draft_id}_{safe_token}.jpg"
+        else:
+            short_uuid = uuid.uuid4().hex[:8]
+            filename = f"draft_{draft_id}_{short_uuid}.jpg"
+            
         output_path = self.media_dir / filename
 
         provider_order = self.get_provider_order()
