@@ -168,7 +168,7 @@
             const retries = parseInt(document.getElementById('max-retries').value);
             const interval = parseInt(document.getElementById('check-interval').value);
             
-            btn.innerHTML = 'Saving...';
+            btn.textContent = 'Saving...';
             
             const response = await fetch('/api/settings', {
                 method: 'POST',
@@ -186,15 +186,15 @@
             });
 
             if(response.ok) {
-                btn.innerHTML = 'Saved Successfully!';
+                btn.textContent = 'Saved Successfully!';
                 btn.classList.add('success');
                 setTimeout(() => {
-                    btn.innerHTML = 'Save Settings';
+                    btn.textContent = 'Save Settings';
                     btn.classList.remove('success');
                 }, 2000);
             } else {
-                alert("Failed to save settings.");
-                btn.innerHTML = 'Save Settings';
+                alert('Error saving settings');
+                btn.textContent = 'Save Settings';
             }
         }
     </script>

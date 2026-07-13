@@ -1066,7 +1066,7 @@
                 const tbody = document.getElementById('sources-tbody');
                 if(!tbody) return;
                 
-                tbody.innerHTML = '';
+                tbody.replaceChildren();
                 sources.forEach(src => {
                     const tr = document.createElement('tr');
                     tr.style.borderBottom = '1px solid var(--card-border)';
@@ -1131,6 +1131,9 @@
                         if (src.last_error_code) {
                             pollDiv.textContent += ` [${src.last_error_code}]`;
                             pollDiv.style.color = '#fca5a5';
+                        }
+                        if (src.last_http_status) {
+                            pollDiv.textContent += ` [HTTP ${src.last_http_status}]`;
                         }
                         statusCell.appendChild(pollDiv);
                     }

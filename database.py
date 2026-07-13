@@ -1490,7 +1490,7 @@ class Database:
                 
             # 2. Find eligible source
             cursor.execute("""
-                SELECT p.source_id, p.next_poll_at, p.collector_status, s.source_type, s.is_active, s.canonical_url
+                SELECT p.source_id, p.next_poll_at, p.collector_status, p.resolved_feed_url, s.source_type, s.is_active, s.canonical_url
                 FROM source_poll_state p
                 JOIN sources s ON p.source_id = s.id
                 WHERE s.is_active = 1 
@@ -1508,6 +1508,20 @@ class Database:
                 return None
                 
             source_id = row['source_id']
+            source_type = row['source_type']
+            canonical_url = row['canonical_url']
+            resolved_feed_url = row['resolved_feed_url']
+            
+            if source_type == 'rss':
+                claimed_mode = 'rss'
+                claimed_target = canonical_url
+            else:
+                if resolved_feed_url is None:
+                    claimed_mode = 'website discovery'
+                    claimed_target = canonical_url
+                else:
+                    claimed_mode = 'website feed'
+                    claimed_target = resolved_feed_url
             
             # 3. Claim it
             import uuid
@@ -1526,11 +1540,13 @@ class Database:
                 WHERE p.source_id = ?
             """, (source_id,))
             full_row = dict(cursor.fetchone())
+            full_row['claimed_mode'] = claimed_mode
+            full_row['claimed_target'] = claimed_target
             
             conn.commit()
             return full_row
 
-    def complete_source_poll(self, global_token: str, source_id: int, source_token: str, outcome_updates: dict, drafts_to_insert: List[dict] = None) -> bool:
+    def complete_source_poll(self, global_token: str, source_id: int, source_token: str, claimed_mode: str, claimed_target: str, outcome_updates: dict, drafts_to_insert: List[dict] = None) -> bool:
         import datetime
         now = datetime.datetime.now(datetime.timezone.utc)
         now_str = now.isoformat()
@@ -1539,11 +1555,16 @@ class Database:
             'collector_status', 'last_error_code', 'consecutive_errors',
             'last_attempt_at', 'last_success_at', 'next_poll_at',
             'resolved_feed_url', 'validator_url', 'etag', 'last_modified',
-            'initial_sync_completed_at'
+            'initial_sync_completed_at', 'last_http_status'
         }
         for k in outcome_updates.keys():
             if k not in allowed_fields:
                 raise ValueError(f"Disallowed outcome field: {k}")
+
+        if 'last_http_status' in outcome_updates:
+            st = outcome_updates['last_http_status']
+            if st is not None and not (isinstance(st, int) and 100 <= st <= 599):
+                raise ValueError("last_http_status must be an integer between 100 and 599, or None")
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1564,8 +1585,10 @@ class Database:
                     w.expires_at as gw_expires,
                     p.lease_token as src_token,
                     p.lease_expires_at as src_expires,
+                    p.resolved_feed_url,
                     s.is_active,
                     s.source_type,
+                    s.canonical_url,
                     s.resolution_status
                 FROM worker_leases w
                 LEFT JOIN source_poll_state p ON p.source_id = ?
@@ -1590,10 +1613,25 @@ class Database:
                 conn.rollback()
                 return False # Stale worker or expired source lease
                 
-            if row['is_active'] == 0 or row['resolution_status'] == 'unresolved' or row['source_type'] not in ('rss', 'website'):
+            if row['is_active'] == 0 or row['source_type'] not in ('rss', 'website'):
                 # Still clear lease if we own it but it became invalid
                 cursor.execute("UPDATE source_poll_state SET lease_token = NULL, lease_expires_at = NULL WHERE source_id = ?", (source_id,))
                 conn.commit()
+                return False
+
+            if row['source_type'] == 'rss':
+                current_mode = 'rss'
+                current_target = row['canonical_url']
+            else:
+                if row['resolved_feed_url'] is None:
+                    current_mode = 'website discovery'
+                    current_target = row['canonical_url']
+                else:
+                    current_mode = 'website feed'
+                    current_target = row['resolved_feed_url']
+                    
+            if current_mode != claimed_mode or current_target != claimed_target:
+                conn.rollback()
                 return False
                 
             set_clauses = ["lease_token = NULL", "lease_expires_at = NULL", "updated_at = CURRENT_TIMESTAMP"]
@@ -1648,7 +1686,7 @@ class Database:
             conn.execute('BEGIN IMMEDIATE')
             
             cursor.execute("""
-                SELECT p.collector_status, p.lease_token, s.is_active, s.resolution_status, s.source_type
+                SELECT p.collector_status, p.lease_token, s.is_active, s.source_type
                 FROM source_poll_state p
                 JOIN sources s ON p.source_id = s.id
                 WHERE p.source_id = ?
@@ -1659,7 +1697,7 @@ class Database:
                 conn.rollback()
                 return "missing"
                 
-            if row['is_active'] == 0 or row['resolution_status'] == 'unresolved':
+            if row['is_active'] == 0 or row['source_type'] not in ('rss', 'website'):
                 conn.rollback()
                 return "conflict"
                 
