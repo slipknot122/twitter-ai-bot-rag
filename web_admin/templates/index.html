@@ -1122,6 +1122,19 @@
                     }
                     statusCell.appendChild(statusBadge);
                     
+                    if (src.collector_status) {
+                        const pollDiv = document.createElement('div');
+                        pollDiv.style.fontSize = '0.75rem';
+                        pollDiv.style.marginTop = '0.25rem';
+                        pollDiv.style.color = 'var(--text-muted)';
+                        pollDiv.textContent = `Poll: ${src.collector_status} (Err: ${src.consecutive_errors || 0})`;
+                        if (src.last_error_code) {
+                            pollDiv.textContent += ` [${src.last_error_code}]`;
+                            pollDiv.style.color = '#fca5a5';
+                        }
+                        statusCell.appendChild(pollDiv);
+                    }
+                    
                     const actionCell = document.createElement('td');
                     actionCell.style.padding = '0.75rem';
                     actionCell.style.display = 'flex';
@@ -1143,6 +1156,16 @@
                         btnToggle.className = src.is_active ? 'btn-ignore' : 'btn-publish';
                         btnToggle.onclick = () => toggleSourceStatus(src.id, !src.is_active);
                         actionCell.appendChild(btnToggle);
+                    }
+                    
+                    if (src.is_active && src.resolution_status === 'resolved' && (src.source_type === 'rss' || src.source_type === 'website')) {
+                        const btnPoll = document.createElement('button');
+                        btnPoll.textContent = 'Poll Now';
+                        btnPoll.style.padding = '0.2rem 0.5rem';
+                        btnPoll.style.fontSize = '0.8rem';
+                        btnPoll.className = 'btn-save';
+                        btnPoll.onclick = () => pollSourceNow(src.id);
+                        actionCell.appendChild(btnPoll);
                     }
                     
                     tr.append(nameCell, idCell, pTCell, statusCell, actionCell);
@@ -1213,6 +1236,21 @@
                     }
                 }
                 fetchSources();
+            } catch(e) {
+                alert("Request failed");
+            }
+        }
+        
+        async function pollSourceNow(id) {
+            try {
+                const resp = await fetch(`/api/sources/${id}/poll_now`, { method: 'POST' });
+                if(resp.ok) {
+                    alert("Source added to polling queue.");
+                    fetchSources();
+                } else {
+                    const data = await resp.json();
+                    alert(data.detail || "Error queueing poll");
+                }
             } catch(e) {
                 alert("Request failed");
             }

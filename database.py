@@ -315,6 +315,9 @@ class Database:
             # 7. Phase 5 migration — sources та snapshot-колонки
             self._migrate_phase5(cursor, conn)
             
+            # 8. Phase 6 migration — ingestion state та leases
+            self._migrate_phase6(cursor, conn)
+            
             logger.debug(f"Database initialized at {self.db_path}")
 
             if self.get_setting("publish_delay_minutes") is None:
@@ -406,6 +409,65 @@ class Database:
                     )
 
         # f) Коміт
+        conn.commit()
+
+    def _migrate_phase6(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection):
+        """Міграція Phase 6: worker_leases, source_poll_state, drafts publication fields."""
+        cursor.execute('BEGIN IMMEDIATE')
+        
+        # a) worker_leases
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS worker_leases (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                worker_id TEXT NOT NULL,
+                lease_token TEXT NOT NULL,
+                heartbeat_at TIMESTAMP NOT NULL,
+                expires_at TIMESTAMP NOT NULL
+            )
+        ''')
+        
+        # b) source_poll_state
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS source_poll_state (
+                source_id INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE RESTRICT,
+                collector_status TEXT NOT NULL DEFAULT 'idle' CHECK(collector_status IN ('idle', 'queued', 'polling', 'healthy', 'backoff', 'degraded', 'unsupported', 'blocked_by_robots')),
+                resolved_feed_url TEXT,
+                validator_url TEXT,
+                etag TEXT,
+                last_modified TEXT,
+                last_attempt_at TIMESTAMP,
+                last_success_at TIMESTAMP,
+                next_poll_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                initial_sync_completed_at TIMESTAMP,
+                last_http_status INTEGER,
+                consecutive_errors INTEGER DEFAULT 0,
+                last_error_code TEXT,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # c) drafts update
+        cursor.execute("PRAGMA table_info(drafts)")
+        existing_columns = {row['name'] for row in cursor.fetchall()}
+        
+        phase6_columns = {
+            "source_published_at": "TIMESTAMP NULL",
+            "source_updated_at": "TIMESTAMP NULL"
+        }
+        for col_name, col_def in phase6_columns.items():
+            if col_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col_name} {col_def}")
+                
+        # Fill poll state for active rss/website sources
+        cursor.execute("""
+            INSERT OR IGNORE INTO source_poll_state (source_id, next_poll_at)
+            SELECT id, CURRENT_TIMESTAMP FROM sources 
+            WHERE source_type IN ('rss', 'website')
+        """)
+                
         conn.commit()
 
     def _transition_draft(self, conn: sqlite3.Connection, draft_id: int, expected_statuses: Set[str], new_status: str, updates: dict = None) -> bool:
@@ -1144,10 +1206,19 @@ class Database:
         """Отримати список джерел, опціонально фільтрованих за is_active."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            query = """
+                SELECT s.*, 
+                       p.collector_status, p.last_error_code, p.consecutive_errors, 
+                       p.last_attempt_at, p.last_success_at, p.next_poll_at
+                FROM sources s
+                LEFT JOIN source_poll_state p ON s.id = p.source_id
+            """
             if is_active is not None:
-                cursor.execute("SELECT * FROM sources WHERE is_active = ? ORDER BY id", (int(is_active),))
+                query += " WHERE s.is_active = ? ORDER BY s.id"
+                cursor.execute(query, (int(is_active),))
             else:
-                cursor.execute("SELECT * FROM sources ORDER BY id")
+                query += " ORDER BY s.id"
+                cursor.execute(query)
             return [dict(row) for row in cursor.fetchall()]
 
     def get_source(self, source_id: int) -> Optional[Dict[str, Any]]:
@@ -1344,5 +1415,235 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
+
+    # --- Phase 6: Global Worker Lease and Polling ---
+
+    def acquire_global_lease(self, worker_id: str, duration_sec: int) -> Optional[str]:
+        import uuid
+        import datetime
+        token = str(uuid.uuid4())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires = (now + datetime.timedelta(seconds=duration_sec)).isoformat()
+        now_str = now.isoformat()
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            
+            cursor.execute("SELECT lease_token, expires_at FROM worker_leases WHERE id = 1")
+            row = cursor.fetchone()
+            if row:
+                if row['expires_at'] > now_str:
+                    conn.rollback()
+                    return None
+                cursor.execute(
+                    "UPDATE worker_leases SET worker_id = ?, lease_token = ?, heartbeat_at = ?, expires_at = ? WHERE id = 1",
+                    (worker_id, token, now_str, expires)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO worker_leases (id, worker_id, lease_token, heartbeat_at, expires_at) VALUES (1, ?, ?, ?, ?)",
+                    (worker_id, token, now_str, expires)
+                )
+            conn.commit()
+            return token
+
+    def heartbeat_global_lease(self, token: str, duration_sec: int) -> bool:
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires = (now + datetime.timedelta(seconds=duration_sec)).isoformat()
+        now_str = now.isoformat()
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE worker_leases SET heartbeat_at = ?, expires_at = ? WHERE id = 1 AND lease_token = ?",
+                (now_str, expires, token)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def release_global_lease(self, token: str):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM worker_leases WHERE id = 1 AND lease_token = ?", (token,))
+            conn.commit()
+
+    def claim_due_poll_source(self, global_token: str, source_lease_sec: int) -> Optional[Dict[str, Any]]:
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        now_str = now.isoformat()
+        expires = (now + datetime.timedelta(seconds=source_lease_sec)).isoformat()
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            
+            # 1. Verify global lease
+            cursor.execute("SELECT expires_at FROM worker_leases WHERE id = 1 AND lease_token = ?", (global_token,))
+            gw = cursor.fetchone()
+            if not gw or gw['expires_at'] <= now_str:
+                conn.rollback()
+                return None
+                
+            # 2. Find eligible source
+            cursor.execute("""
+                SELECT p.source_id, p.next_poll_at, p.collector_status, s.source_type, s.is_active, s.canonical_url
+                FROM source_poll_state p
+                JOIN sources s ON p.source_id = s.id
+                WHERE s.is_active = 1 
+                  AND s.source_type IN ('rss', 'website')
+                  AND p.next_poll_at <= ?
+                  AND (p.lease_expires_at IS NULL OR p.lease_expires_at <= ?)
+                ORDER BY p.next_poll_at ASC
+                LIMIT 1
+            """, (now_str, now_str))
+            
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+                
+            source_id = row['source_id']
+            
+            # 3. Claim it
+            import uuid
+            source_token = str(uuid.uuid4())
+            cursor.execute("""
+                UPDATE source_poll_state 
+                SET lease_token = ?, lease_expires_at = ?, collector_status = CASE WHEN collector_status = 'idle' THEN 'polling' ELSE collector_status END
+                WHERE source_id = ?
+            """, (source_token, expires, source_id))
+            
+            # Fetch complete row
+            cursor.execute("""
+                SELECT p.*, s.source_type, s.external_id, s.name, s.priority, s.trust_rating, s.processing_mode, s.canonical_url 
+                FROM source_poll_state p
+                JOIN sources s ON p.source_id = s.id
+                WHERE p.source_id = ?
+            """, (source_id,))
+            full_row = dict(cursor.fetchone())
+            
+            conn.commit()
+            return full_row
+
+    def complete_source_poll(self, global_token: str, source_id: int, source_token: str, outcome_updates: dict, drafts_to_insert: List[dict] = None) -> bool:
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        now_str = now.isoformat()
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            
+            # 1. Verify global lease
+            cursor.execute("SELECT expires_at FROM worker_leases WHERE id = 1 AND lease_token = ?", (global_token,))
+            gw = cursor.fetchone()
+            if not gw or gw['expires_at'] <= now_str:
+                conn.rollback()
+                return False
+                
+            # 2. Verify source is still active and token matches
+            cursor.execute("""
+                SELECT p.lease_token, p.lease_expires_at, s.is_active, s.resolution_status
+                FROM source_poll_state p
+                JOIN sources s ON p.source_id = s.id
+                WHERE p.source_id = ?
+            """, (source_id,))
+            src = cursor.fetchone()
+            
+            if not src or src['is_active'] == 0 or src['resolution_status'] == 'unresolved' or src['lease_token'] != source_token:
+                # Still clear lease if we own it but it's deactivated
+                if src and src['lease_token'] == source_token:
+                    cursor.execute("UPDATE source_poll_state SET lease_token = NULL, lease_expires_at = NULL WHERE source_id = ?", (source_id,))
+                    conn.commit()
+                else:
+                    conn.rollback()
+                return False
+                
+            # 3. Update source_poll_state
+            set_clauses = ["lease_token = NULL", "lease_expires_at = NULL", "updated_at = CURRENT_TIMESTAMP"]
+            params = []
+            for k, v in outcome_updates.items():
+                set_clauses.append(f"{k} = ?")
+                params.append(v)
+                
+            set_clauses_str = ", ".join(set_clauses)
+            params.append(source_id)
+            cursor.execute(f"UPDATE source_poll_state SET {set_clauses_str} WHERE source_id = ?", params)
+            
+            # 4. Insert drafts if any
+            if drafts_to_insert:
+                cursor.execute(
+                    "SELECT id, name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
+                    (source_id,)
+                )
+                src_meta = cursor.fetchone()
+                
+                # Verify limit to prevent runaway inserts
+                cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE source_id = ?", (source_id,))
+                
+                for draft in drafts_to_insert:
+                    try:
+                        cursor.execute("""
+                            INSERT INTO drafts (
+                                original_text, status, source_id, source_name_snapshot, 
+                                source_priority_snapshot, source_trust_snapshot, 
+                                source_processing_mode_snapshot, source_item_id,
+                                source_published_at, source_updated_at, created_at, updated_at
+                            ) VALUES (?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            draft['original_text'], source_id, src_meta['name'],
+                            src_meta['priority'], src_meta['trust_rating'], src_meta['processing_mode'],
+                            draft['source_item_id'], draft.get('source_published_at'), draft.get('source_updated_at'),
+                            now_str, now_str
+                        ))
+                    except sqlite3.IntegrityError:
+                        pass # Duplicate source_item_id
+                        
+            conn.commit()
+            return True
+            
+    def get_poll_state(self, source_id: int) -> Optional[dict]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM source_poll_state WHERE source_id = ?", (source_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+            
+    def poll_now(self, source_id: int) -> str:
+        """API method to enqueue immediate poll. Returns 'queued', 'missing', or 'conflict'"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            
+            cursor.execute("""
+                SELECT p.collector_status, p.lease_token, s.is_active, s.resolution_status, s.source_type
+                FROM source_poll_state p
+                JOIN sources s ON p.source_id = s.id
+                WHERE p.source_id = ?
+            """, (source_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                conn.rollback()
+                return "missing"
+                
+            if row['is_active'] == 0 or row['resolution_status'] == 'unresolved':
+                conn.rollback()
+                return "conflict"
+                
+            if row['lease_token'] is not None:
+                conn.rollback()
+                return "conflict" # Already polling
+                
+            # Allow unsupported website to be retried
+            cursor.execute("""
+                UPDATE source_poll_state 
+                SET next_poll_at = CURRENT_TIMESTAMP, collector_status = 'queued', updated_at = CURRENT_TIMESTAMP
+                WHERE source_id = ?
+            """, (source_id,))
+            conn.commit()
+            return "queued"
 
 db = Database()

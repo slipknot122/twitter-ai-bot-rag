@@ -362,6 +362,15 @@ def resolve_source(source_id: int, req: SourceResolve):
             raise HTTPException(status_code=409, detail=err)
         raise HTTPException(status_code=422, detail=err)
 
+@app.post("/api/sources/{source_id}/poll_now", status_code=202)
+def poll_now_endpoint(source_id: int):
+    status = db.poll_now(source_id)
+    if status == "missing":
+        raise HTTPException(status_code=404, detail="Source not found")
+    if status == "conflict":
+        raise HTTPException(status_code=409, detail="Source cannot be polled currently (inactive, unresolved, or active lease)")
+    return {"status": "queued"}
+
 @app.get("/logs", response_class=HTMLResponse)
 def logs_page(request: Request, filter: str = "ALL"):
     logs_content = []
