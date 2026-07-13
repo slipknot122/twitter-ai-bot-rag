@@ -26,9 +26,9 @@ class SourceCache:
             self._loaded_at = time.time()
             self._consecutive_failures = 0
             return True
-        except Exception as e:
+        except Exception:
             self._consecutive_failures += 1
-            logger.error(f"Failed to reload SourceCache: {e}")
+            logger.error("Failed to reload SourceCache [SAFE_ERR_CACHE_RELOAD]")
             if self._consecutive_failures >= 2 or (time.time() - self._loaded_at >= self._ttl):
                 logger.warning("Clearing SourceCache due to fail-closed policy.")
                 self._cache = {}
@@ -43,19 +43,25 @@ class SourceCache:
     def invalidate(self):
         self._loaded_at = 0
 
-# Initialize Telethon Client
-client = TelegramClient('bot_session', settings.telegram_api_id, settings.telegram_api_hash)
-
 source_cache = SourceCache(db)
 
-# Listen to all incoming messages. We'll filter them using the cache.
-@client.on(events.NewMessage(incoming=True))
-async def handle_new_message(event):
+def create_telegram_client() -> TelegramClient:
+    """Factory для створення TelegramClient виключно під час виконання."""
+    if not settings.telegram_api_id or not settings.telegram_api_hash:
+        raise RuntimeError("Telegram credentials are not configured")
+
+    return TelegramClient(
+        'bot_session',
+        settings.telegram_api_id,
+        settings.telegram_api_hash
+    )
+
+async def process_telegram_event(event, cache, db_instance):
     """
-    Обробник нових повідомлень з Telegram.
+    Чиста функція для обробки подій.
     Тут немає бізнес-логіки ШІ. Тільки збереження в SQLite як чергу.
     """
-    if not event.chat_id:
+    if not getattr(event, 'chat_id', None):
         return
         
     try:
@@ -63,34 +69,35 @@ async def handle_new_message(event):
     except ValueError:
         return
         
-    source = source_cache.get(normalized_id)
+    source = cache.get(normalized_id)
     if not source:
         return
 
     message_id = str(event.id)
-    text = event.text
 
+    # Читаємо text тільки перед передачею в БД
+    text = getattr(event, 'text', '')
     if not text or len(text) < 10:
-        return # Ігноруємо порожні або занадто короткі повідомлення
-
-    channel_name = source['name']
-    logger.info(f"Listener: New message from {channel_name} (ID: {message_id})")
+        return
 
     try:
-        result = db.create_draft_from_active_source("telegram", normalized_id, message_id, text)
+        result = db_instance.create_draft_from_active_source("telegram", normalized_id, message_id, text)
         if result == "duplicate":
-            logger.debug(f"Listener: Message {normalized_id}:{message_id} already exists. Skipping.")
+            # Не логуємо деталі для duplicate, щоб не смітити
+            pass
         elif result == "rejected":
-            logger.debug(f"Listener: Message from {normalized_id} rejected by DB transaction.")
+            logger.debug("Listener: Message rejected by DB transaction [SAFE_REJECT]")
         elif result == "created":
-            logger.success(f"Listener: Message added to queue (Source: {channel_name}, MsgID: {message_id})")
-    except Exception as e:
-        logger.error(f"Listener: Failed to add message to DB: {e}")
+            logger.success("Listener: Message added to queue [SAFE_CREATE]")
+    except Exception:
+        logger.error("Listener: Failed to add message to DB [SAFE_ERR_LISTENER_DB]")
 
 async def start_listener():
     """Запуск Telegram клієнта."""
-    if not settings.telegram_api_id or not settings.telegram_api_hash:
-        logger.error("TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env")
+    try:
+        client = create_telegram_client()
+    except RuntimeError as e:
+        logger.error(f"Cannot start listener: {e}")
         return
         
     logger.info("Starting Telegram Listener with SourceCache filtering")
@@ -98,14 +105,15 @@ async def start_listener():
     # Preload cache
     source_cache.reload()
     logger.info(f"Loaded {len(source_cache._cache)} active telegram sources into cache.")
-    
-    # Використовуємо start() з пустими параметрами. 
-    # Під час першого запуску він попросить телефон в консолі, якщо сесії немає.
-    await client.start()
-    logger.success("Telegram Listener connected and running 24/7!")
-    
-    # Запускаємо безкінечний цикл
-    await client.run_until_disconnected()
 
-if __name__ == "__main__":
-    asyncio.run(start_listener())
+    @client.on(events.NewMessage(incoming=True))
+    async def handle_new_message(event):
+        await process_telegram_event(event, source_cache, db)
+
+    try:
+        await client.start(phone=settings.telegram_phone_number)
+        logger.success("Telegram Client started and listening for messages")
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"Telegram Client connection failed: {e}")
+        raise

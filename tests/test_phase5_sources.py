@@ -814,3 +814,82 @@ def test_ui_xss_source_name(temp_db):
         # GET should also return it safely
         resp2 = client.get(f"/api/sources/{data['id']}")
         assert resp2.json()["name"] == "<script>alert(1)</script>"
+
+
+# ===========================================================================
+# REGRESSION TESTS (TELEGRAM LISTENER & CACHE)
+# ===========================================================================
+
+def test_import_telegram_listener_no_credentials():
+    # Import telegram_listener without credentials
+    # It should not raise any exceptions during import
+    with patch("config.settings") as mock_settings:
+        mock_settings.telegram_api_id = None
+        mock_settings.telegram_api_hash = None
+        
+        # We need to reload the module to simulate import
+        import sys
+        import importlib
+        if "telegram_listener" in sys.modules:
+            importlib.reload(sys.modules["telegram_listener"])
+        else:
+            import telegram_listener
+            
+        assert True # Import succeeded without errors
+
+def test_start_listener_no_credentials_safe_error():
+    # start_listener should handle missing credentials safely
+    import telegram_listener
+    with patch("config.settings") as mock_settings:
+        mock_settings.telegram_api_id = None
+        mock_settings.telegram_api_hash = None
+        
+        # It shouldn't raise exception, just log error and return
+        import asyncio
+        asyncio.run(telegram_listener.start_listener())
+
+def test_source_cache_reload_safe_error():
+    import telegram_listener
+    # Create cache with mock db that throws exception
+    mock_db = MagicMock()
+    mock_db.get_sources.side_effect = Exception("DB Error")
+    cache = telegram_listener.SourceCache(mock_db, ttl_seconds=60)
+    
+    # Reload should fail but safely return False
+    res = cache.reload()
+    assert res is False
+
+def test_normalize_telegram_id_negative_bare_id():
+    # -123456 -> ValueError
+    with pytest.raises(ValueError, match="Negative Telegram ID must start with -100"):
+        normalize_telegram_id("-123456")
+
+def test_normalize_telegram_id_oversized():
+    # Length > 20 -> ValueError
+    with pytest.raises(ValueError, match="Telegram ID too long"):
+        normalize_telegram_id("1" * 21)
+
+def test_normalize_telegram_id_zero():
+    # 0 -> ValueError
+    with pytest.raises(ValueError, match="Telegram ID cannot be zero"):
+        normalize_telegram_id("0")
+    
+    with pytest.raises(ValueError, match="Telegram ID cannot be zero"):
+        normalize_telegram_id("-1000")
+
+def test_normalize_telegram_id_missing_channel_payload():
+    # "-100" without payload -> ValueError
+    with pytest.raises(ValueError, match="Missing or invalid channel payload after -100"):
+        normalize_telegram_id("-100")
+
+def test_validate_canonical_url_rejects_newlines_tabs():
+    # Rejects tab, newline, carriage return, and DEL (0x7f)
+    with pytest.raises(ValueError, match="canonical_url contains control character"):
+        _validate_canonical_url("https://example.com/\tpath", "website")
+        
+    with pytest.raises(ValueError, match="canonical_url contains control character"):
+        _validate_canonical_url("https://example.com/\npath", "website")
+        
+    with pytest.raises(ValueError, match="canonical_url contains control character"):
+        _validate_canonical_url("https://example.com/\x7fpath", "website")
+

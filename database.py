@@ -22,19 +22,33 @@ def normalize_telegram_id(raw) -> str:
     s = str(raw).strip()
     if not s:
         raise ValueError("Empty Telegram ID")
-    # Видаляємо мінус для аналізу
-    if s.startswith('-'):
-        abs_part = s[1:]
-    else:
-        abs_part = s
-    # Має складатися лише з цифр
-    if not abs_part.isdigit() or not abs_part:
-        raise ValueError(f"Invalid Telegram ID: {raw!r}")
+        
     # Якщо вже має префікс -100
     if s.startswith('-100'):
+        abs_part = s[4:]
+        if not abs_part.isdigit() or not abs_part:
+            raise ValueError(f"Missing or invalid channel payload after -100")
+        if len(abs_part) > 20:
+            raise ValueError(f"Telegram ID too long")
+        if int(abs_part) == 0:
+            raise ValueError(f"Telegram ID cannot be zero")
         return s
-    # Інакше — голий peer ID
-    return f"-100{abs_part}"
+        
+    # Якщо починається з -, але не -100
+    if s.startswith('-'):
+        raise ValueError(f"Negative Telegram ID must start with -100")
+        
+    # Має складатися лише з цифр (positive bare ID)
+    if not s.isdigit() or not s:
+        raise ValueError(f"Invalid Telegram ID")
+        
+    if len(s) > 20:
+        raise ValueError(f"Telegram ID too long")
+        
+    if int(s) == 0:
+        raise ValueError(f"Telegram ID cannot be zero")
+        
+    return f"-100{s}"
 
 
 def _validate_canonical_url(url: str, source_type: str) -> str:
@@ -42,9 +56,9 @@ def _validate_canonical_url(url: str, source_type: str) -> str:
     cleaned = url.strip()
     if not cleaned:
         raise ValueError("canonical_url is empty after stripping")
-    # Перевірка на керуючі символи (< 0x20 окрім табуляцій/переносів)
+    # Перевірка на керуючі символи (всі < 0x20 та 0x7f)
     for ch in cleaned:
-        if ord(ch) < 0x20 and ch not in ('\t', '\n', '\r'):
+        if ord(ch) < 0x20 or ord(ch) == 0x7f:
             raise ValueError(f"canonical_url contains control character: {ord(ch):#x}")
     # Заборонені схеми для всіх типів
     lower = cleaned.lower()
