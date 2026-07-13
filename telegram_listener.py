@@ -96,8 +96,8 @@ async def start_listener():
     """Запуск Telegram клієнта."""
     try:
         client = create_telegram_client()
-    except RuntimeError as e:
-        logger.error(f"Cannot start listener: {e}")
+    except RuntimeError:
+        logger.error("Cannot start listener [SAFE_ERR_MISSING_CREDENTIALS]")
         return
         
     logger.info("Starting Telegram Listener with SourceCache filtering")
@@ -114,6 +114,6 @@ async def start_listener():
         await client.start(phone=settings.telegram_phone_number)
         logger.success("Telegram Client started and listening for messages")
         await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"Telegram Client connection failed: {e}")
-        raise
+    except Exception:
+        logger.error("Telegram Client connection failed [SAFE_ERR_CONNECTION_FAILED]")
+        raise RuntimeError("Telegram Client connection failed [SAFE_ERR_CONNECTION_FAILED]")

@@ -893,3 +893,22 @@ def test_validate_canonical_url_rejects_newlines_tabs():
     with pytest.raises(ValueError, match="canonical_url contains control character"):
         _validate_canonical_url("https://example.com/\x7fpath", "website")
 
+
+
+def test_start_listener_connection_failure_safe_log():
+    import telegram_listener
+    import asyncio
+    from unittest.mock import AsyncMock
+    with patch("config.settings") as mock_settings:
+        mock_settings.telegram_api_id = "123"
+        mock_settings.telegram_api_hash = "abc"
+        mock_settings.telegram_phone_number = "123"
+        
+        with patch("telegram_listener.create_telegram_client") as mock_create:
+            mock_client = MagicMock()
+            # Simulate a connection failure (e.g. network error)
+            mock_client.start = AsyncMock(side_effect=Exception("Network disconnected"))
+            mock_create.return_value = mock_client
+            
+            with pytest.raises(RuntimeError, match="Telegram Client connection failed \\[SAFE_ERR_CONNECTION_FAILED\\]"):
+                asyncio.run(telegram_listener.start_listener())
