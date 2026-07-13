@@ -72,9 +72,9 @@ class MockStreamResp:
     ([], "redirect_missing_location"),
     ([(b"location", b"   ")], "redirect_missing_location"),
     ([(b"location", b"http://ok.com"), (b"location", b"http://ok2.com")], "redirect_ambiguous_location"),
-    ([(b"location", b"http://ok.com/\x00/a")], "redirect_ambiguous_location"),
-    ([(b"location", b"http://ok.com/\n/a")], "redirect_ambiguous_location"),
-    ([(b"location", b"http://ok.com\r/a")], "redirect_ambiguous_location"),
+    ([(b"location", b"http://ok.com/\x00/a")], "redirect_invalid_location"),
+    ([(b"location", b"http://ok.com/\n/a")], "redirect_invalid_location"),
+    ([(b"location", b"http://ok.com\r/a")], "redirect_invalid_location"),
     ([(b"location", b"http://ok.com"), (b"location", b"   ")], "redirect_ambiguous_location"),
     ([(b"location", b"http://ok.com/a,b")], None),
 ])
@@ -105,8 +105,8 @@ async def test_location_cardinality(worker, headers_raw, expected_error):
     ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Encoding": b"gzip"}, b"<?xml>", None),
     ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Encoding": b"deflate"}, b"<?xml>", None),
     ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Encoding": b"identity"}, b"<?xml>", None),
-    ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Encoding": b"br"}, b"<?xml>", "unsupported_encoding"),
-    ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Encoding": b"gzip, deflate"}, b"<?xml>", "unsupported_encoding"),
+    ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Encoding": b"br"}, b"<?xml>", "unsupported_content_encoding"),
+    ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Encoding": b"gzip, deflate"}, b"<?xml>", "multiple_content_encodings"),
     ("rss", 1024, 200, {b"Content-Type": b"application/xml", b"Content-Length": b"2048"}, b"<?xml>", "content_too_large"),
     ("rss", 10, 200, {b"Content-Type": b"application/xml"}, b"<?xml><toobig/>", "content_too_large"),
 ])
@@ -238,11 +238,11 @@ async def test_host_limiter_real():
     await limiter.acquire("https://test.com")
     key = "https://test.com:443"
     async with limiter._registry_lock:
-        assert limiter.owner_counts[key] == 1
+        assert limiter._states[key].owner_count == 1
 
     await limiter.release(key)
     async with limiter._registry_lock:
-        assert limiter.owner_counts[key] == 0
+        assert limiter._states.get(key) is None or limiter._states[key].owner_count == 0
 
 # 8. SSRF checking via validate_url_and_dns
 @pytest.mark.asyncio

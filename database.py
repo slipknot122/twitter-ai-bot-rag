@@ -576,7 +576,7 @@ class Database:
                         )
                       )
                   ) DESC,
-                  created_at ASC,
+                  julianday(created_at) ASC,
                   id ASC
                 LIMIT 1
             """)
@@ -1632,6 +1632,13 @@ class Database:
             if current_mode != claimed_mode or current_target != claimed_target:
                 conn.rollback()
                 return False
+                
+            # V-18: Clear validators if discovery target changes
+            if 'resolved_feed_url' in outcome_updates:
+                if outcome_updates['resolved_feed_url'] != row['resolved_feed_url']:
+                    outcome_updates['etag'] = None
+                    outcome_updates['last_modified'] = None
+                    outcome_updates['validator_url'] = None
                 
             set_clauses = ["lease_token = NULL", "lease_expires_at = NULL", "updated_at = CURRENT_TIMESTAMP"]
             params = []

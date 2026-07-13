@@ -14,6 +14,8 @@ import urllib.robotparser
 import time
 import re
 import unicodedata
+from enum import Enum
+from dataclasses import dataclass
 
 import httpx
 import feedparser
@@ -23,6 +25,21 @@ from config import settings
 from ssrf_validator import validate_url_and_dns, SSRFError, URLValidationError
 
 logger = logging.getLogger(__name__)
+
+class CancellationReason(str, Enum):
+    GLOBAL_LEASE_LOST = "global_lease_lost"
+    SOURCE_LEASE_LOST = "source_lease_lost"
+    SHUTDOWN = "shutdown"
+    TRANSIENT_INTERNAL = "transient_internal"
+
+CANCELLATION_PRIORITY = {
+    CancellationReason.GLOBAL_LEASE_LOST: 4,
+    CancellationReason.SOURCE_LEASE_LOST: 3,
+    CancellationReason.SHUTDOWN: 2,
+    CancellationReason.TRANSIENT_INTERNAL: 1,
+}
+
+ROBOTS_PRODUCT_TOKEN = "AntigravityBot"
 
 MAX_REDIRECTS = 3
 MAX_DECODED_BYTES = 5 * 1024 * 1024  # 5 MiB
@@ -42,55 +59,57 @@ class StartupConfigError(Exception):
     pass
 
 def check_startup_config():
-    if os.environ.get("RSS_EGRESS_SANDBOX_CONFIRMED", "").lower() != "true":
-        raise StartupConfigError("RSS_EGRESS_SANDBOX_CONFIRMED is not true. Worker disabled for safety.")
+    if os.environ.get("RSS_EGRESS_SANDBOX_CONFIRMED") != "true":
+        raise StartupConfigError("RSS_EGRESS_SANDBOX_CONFIRMED is not exact 'true'. Worker disabled for safety.")
     if HEARTBEAT_INTERVAL_SEC >= GLOBAL_LEASE_DURATION_SEC:
         raise StartupConfigError("Heartbeat interval must be strictly less than global lease duration")
     if POLL_DEADLINE_SEC >= SOURCE_LEASE_SEC:
         raise StartupConfigError("Poll deadline must be strictly less than source lease duration")
 
-class HostLimiter:
-    def __init__(self):
-        self.locks = {}
-        self.next_allowed = {}
-        self.waiter_counts = {}
-        self.owner_counts = {}
-        self.last_used = {}
-        self._registry_lock = asyncio.Lock()
+@dataclass
+class HostState:
+    request_lock: asyncio.Lock
+    waiter_count: int = 0
+    owner_count: int = 0
+    next_allowed_monotonic: float = 0.0
+    last_used_monotonic: float = 0.0
 
-    async def acquire(self, url: str):
+class HostLimiter:
+    def __init__(self, interval: float = 10.0, idle_ttl: float = 300.0) -> None:
+        self._registry_lock = asyncio.Lock()
+        self._states: dict[str, HostState] = {}
+        self._interval = interval
+        self._idle_ttl = idle_ttl
+
+    async def acquire(self, url: str) -> str:
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname.lower() if parsed.hostname else ""
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
         key = f"{parsed.scheme}://{host}:{port}"
         
         async with self._registry_lock:
-            if key not in self.locks:
-                self.locks[key] = asyncio.Lock()
-                self.waiter_counts[key] = 0
-                self.owner_counts[key] = 0
-                self.next_allowed[key] = 0.0
-                self.last_used[key] = time.monotonic()
-            
-            self.waiter_counts[key] += 1
-            request_lock = self.locks[key]
+            if key not in self._states:
+                self._states[key] = HostState(request_lock=asyncio.Lock())
+            state = self._states[key]
+            state.waiter_count += 1
+            request_lock = state.request_lock
 
         try:
             await request_lock.acquire()
         except asyncio.CancelledError:
             async with self._registry_lock:
-                self.waiter_counts[key] -= 1
+                state.waiter_count -= 1
             raise
             
         async with self._registry_lock:
-            self.waiter_counts[key] -= 1
-            self.owner_counts[key] += 1
-            self.last_used[key] = time.monotonic()
+            state.waiter_count -= 1
+            state.owner_count += 1
+            state.last_used_monotonic = time.monotonic()
             
         try:
             now = time.monotonic()
             async with self._registry_lock:
-                allowed = self.next_allowed[key]
+                allowed = state.next_allowed_monotonic
             if now < allowed:
                 await asyncio.sleep(allowed - now)
         except asyncio.CancelledError:
@@ -101,24 +120,21 @@ class HostLimiter:
 
     async def release(self, key: str):
         async with self._registry_lock:
-            self.owner_counts[key] -= 1
-            self.next_allowed[key] = time.monotonic() + HOST_INTERVAL_SEC
-            self.last_used[key] = time.monotonic()
-            self.locks[key].release()
+            state = self._states[key]
+            state.owner_count -= 1
+            state.next_allowed_monotonic = time.monotonic() + self._interval
+            state.last_used_monotonic = time.monotonic()
+            state.request_lock.release()
 
-    async def cleanup(self):
+    async def cleanup_idle(self):
         now = time.monotonic()
         async with self._registry_lock:
             keys_to_delete = []
-            for k in self.locks:
-                if self.owner_counts[k] == 0 and self.waiter_counts[k] == 0 and not self.locks[k].locked() and (now - self.last_used[k] > HOST_CLEANUP_TTL_SEC):
+            for k, state in self._states.items():
+                if state.owner_count == 0 and state.waiter_count == 0 and not state.request_lock.locked() and (now - state.last_used_monotonic > self._idle_ttl):
                     keys_to_delete.append(k)
             for k in keys_to_delete:
-                del self.locks[k]
-                del self.next_allowed[k]
-                del self.waiter_counts[k]
-                del self.owner_counts[k]
-                del self.last_used[k]
+                del self._states[k]
 
 class RobotsCache:
     def __init__(self):
@@ -149,34 +165,48 @@ class RobotsCache:
             'expires_at': now + ttl
         }
 
+SUPPRESSED_TAGS = {"script", "style", "noscript"}
+
 class SafeHTMLParser(HTMLParser):
-    def __init__(self):
+    def __init__(self, max_len: int):
         super().__init__()
-        self.text_chunks = []
-        self.skip_depth = 0
-        self.skip_tags = {'script', 'style', 'noscript', 'iframe', 'object', 'embed'}
+        self.max_len = max_len
         self.total_len = 0
-        self.max_len = 3000
+        self.parts = []
+        self._suppressed_stack = []
 
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() in self.skip_tags:
-            self.skip_depth += 1
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_lower = tag.casefold()
+        if tag_lower in SUPPRESSED_TAGS or self._suppressed_stack:
+            self._suppressed_stack.append(tag_lower)
 
-    def handle_endtag(self, tag):
-        if tag.lower() in self.skip_tags:
-            self.skip_depth = max(0, self.skip_depth - 1)
-
-    def handle_data(self, data):
-        if self.total_len >= self.max_len:
+    def handle_endtag(self, tag: str) -> None:
+        tag_lower = tag.casefold()
+        if not self._suppressed_stack:
             return
-        if self.skip_depth == 0:
-            cleaned = "".join(" " if c in ('\t', '\n', '\r') else c for c in data if ord(c) >= 32 or c in ('\t', '\n', '\r'))
-            if cleaned:
-                self.text_chunks.append(cleaned)
-                self.total_len += len(cleaned)
+        # Pop up to matching tag to handle malformed/missing closures
+        for i in range(len(self._suppressed_stack) - 1, -1, -1):
+            if self._suppressed_stack[i] == tag_lower:
+                del self._suppressed_stack[i:]
+                break
+
+    def handle_data(self, data: str) -> None:
+        if self._suppressed_stack:
+            return
+        remaining = self.max_len - self.total_len
+        if remaining <= 0:
+            return
+        # Keep spacing safe by replacing newlines/tabs with spaces
+        cleaned = "".join(" " if c in ('\t', '\n', '\r') else c for c in data if ord(c) >= 32 or c in ('\t', '\n', '\r'))
+        if not cleaned:
+            return
+        bounded = cleaned[:remaining]
+        if bounded:
+            self.parts.append(bounded)
+            self.total_len += len(bounded)
             
     def get_text(self) -> str:
-        raw = " ".join(self.text_chunks)
+        raw = " ".join(self.parts)
         norm = unicodedata.normalize('NFC', raw)
         return re.sub(r'\s+', ' ', norm).strip()[:self.max_len]
 
@@ -270,7 +300,8 @@ class PollingWorker:
         self.worker_id = str(uuid.uuid4())
         self.global_token = None
         self.cancellation_event = asyncio.Event()
-        self.host_limiter = HostLimiter()
+        self.cancellation_reason: Optional[CancellationReason] = None
+        self.host_limiter = HostLimiter(HOST_INTERVAL_SEC, HOST_CLEANUP_TTL_SEC)
         self.robots_cache = RobotsCache()
         self.active_poll_task = None
         self._rng = random.Random()
@@ -309,7 +340,7 @@ class PollingWorker:
                             return result
                             
                         if any(ord(c) < 32 or ord(c) == 127 for c in loc):
-                            result.error_code = "redirect_ambiguous_location"
+                            result.error_code = "redirect_invalid_location"
                             return result
                             
                         result.redirect_url = loc
@@ -346,13 +377,24 @@ class PollingWorker:
                                     result.error_code = "unsupported_content_type"
                                     return result
 
-                    encoding = resp.headers.get("Content-Encoding", "identity").lower()
-                    if encoding not in ("identity", "gzip", "deflate"):
+                    encoding_raw = resp.headers.get("Content-Encoding")
+                    if encoding_raw is not None:
+                        # Fallback for checking multiple headers if httpx concatenated them
+                        raw_list = [v.decode('utf-8', errors='ignore') for k, v in resp.headers.raw if k.lower() == b'content-encoding']
+                        if len(raw_list) > 1:
+                            result.error_code = "ambiguous_content_encoding"
+                            return result
+                            
+                        encoding = encoding_raw.lower().strip()
+                        if encoding == "":
+                            result.error_code = "invalid_content_encoding"
+                            return result
                         if "," in encoding:
-                            result.error_code = "unsupported_encoding" # multiple encodings
-                        else:
-                            result.error_code = "unsupported_encoding"
-                        return result
+                            result.error_code = "multiple_content_encodings"
+                            return result
+                        if encoding not in ("identity", "gzip", "deflate"):
+                            result.error_code = "unsupported_content_encoding"
+                            return result
 
                     cl = resp.headers.get("Content-Length")
                     if cl and cl.isdigit() and int(cl) > max_bytes:
@@ -378,9 +420,9 @@ class PollingWorker:
             except httpx.RequestError:
                 result.error_code = "network_error"
             except httpx.DecodingError:
-                result.error_code = "unsupported_encoding"
+                result.error_code = "invalid_content_encoding"
             except Exception as e:
-                import traceback; traceback.print_exc()
+                # Raw traceback and exception strings are explicitly forbidden
                 result.error_code = "internal_error"
         finally:
             await self.host_limiter.release(host_key)
@@ -431,39 +473,57 @@ class PollingWorker:
         ttl = 900 # 15m default error TTL
         delay = 0
         
-        if res.error_code:
-            print(f"DEBUG: check_robots res.error_code = {res.error_code}, res.status_code = {res.status_code}")
-        
         if res.status_code in (404, 410):
             decision = 'allow'
             ttl = 86400 # 24h
         elif res.status_code == 200:
-            text = res.content.decode('utf-8', errors='ignore')
-            rp = urllib.robotparser.RobotFileParser()
-            rp.parse(text.splitlines())
-            if rp.can_fetch(USER_AGENT, origin_url):
-                decision = 'allow'
-            else:
-                decision = 'deny'
-                error_code = 'robots_denied'
-            ttl = 86400 # 24h
+            try:
+                text = res.content.decode('utf-8')
+                # Optional check for some extreme malformedness if needed, but strict decoding helps
+                rp = urllib.robotparser.RobotFileParser()
+                rp.parse(text.splitlines())
+                if rp.can_fetch(ROBOTS_PRODUCT_TOKEN, origin_url):
+                    decision = 'allow'
+                else:
+                    decision = 'deny'
+                    error_code = 'robots_rule_denied'
+                ttl = 86400 # 24h
+            except UnicodeDecodeError:
+                decision = 'error'
+                error_code = 'robots_parse_error'
+                ttl = 900
         elif res.status_code in (401, 403):
             decision = 'deny'
-            error_code = 'robots_error'
+            error_code = 'robots_auth_denied'
             ttl = 900 # 15m
         elif res.status_code == 429:
-            decision = 'deny'
-            error_code = 'robots_error'
+            decision = 'error'
+            error_code = 'robots_rate_limited'
             delay = min(86400, max(10, res.retry_after)) if res.retry_after else 0
             if delay > 0:
                 ttl = delay
             else:
                 ttl = 900
-                delay = 0 # Fallback to standard rng backoff later
+                delay = 0 # Fallback
+        elif res.status_code and res.status_code >= 500:
+            decision = 'error'
+            error_code = 'robots_server_error'
+            ttl = 900
         elif res.error_code:
             decision = 'error'
-            error_code = 'robots_error'
             ttl = 900
+            if res.error_code == 'content_too_large':
+                error_code = 'robots_body_too_large'
+            elif res.error_code == 'invalid_content_encoding':
+                error_code = 'robots_decoding_error'
+            elif res.error_code in ('timeout', 'network_error'):
+                error_code = f"robots_{res.error_code}"
+            elif res.error_code.startswith("redirect_"):
+                error_code = res.error_code
+            elif res.error_code == 'too_many_redirects':
+                error_code = 'too_many_redirects'
+            else:
+                error_code = 'robots_error'
         else:
             decision = 'error'
             error_code = 'robots_error'
@@ -514,7 +574,7 @@ class PollingWorker:
             )
             
             if self.cancellation_event.is_set():
-                self.requeue_poll(source, "cancelled")
+                self.requeue_poll(source, self.cancellation_reason or CancellationReason.TRANSIENT_INTERNAL)
                 return
 
             if res.redirect_url:
@@ -618,18 +678,16 @@ class PollingWorker:
         # Feed Mode
         try:
             feed = feedparser.parse(res.content)
-            if not feed.entries:
-                if feed.bozo:
-                    self.fail_poll(source, "parse_error", http_status=res.status_code)
-                    return
-                else:
-                    self.succeed_poll(source, res.etag, res.last_modified, res.final_url, res.status_code, [], is_empty=True)
-                    return
+            
             if feed.bozo:
-                msg = getattr(feed.bozo_exception, 'getMessage', lambda: str(feed.bozo_exception))()
-                if "xml" in msg.lower() or "encoding" in msg.lower() or "document" in msg.lower() or "syntax" in msg.lower() or "character" in msg.lower():
+                ex_name = type(feed.bozo_exception).__name__
+                if ex_name not in ("CharacterEncodingOverride", "CharacterEncodingUnknown", "NonXMLContentType", "ChardetException"):
                     self.fail_poll(source, "parse_error", http_status=res.status_code)
                     return
+                    
+            if not feed.entries:
+                self.succeed_poll(source, res.etag, res.last_modified, res.final_url, res.status_code, [], is_empty=True)
+                return
         except Exception:
             self.fail_poll(source, "parse_error", http_status=res.status_code)
             return
@@ -726,31 +784,36 @@ class PollingWorker:
             
         db.complete_source_poll(self.global_token, source['source_id'], source['lease_token'], source['claimed_mode'], source['claimed_target'], updates, drafts)
 
-    def requeue_poll(self, source: dict, error_code: str = None):
+    def requeue_poll(self, source: dict, reason: CancellationReason):
+        delay = 60
+        next_poll = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)
         updates = {
             "collector_status": "queued",
-            "next_poll_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            "next_poll_at": next_poll.isoformat()
         }
-        if error_code:
-            updates["last_error_code"] = error_code
         db.complete_source_poll(
             self.global_token, source['source_id'], source['lease_token'], source['claimed_mode'], source['claimed_target'],
             updates
         )
 
+    def trigger_cancellation(self, reason: CancellationReason):
+        if not self.cancellation_reason or CANCELLATION_PRIORITY[reason] > CANCELLATION_PRIORITY.get(self.cancellation_reason, 0):
+            self.cancellation_reason = reason
+        self.cancellation_event.set()
+        if self.active_poll_task and not self.active_poll_task.done():
+            self.active_poll_task.cancel()
+
     async def heartbeat_loop(self):
         while not self.cancellation_event.is_set():
             await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
             if not db.heartbeat_global_lease(self.global_token, GLOBAL_LEASE_DURATION_SEC):
-                self.cancellation_event.set()
-                if self.active_poll_task and not self.active_poll_task.done():
-                    self.active_poll_task.cancel()
+                self.trigger_cancellation(CancellationReason.GLOBAL_LEASE_LOST)
                 return
 
     async def cleanup_loop(self):
         while not self.cancellation_event.is_set():
             await asyncio.sleep(60)
-            await self.host_limiter.cleanup()
+            await self.host_limiter.cleanup_idle()
 
     async def run(self):
         try:
@@ -765,6 +828,7 @@ class PollingWorker:
                 continue
                 
             self.cancellation_event.clear()
+            self.cancellation_reason = None
             heartbeat_task = asyncio.create_task(self.heartbeat_loop())
             cleanup_task = asyncio.create_task(self.cleanup_loop())
             
@@ -795,9 +859,7 @@ class PollingWorker:
                             self.fail_poll(source, "internal_error")
                             
             finally:
-                self.cancellation_event.set()
-                if self.active_poll_task and not self.active_poll_task.done():
-                    self.active_poll_task.cancel()
+                self.trigger_cancellation(CancellationReason.SHUTDOWN)
                 await asyncio.gather(heartbeat_task, cleanup_task, return_exceptions=True)
                 if self.global_token:
                     db.release_global_lease(self.global_token)
