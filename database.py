@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import re
 from typing import Optional, List, Dict, Any, Set
 from loguru import logger
 from config import settings
@@ -13,6 +14,57 @@ class InvalidUpdateColumnError(Exception):
 
 class AmbiguousPublishStateError(Exception):
     pass
+
+
+def normalize_telegram_id(raw) -> str:
+    """Нормалізує Telegram channel ID до канонічного формату '-100...'.
+    Піднімає ValueError при невалідному вводі (юзернейми, URL, порожні, нечислові)."""
+    s = str(raw).strip()
+    if not s:
+        raise ValueError("Empty Telegram ID")
+    # Видаляємо мінус для аналізу
+    if s.startswith('-'):
+        abs_part = s[1:]
+    else:
+        abs_part = s
+    # Має складатися лише з цифр
+    if not abs_part.isdigit() or not abs_part:
+        raise ValueError(f"Invalid Telegram ID: {raw!r}")
+    # Якщо вже має префікс -100
+    if s.startswith('-100'):
+        return s
+    # Інакше — голий peer ID
+    return f"-100{abs_part}"
+
+
+def _validate_canonical_url(url: str, source_type: str) -> str:
+    """Валідація та нормалізація canonical_url. Повертає очищений URL або піднімає ValueError."""
+    cleaned = url.strip()
+    if not cleaned:
+        raise ValueError("canonical_url is empty after stripping")
+    # Перевірка на керуючі символи (< 0x20 окрім табуляцій/переносів)
+    for ch in cleaned:
+        if ord(ch) < 0x20 and ch not in ('\t', '\n', '\r'):
+            raise ValueError(f"canonical_url contains control character: {ord(ch):#x}")
+    # Заборонені схеми для всіх типів
+    lower = cleaned.lower()
+    for scheme in ('javascript:', 'data:', 'file:'):
+        if lower.startswith(scheme):
+            raise ValueError(f"Forbidden URL scheme: {scheme}")
+    # Перевірка на credentials (@ перед першого /)
+    slash_pos = cleaned.find('/', cleaned.find('//') + 2) if '//' in cleaned else cleaned.find('/')
+    at_pos = cleaned.find('@')
+    if at_pos != -1 and (slash_pos == -1 or at_pos < slash_pos):
+        raise ValueError("canonical_url contains credentials (@ before path)")
+    # Валідація за типом джерела
+    if source_type in ('rss', 'website'):
+        if not cleaned.startswith('https://'):
+            raise ValueError(f"canonical_url for '{source_type}' must start with 'https://'")
+    elif source_type == 'x':
+        if not (cleaned.startswith('https://x.com/') or cleaned.startswith('https://twitter.com/')):
+            raise ValueError("canonical_url for 'x' must start with 'https://x.com/' or 'https://twitter.com/'")
+    return cleaned
+
 
 ALLOWED_TRANSITIONS = {
     ("new", "processing"),
@@ -245,6 +297,9 @@ class Database:
             # 6. Transient status recovery
             self._recover_stuck_drafts(cursor)
             conn.commit()
+
+            # 7. Phase 5 migration — sources та snapshot-колонки
+            self._migrate_phase5(cursor, conn)
             
             logger.debug(f"Database initialized at {self.db_path}")
 
@@ -272,6 +327,72 @@ class Database:
             "AND media_lease_expires_at < ?",
             (datetime.datetime.now(datetime.timezone.utc).isoformat(),)
         )
+
+    def _migrate_phase5(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection):
+        """Міграція Phase 5: таблиця sources та snapshot-колонки в drafts."""
+        cursor.execute('BEGIN IMMEDIATE')
+
+        # a) Таблиця sources
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sources (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type     TEXT NOT NULL CHECK(source_type IN ('telegram','rss','website','x')),
+                external_id     TEXT NOT NULL,
+                canonical_url   TEXT NULL,
+                name            TEXT NOT NULL,
+                priority        INTEGER NOT NULL DEFAULT 50 CHECK(priority >= 0 AND priority <= 100),
+                trust_rating    INTEGER NOT NULL DEFAULT 50 CHECK(trust_rating >= 0 AND trust_rating <= 100),
+                processing_mode TEXT NOT NULL DEFAULT 'auto' CHECK(processing_mode IN ('auto','review')),
+                resolution_status TEXT NOT NULL DEFAULT 'resolved' CHECK(resolution_status IN ('resolved','unresolved')),
+                is_active       INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0, 1)),
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(source_type, external_id)
+            )
+        ''')
+
+        # b) Індекс на sources
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sources_active_type ON sources(is_active, source_type)')
+
+        # c) Snapshot-колонки в drafts
+        cursor.execute("PRAGMA table_info(drafts)")
+        existing_columns = {row['name'] for row in cursor.fetchall()}
+
+        phase5_columns = {
+            "source_id": "INTEGER NULL REFERENCES sources(id) ON DELETE RESTRICT",
+            "source_name_snapshot": "TEXT NULL",
+            "source_priority_snapshot": "INTEGER NULL",
+            "source_trust_snapshot": "INTEGER NULL",
+            "source_processing_mode_snapshot": "TEXT NULL",
+            "source_item_id": "TEXT NULL",
+        }
+        for col_name, col_def in phase5_columns.items():
+            if col_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col_name} {col_def}")
+
+        # d) Індекси на drafts для source-зв'язків
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_source_id ON drafts(source_id)')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_source_dedup ON drafts(source_id, source_item_id) WHERE source_id IS NOT NULL AND source_item_id IS NOT NULL')
+
+        # e) Seed з settings.telegram_channels
+        for raw_channel in settings.telegram_channels:
+            try:
+                normalized = normalize_telegram_id(raw_channel)
+                cursor.execute(
+                    "INSERT OR IGNORE INTO sources (source_type, external_id, name, resolution_status, is_active) VALUES ('telegram', ?, ?, 'resolved', 1)",
+                    (normalized, str(raw_channel))
+                )
+            except ValueError:
+                # Нечисловий (юзернейм/URL) — вставляємо як unresolved, inactive
+                raw_str = str(raw_channel).strip()
+                if raw_str:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO sources (source_type, external_id, name, resolution_status, is_active) VALUES ('telegram', ?, ?, 'unresolved', 0)",
+                        (raw_str, raw_str)
+                    )
+
+        # f) Коміт
+        conn.commit()
 
     def _transition_draft(self, conn: sqlite3.Connection, draft_id: int, expected_statuses: Set[str], new_status: str, updates: dict = None) -> bool:
         cursor = conn.cursor()
@@ -361,7 +482,28 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             conn.execute('BEGIN IMMEDIATE')
-            cursor.execute("SELECT id FROM drafts WHERE status = 'new' ORDER BY created_at ASC LIMIT 1")
+            cursor.execute("""
+                SELECT id FROM drafts WHERE status = 'new'
+                ORDER BY
+                  (
+                    COALESCE(source_priority_snapshot, 50)
+                    + MAX(
+                        0,
+                        MIN(
+                          100,
+                          CAST(
+                            COALESCE(
+                              (julianday('now') - julianday(created_at)) * 24 * 60 / 10,
+                              0
+                            ) AS INTEGER
+                          )
+                        )
+                      )
+                  ) DESC,
+                  created_at ASC,
+                  id ASC
+                LIMIT 1
+            """)
             row = cursor.fetchone()
             if not row:
                 return None
@@ -922,5 +1064,271 @@ class Database:
                 "ignored_today": ignored_today,
                 "pending_total": pending_total
             }
+
+    # --- Phase 5: Source CRUD та створення чернеток з джерел ---
+
+    def create_draft_from_active_source(
+        self,
+        source_type: str,
+        external_id: str,
+        source_item_id: str,
+        original_text: str,
+    ) -> str:
+        """Створює чернетку прив'язану до активного джерела.
+        Повертає 'created', 'duplicate' або 'rejected'."""
+        # Валідація source_item_id
+        item_id = str(source_item_id).strip()
+        if not item_id or len(item_id) > 200:
+            raise ValueError(f"source_item_id must be 1-200 chars, got {len(item_id)}")
+
+        # Нормалізація external_id для telegram
+        if source_type == 'telegram':
+            try:
+                external_id = normalize_telegram_id(external_id)
+            except ValueError:
+                return "rejected"
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+
+                cursor.execute(
+                    "SELECT id, name, priority, trust_rating, processing_mode, is_active, resolution_status "
+                    "FROM sources WHERE source_type = ? AND external_id = ?",
+                    (source_type, external_id)
+                )
+                src = cursor.fetchone()
+                if not src or src['is_active'] == 0 or src['resolution_status'] == 'unresolved':
+                    conn.rollback()
+                    return "rejected"
+
+                cursor.execute(
+                    "INSERT INTO drafts (original_text, status, source_id, source_name_snapshot, "
+                    "source_priority_snapshot, source_trust_snapshot, source_processing_mode_snapshot, source_item_id) "
+                    "VALUES (?, 'new', ?, ?, ?, ?, ?, ?)",
+                    (
+                        original_text,
+                        src['id'],
+                        src['name'],
+                        src['priority'],
+                        src['trust_rating'],
+                        src['processing_mode'],
+                        item_id,
+                    )
+                )
+                conn.commit()
+                return "created"
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                return "duplicate"
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_sources(self, is_active=None) -> List[Dict[str, Any]]:
+        """Отримати список джерел, опціонально фільтрованих за is_active."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if is_active is not None:
+                cursor.execute("SELECT * FROM sources WHERE is_active = ? ORDER BY id", (int(is_active),))
+            else:
+                cursor.execute("SELECT * FROM sources ORDER BY id")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_source(self, source_id: int) -> Optional[Dict[str, Any]]:
+        """Отримати джерело за ID."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def add_source(
+        self,
+        source_type: str,
+        external_id: str,
+        name: str,
+        canonical_url: str = None,
+        priority: int = 50,
+        trust_rating: int = 50,
+        processing_mode: str = 'auto',
+    ) -> Dict[str, Any]:
+        """Додати нове джерело. Повертає створене джерело як dict.
+        Піднімає ValueError при невалідних даних, sqlite3.IntegrityError при дублікаті."""
+        # Валідація імені
+        name = str(name).strip()
+        if not name:
+            raise ValueError("name must not be empty")
+
+        # Валідація source_type
+        if source_type not in ('telegram', 'rss', 'website', 'x'):
+            raise ValueError(f"Invalid source_type: {source_type!r}")
+
+        # Нормалізація external_id для telegram
+        resolution_status = 'resolved'
+        if source_type == 'telegram':
+            external_id = normalize_telegram_id(external_id)
+
+        # Валідація canonical_url
+        if canonical_url is not None:
+            canonical_url = _validate_canonical_url(canonical_url, source_type)
+
+        # Валідація числових діапазонів
+        if not (0 <= priority <= 100):
+            raise ValueError(f"priority must be 0-100, got {priority}")
+        if not (0 <= trust_rating <= 100):
+            raise ValueError(f"trust_rating must be 0-100, got {trust_rating}")
+        if processing_mode not in ('auto', 'review'):
+            raise ValueError(f"Invalid processing_mode: {processing_mode!r}")
+
+        is_active = 1 if resolution_status == 'resolved' else 0
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO sources (source_type, external_id, canonical_url, name, priority, "
+                "trust_rating, processing_mode, resolution_status, is_active) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (source_type, external_id, canonical_url, name, priority,
+                 trust_rating, processing_mode, resolution_status, is_active)
+            )
+            conn.commit()
+            source_id = cursor.lastrowid
+            cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
+            return dict(cursor.fetchone())
+
+    def update_source(self, source_id: int, updates: dict) -> Optional[Dict[str, Any]]:
+        """Часткове оновлення джерела. Повертає оновлене джерело або None якщо не знайдено.
+        Піднімає ValueError при невалідних даних."""
+        if not updates:
+            return self.get_source(source_id)
+
+        allowed_fields = {
+            'name', 'canonical_url', 'priority', 'trust_rating',
+            'processing_mode', 'is_active', 'external_id', 'source_type',
+        }
+        for key in updates:
+            if key not in allowed_fields:
+                raise ValueError(f"Cannot update field: {key!r}")
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+
+            # Отримуємо поточний стан
+            cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
+            current = cursor.fetchone()
+            if not current:
+                conn.rollback()
+                return None
+
+            current_dict = dict(current)
+
+            # Валідація: не можна активувати unresolved джерело
+            new_active = updates.get('is_active', current_dict['is_active'])
+            new_resolution = current_dict['resolution_status']
+            if new_active and new_resolution == 'unresolved':
+                conn.rollback()
+                raise ValueError("Cannot activate source with resolution_status='unresolved'")
+
+            # Валідація числових діапазонів
+            if 'priority' in updates:
+                p = updates['priority']
+                if not (0 <= p <= 100):
+                    conn.rollback()
+                    raise ValueError(f"priority must be 0-100, got {p}")
+            if 'trust_rating' in updates:
+                t = updates['trust_rating']
+                if not (0 <= t <= 100):
+                    conn.rollback()
+                    raise ValueError(f"trust_rating must be 0-100, got {t}")
+            if 'processing_mode' in updates and updates['processing_mode'] not in ('auto', 'review'):
+                conn.rollback()
+                raise ValueError(f"Invalid processing_mode: {updates['processing_mode']!r}")
+            if 'canonical_url' in updates and updates['canonical_url'] is not None:
+                source_type = updates.get('source_type', current_dict['source_type'])
+                updates['canonical_url'] = _validate_canonical_url(updates['canonical_url'], source_type)
+            if 'name' in updates:
+                updates['name'] = str(updates['name']).strip()
+                if not updates['name']:
+                    conn.rollback()
+                    raise ValueError("name must not be empty")
+
+            set_clauses = []
+            params = []
+            for key, value in updates.items():
+                set_clauses.append(f"{key} = ?")
+                params.append(value)
+            set_clauses.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+            params.append(source_id)
+
+            query = f"UPDATE sources SET {', '.join(set_clauses)} WHERE id = ?"
+            cursor.execute(query, params)
+            conn.commit()
+
+            cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def deactivate_source(self, source_id: int) -> Optional[Dict[str, Any]]:
+        """Деактивація джерела (ідемпотентна). Повертає джерело або None."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sources SET is_active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+                (source_id,)
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def resolve_source(self, source_id: int, new_external_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve unresolved telegram джерело з новим числовим external_id.
+        Піднімає ValueError при невалідних даних, sqlite3.IntegrityError при дублікаті."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+
+            cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
+            current = cursor.fetchone()
+            if not current:
+                conn.rollback()
+                return None
+
+            current_dict = dict(current)
+            if current_dict['source_type'] != 'telegram':
+                conn.rollback()
+                raise ValueError("resolve_source is only for telegram sources")
+            if current_dict['resolution_status'] != 'unresolved':
+                conn.rollback()
+                raise ValueError("Source is already resolved")
+
+            # Нормалізуємо новий external_id
+            normalized = normalize_telegram_id(new_external_id)
+
+            # Перевірка на дублікат
+            cursor.execute(
+                "SELECT id FROM sources WHERE source_type = 'telegram' AND external_id = ? AND id != ?",
+                (normalized, source_id)
+            )
+            if cursor.fetchone():
+                conn.rollback()
+                raise sqlite3.IntegrityError(f"Source with external_id={normalized} already exists")
+
+            cursor.execute(
+                "UPDATE sources SET external_id = ?, resolution_status = 'resolved', is_active = 1, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+                (normalized, source_id)
+            )
+            conn.commit()
+
+            cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
 
 db = Database()

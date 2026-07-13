@@ -454,7 +454,7 @@
             </div>
         </header>
 
-        {% if analytics %}
+        {% if analytics and current_tab != "sources" %}
         <div class="stats-grid">
             <div class="stat-card">
                 <h4>Today Processed</h4>
@@ -479,8 +479,10 @@
             <a href="/?tab=review" class="tab {% if current_tab == 'review' %}active{% endif %}">На розгляді</a>
             <a href="/?tab=approved" class="tab {% if current_tab == 'approved' %}active{% endif %}">Опубліковані / Схвалені</a>
             <a href="/?tab=ignored" class="tab {% if current_tab == 'ignored' %}active{% endif %}">Відхилені</a>
+            <a href="/?tab=sources" class="tab {% if current_tab == 'sources' %}active{% endif %}">📡 Sources</a>
         </div>
 
+        {% if current_tab != "sources" %}
         <main id="drafts-container">
             {% if not drafts %}
             <div class="empty-state">
@@ -693,6 +695,102 @@
             </div>
             {% endfor %}
         </main>
+        {% endif %}
+        {% if current_tab == 'sources' %}
+        <main id="sources-container">
+            <div class="draft-card">
+                <div class="card-header">
+                    <h2>Manage Sources</h2>
+                    <button onclick="document.getElementById('add-source-form').style.display = 'block';" class="btn-publish">+ Add Source</button>
+                </div>
+                
+                <div id="add-source-form" style="display: none; margin-bottom: 2rem; padding: 1rem; background: rgba(0,0,0,0.2); border-radius: 0.5rem;">
+                    <h3>Add New Source</h3>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem;">
+                        <div>
+                            <label>Type</label>
+                            <select id="new_source_type" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                                <option value="telegram">Telegram</option>
+                                <option value="rss">RSS</option>
+                                <option value="website">Website</option>
+                                <option value="x">X</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label>External ID</label>
+                            <input type="text" id="new_external_id" placeholder="-100... for telegram" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                        </div>
+                        <div>
+                            <label>Name</label>
+                            <input type="text" id="new_name" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                        </div>
+                        <div>
+                            <label>Canonical URL</label>
+                            <input type="text" id="new_canonical_url" placeholder="Optional for TG/X, required for RSS/Website" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                        </div>
+                        <div>
+                            <label>Priority (0-100)</label>
+                            <input type="number" id="new_priority" value="50" min="0" max="100" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                        </div>
+                        <div>
+                            <label>Trust Rating (0-100)</label>
+                            <input type="number" id="new_trust" value="50" min="0" max="100" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                        </div>
+                        <div>
+                            <label>Processing Mode</label>
+                            <select id="new_processing_mode" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                                <option value="auto">Auto</option>
+                                <option value="review">Review</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="margin-top: 1rem; display: flex; gap: 1rem; justify-content: flex-end;">
+                        <button onclick="document.getElementById('add-source-form').style.display = 'none';" class="btn-save">Cancel</button>
+                        <button onclick="submitNewSource()" class="btn-publish">Save Source</button>
+                    </div>
+                </div>
+
+                <div style="overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                        <thead>
+                            <tr style="border-bottom: 1px solid var(--card-border);">
+                                <th style="padding: 0.75rem;">Name / Type</th>
+                                <th style="padding: 0.75rem;">External ID</th>
+                                <th style="padding: 0.75rem;">Priority / Trust</th>
+                                <th style="padding: 0.75rem;">Status</th>
+                                <th style="padding: 0.75rem;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sources-tbody">
+                            <!-- Injected by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+        
+        <div id="resolve-modal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 50; display: flex; align-items: center; justify-content: center;">
+            <div style="background: var(--bg-color); padding: 2rem; border-radius: 1rem; border: 1px solid var(--card-border); max-width: 400px; width: 100%;">
+                <h3>Resolve Legacy Source</h3>
+                <p style="margin-top: 1rem; color: var(--text-muted); font-size: 0.9rem;">
+                    Enter the canonical numeric ID for this Telegram channel.
+                </p>
+                <input type="text" id="resolve_external_id" placeholder="-100..." style="width: 100%; margin-top: 1rem; padding: 0.5rem; background: rgba(0,0,0,0.2); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
+                <input type="hidden" id="resolve_source_id">
+                <div style="margin-top: 1.5rem; display: flex; gap: 1rem; justify-content: flex-end;">
+                    <button onclick="document.getElementById('resolve-modal').style.display = 'none';" class="btn-save">Cancel</button>
+                    <button onclick="submitResolveSource()" class="btn-publish">Resolve</button>
+                </div>
+            </div>
+        </div>
+        <script>
+            // Hide resolve modal initially
+            document.addEventListener('DOMContentLoaded', () => {
+                const el = document.getElementById('resolve-modal');
+                if(el) el.style.display = 'none';
+            });
+        </script>
+        {% endif %}
     </div>
 
     <script>
@@ -959,6 +1057,203 @@
                 }
             }, 300);
         }
+
+        // --- Phase 5: Sources Management ---
+        async function fetchSources() {
+            try {
+                const resp = await fetch('/api/sources');
+                const sources = await resp.json();
+                const tbody = document.getElementById('sources-tbody');
+                if(!tbody) return;
+                
+                tbody.innerHTML = '';
+                sources.forEach(src => {
+                    const tr = document.createElement('tr');
+                    tr.style.borderBottom = '1px solid var(--card-border)';
+                    
+                    const nameCell = document.createElement('td');
+                    nameCell.style.padding = '0.75rem';
+                    const nameStr = document.createElement('strong');
+                    nameStr.textContent = src.name;
+                    const typeStr = document.createElement('div');
+                    typeStr.style.fontSize = '0.8rem';
+                    typeStr.style.color = 'var(--text-muted)';
+                    typeStr.textContent = src.source_type;
+                    nameCell.append(nameStr, typeStr);
+                    
+                    const idCell = document.createElement('td');
+                    idCell.style.padding = '0.75rem';
+                    idCell.textContent = src.external_id;
+                    if(src.canonical_url) {
+                        const urlDiv = document.createElement('div');
+                        urlDiv.style.fontSize = '0.8rem';
+                        urlDiv.style.color = 'var(--accent)';
+                        urlDiv.textContent = src.canonical_url;
+                        idCell.appendChild(urlDiv);
+                    }
+                    
+                    const pTCell = document.createElement('td');
+                    pTCell.style.padding = '0.75rem';
+                    pTCell.textContent = `P: ${src.priority} | T: ${src.trust_rating}`;
+                    const modeDiv = document.createElement('div');
+                    modeDiv.style.fontSize = '0.8rem';
+                    modeDiv.style.color = 'var(--text-muted)';
+                    modeDiv.textContent = `Mode: ${src.processing_mode}`;
+                    pTCell.appendChild(modeDiv);
+                    
+                    const statusCell = document.createElement('td');
+                    statusCell.style.padding = '0.75rem';
+                    const statusBadge = document.createElement('span');
+                    statusBadge.style.padding = '0.2rem 0.5rem';
+                    statusBadge.style.borderRadius = '0.25rem';
+                    statusBadge.style.fontSize = '0.8rem';
+                    if (src.is_active) {
+                        statusBadge.style.background = 'rgba(16, 185, 129, 0.2)';
+                        statusBadge.style.color = '#6ee7b7';
+                        statusBadge.textContent = 'Active';
+                    } else if (src.resolution_status === 'unresolved') {
+                        statusBadge.style.background = 'rgba(239, 68, 68, 0.2)';
+                        statusBadge.style.color = '#fca5a5';
+                        statusBadge.textContent = 'Unresolved';
+                    } else {
+                        statusBadge.style.background = 'rgba(148, 163, 184, 0.2)';
+                        statusBadge.style.color = '#cbd5e1';
+                        statusBadge.textContent = 'Inactive';
+                    }
+                    statusCell.appendChild(statusBadge);
+                    
+                    const actionCell = document.createElement('td');
+                    actionCell.style.padding = '0.75rem';
+                    actionCell.style.display = 'flex';
+                    actionCell.style.gap = '0.5rem';
+                    
+                    if (src.resolution_status === 'unresolved') {
+                        const btnRes = document.createElement('button');
+                        btnRes.textContent = 'Resolve';
+                        btnRes.style.padding = '0.2rem 0.5rem';
+                        btnRes.style.fontSize = '0.8rem';
+                        btnRes.className = 'btn-save';
+                        btnRes.onclick = () => openResolveModal(src.id);
+                        actionCell.appendChild(btnRes);
+                    } else {
+                        const btnToggle = document.createElement('button');
+                        btnToggle.textContent = src.is_active ? 'Deactivate' : 'Reactivate';
+                        btnToggle.style.padding = '0.2rem 0.5rem';
+                        btnToggle.style.fontSize = '0.8rem';
+                        btnToggle.className = src.is_active ? 'btn-ignore' : 'btn-publish';
+                        btnToggle.onclick = () => toggleSourceStatus(src.id, !src.is_active);
+                        actionCell.appendChild(btnToggle);
+                    }
+                    
+                    tr.append(nameCell, idCell, pTCell, statusCell, actionCell);
+                    tbody.appendChild(tr);
+                });
+            } catch (e) {
+                console.error("Error fetching sources:", e);
+            }
+        }
+
+        async function submitNewSource() {
+            const type = document.getElementById('new_source_type').value;
+            const ext_id = document.getElementById('new_external_id').value;
+            const name = document.getElementById('new_name').value;
+            let url = document.getElementById('new_canonical_url').value;
+            const priority = parseInt(document.getElementById('new_priority').value);
+            const trust = parseInt(document.getElementById('new_trust').value);
+            const mode = document.getElementById('new_processing_mode').value;
+            
+            if(!url) url = null;
+            
+            try {
+                const resp = await fetch('/api/sources', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        source_type: type,
+                        external_id: ext_id,
+                        name: name,
+                        canonical_url: url,
+                        priority: priority,
+                        trust_rating: trust,
+                        processing_mode: mode
+                    })
+                });
+                
+                if(resp.ok) {
+                    document.getElementById('add-source-form').style.display = 'none';
+                    fetchSources();
+                } else {
+                    const data = await resp.json();
+                    alert(data.detail || "Error adding source");
+                }
+            } catch(e) {
+                alert("Request failed");
+            }
+        }
+
+        async function toggleSourceStatus(id, newStatus) {
+            try {
+                if (newStatus) {
+                    // Reactivate via PATCH
+                    const resp = await fetch(`/api/sources/${id}`, {
+                        method: 'PATCH',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ is_active: true })
+                    });
+                    if (!resp.ok) {
+                        const data = await resp.json();
+                        alert(data.detail || "Error reactivating");
+                    }
+                } else {
+                    // Deactivate via DELETE
+                    const resp = await fetch(`/api/sources/${id}`, { method: 'DELETE' });
+                    if (!resp.ok) {
+                        const data = await resp.json();
+                        alert(data.detail || "Error deactivating");
+                    }
+                }
+                fetchSources();
+            } catch(e) {
+                alert("Request failed");
+            }
+        }
+        
+        function openResolveModal(id) {
+            document.getElementById('resolve_source_id').value = id;
+            document.getElementById('resolve_external_id').value = '';
+            document.getElementById('resolve-modal').style.display = 'flex';
+        }
+        
+        async function submitResolveSource() {
+            const id = document.getElementById('resolve_source_id').value;
+            const ext_id = document.getElementById('resolve_external_id').value;
+            if(!ext_id) return;
+            
+            try {
+                const resp = await fetch(`/api/sources/${id}/resolve`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ external_id: ext_id })
+                });
+                if(resp.ok) {
+                    document.getElementById('resolve-modal').style.display = 'none';
+                    fetchSources();
+                } else {
+                    const data = await resp.json();
+                    alert(data.detail || "Error resolving source");
+                }
+            } catch(e) {
+                alert("Request failed");
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            if(urlParams.get('tab') === 'sources') {
+                fetchSources();
+            }
+        });
+
     </script>
 </body>
 </html>

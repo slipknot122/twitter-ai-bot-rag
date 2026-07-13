@@ -13,6 +13,9 @@ from pydantic import BaseModel, Field
 # Додаємо кореневу папку в sys.path, щоб імпортувати наші модулі
 sys.path.append(str(Path(__file__).parent.parent))
 
+from typing import Literal
+import sqlite3
+
 from database import db
 from twitter_publisher import publisher
 from semantic_memory import semantic_memory
@@ -56,12 +59,14 @@ def index(request: Request, tab: str = "review"):
         statuses = ["approved", "published", "publishing"]
     elif tab == "ignored":
         statuses = ["ignored", "failed"]
+    elif tab == "sources":
+        statuses = []
     else:
         # Default tab is review
         tab = "review"
         statuses = ["review", "pending"]
 
-    drafts = db.get_drafts_by_status(statuses)
+    drafts = db.get_drafts_by_status(statuses) if statuses else []
     
     # Parse audit_result for UI rendering
     import json
@@ -241,17 +246,121 @@ def settings_page(request: Request):
     )
 
 @app.post("/api/settings")
-def update_settings(request: SettingsRequest):
-    logger.info("Web Admin: Updating settings")
-    db.set_setting("system_prompt", request.system_prompt)
-    db.set_setting("shadow_mode", request.shadow_mode)
-    db.set_setting("publish_delay_minutes", request.publish_delay_minutes)
-    db.set_setting("publish_jitter_percent", request.publish_jitter_percent)
-    db.set_setting("max_retries", request.max_retries)
-    db.set_setting("scheduler_check_interval_seconds", request.scheduler_check_interval_seconds)
-    db.set_setting("image_overlay", request.image_overlay)
-    db.set_setting("allowed_categories", request.allowed_categories)
-    return {"status": "success"}
+def update_settings(req: SettingsRequest):
+    db.set_setting("system_prompt", req.system_prompt)
+    db.set_setting("shadow_mode", req.shadow_mode)
+    db.set_setting("publish_delay_minutes", req.publish_delay_minutes)
+    db.set_setting("publish_jitter_percent", req.publish_jitter_percent)
+    db.set_setting("max_retries", req.max_retries)
+    db.set_setting("scheduler_check_interval_seconds", req.scheduler_check_interval_seconds)
+    db.set_setting("image_overlay", req.image_overlay)
+    db.set_setting("allowed_categories", req.allowed_categories)
+    return {"status": "ok"}
+
+
+# --- Phase 5: Source CRUD API ---
+
+class SourceCreate(BaseModel, extra='forbid'):
+    source_type: Literal['telegram', 'rss', 'website', 'x']
+    external_id: str = Field(min_length=1, max_length=200)
+    canonical_url: Optional[str] = Field(default=None, max_length=500)
+    name: str = Field(min_length=1, max_length=200)
+    priority: int = Field(default=50, ge=0, le=100)
+    trust_rating: int = Field(default=50, ge=0, le=100)
+    processing_mode: Literal['auto', 'review'] = 'auto'
+
+class SourcePatch(BaseModel, extra='forbid'):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    canonical_url: Optional[str] = Field(default=None, max_length=500)
+    priority: Optional[int] = Field(default=None, ge=0, le=100)
+    trust_rating: Optional[int] = Field(default=None, ge=0, le=100)
+    processing_mode: Optional[Literal['auto', 'review']] = None
+    is_active: Optional[bool] = None
+
+class SourceResolve(BaseModel, extra='forbid'):
+    external_id: str = Field(min_length=1, max_length=200)
+
+@app.get("/api/sources")
+def get_sources(is_active: Optional[bool] = None):
+    return db.get_sources(is_active)
+
+@app.get("/api/sources/{source_id}")
+def get_source(source_id: int):
+    src = db.get_source(source_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return src
+
+def _invalidate_source_cache():
+    try:
+        from telegram_listener import source_cache
+        source_cache.invalidate()
+    except Exception as e:
+        logger.warning(f"Could not invalidate source cache: {e}")
+
+@app.post("/api/sources", status_code=201)
+def create_source(req: SourceCreate):
+    try:
+        src = db.add_source(
+            source_type=req.source_type,
+            external_id=req.external_id,
+            name=req.name,
+            canonical_url=req.canonical_url,
+            priority=req.priority,
+            trust_rating=req.trust_rating,
+            processing_mode=req.processing_mode
+        )
+        _invalidate_source_cache()
+        return src
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Source with this external_id already exists")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+@app.patch("/api/sources/{source_id}")
+def update_source(source_id: int, req: SourcePatch):
+    try:
+        src = db.update_source(source_id, req.model_dump(exclude_unset=True))
+        if not src:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _invalidate_source_cache()
+        return src
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Conflict updating source")
+    except ValueError as e:
+        if "Cannot activate source with resolution_status='unresolved'" in str(e):
+            raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=422, detail=str(e))
+
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: int):
+    src = db.deactivate_source(source_id)
+    if not src:
+        # Check if exists
+        if not db.get_source(source_id):
+            raise HTTPException(status_code=404, detail="Source not found")
+        # Idempotent: already inactive, but get_source exists
+        src = db.get_source(source_id)
+    _invalidate_source_cache()
+    return src
+
+@app.post("/api/sources/{source_id}/resolve")
+def resolve_source(source_id: int, req: SourceResolve):
+    try:
+        src = db.resolve_source(source_id, req.external_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _invalidate_source_cache()
+        return src
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Resolved external_id already exists")
+    except ValueError as e:
+        err = str(e)
+        if "only for telegram" in err:
+            raise HTTPException(status_code=422, detail=err)
+        if "already resolved" in err:
+            raise HTTPException(status_code=409, detail=err)
+        raise HTTPException(status_code=422, detail=err)
 
 @app.get("/logs", response_class=HTMLResponse)
 def logs_page(request: Request, filter: str = "ALL"):
