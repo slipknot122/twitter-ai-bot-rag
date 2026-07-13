@@ -29,7 +29,7 @@ ALLOWED_TRANSITIONS = {
 }
 
 ALLOWED_UPDATE_COLUMNS = {
-    "rewritten_text", "status", "reason", "confidence",
+    "rewritten_text", "reason", "confidence",
     "image_prompt", "sentiment", "category",
     "scheduled_at", "last_error", "retry_count", "last_retry_at",
     "updated_at", "media_status", "media_error", "media_path",

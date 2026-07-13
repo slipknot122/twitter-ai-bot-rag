@@ -205,7 +205,7 @@ def test_timeout_first_audit(mock_process, mock_audit, test_db):
     ai_worker.process_draft(1, test_db)
     
     draft = test_db.get_draft(1)
-    assert draft['status'] == 'failed'
+    assert draft['status'] == 'review'
     assert draft['audit_status'] == 'failed'
     assert draft['audit_score'] is None
     assert draft['audit_error_code'] == 'timeout'
@@ -234,7 +234,7 @@ def test_revision_failure(mock_revise, mock_process, mock_audit, test_db):
     ai_worker.process_draft(1, test_db)
     
     draft = test_db.get_draft(1)
-    assert draft['status'] == 'failed'
+    assert draft['status'] == 'review'
     assert draft['audit_status'] == 'failed'
     assert draft['audit_error_code'] == 'timeout'
     assert draft['audit_score'] is None

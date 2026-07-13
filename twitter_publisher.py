@@ -85,7 +85,9 @@ class TwitterPublisher:
         try:
             semantic_memory.save(text)
         except Exception as e:
-            logger.warning(f"Failed to update semantic memory for draft {draft_id}: {e}")
+            from utils import classify_safe_error
+            safe_code = classify_safe_error(e)
+            logger.warning(f"Failed to update semantic memory for draft {draft_id}: {safe_code}")
             
         return True
 

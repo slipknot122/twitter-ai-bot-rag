@@ -40,7 +40,9 @@ class SemanticMemory:
                 conn.commit()
             logger.debug(f"Saved to Semantic Memory: {text[:50]}...")
         except Exception as e:
-            logger.error(f"Failed to save to Semantic Memory: {e}")
+            from utils import classify_safe_error
+            safe_code = classify_safe_error(e)
+            logger.error(f"Failed to save to Semantic Memory: {safe_code}")
 
     def search(self, query_text: str) -> List[Dict[str, Any]]:
         """Шукає найближчі по смислу тексти в пам'яті."""
@@ -73,7 +75,9 @@ class SemanticMemory:
             return results[:self.top_k]
             
         except Exception as e:
-            logger.error(f"Failed to search Semantic Memory: {e}")
+            from utils import classify_safe_error
+            safe_code = classify_safe_error(e)
+            logger.error(f"Failed to search Semantic Memory: {safe_code}")
             return []
 
     def delete(self, memory_id: int):

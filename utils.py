@@ -58,8 +58,10 @@ def classify_safe_error(error: Exception) -> str:
     """
     import sqlite3
     import asyncio
+    import json
     from httpx import TimeoutException as HttpxTimeout
     from litellm.exceptions import Timeout as LitellmTimeout
+    from litellm.exceptions import APIError, AuthenticationError, APIConnectionError, RateLimitError
     from pydantic import ValidationError as PydanticValidationError
     
     if isinstance(error, (asyncio.TimeoutError, HttpxTimeout, LitellmTimeout)):
@@ -71,20 +73,23 @@ def classify_safe_error(error: Exception) -> str:
     if isinstance(error, PydanticValidationError):
         return "audit_schema_validation"
         
+    if isinstance(error, json.JSONDecodeError):
+        return "audit_invalid_json"
+
+    # From our post_auditor.py
+    if type(error).__name__ == "AuditFailure":
+        # Check if the code is known
+        if hasattr(error, 'code') and error.code:
+            return f"audit_{error.code}"
+        return "audit_failure"
+        
+    if isinstance(error, (APIError, AuthenticationError, APIConnectionError, RateLimitError)):
+        return "llm_provider_error"
+        
     if isinstance(error, sqlite3.Error):
-        # We can narrow this down later if needed
+        # We can narrow this down if needed
         if "UNIQUE constraint" in str(error) or "FOREIGN KEY" in str(error):
              return "state_conflict"
         return "database_error"
-        
-    error_str = str(error).lower()
-    
-    # Very coarse mapping for llm provider errors. It's safer to catch explicit types,
-    # but litellm wraps many API errors. We just check if it's from LiteLLM.
-    if "litellm" in str(type(error)).lower() or "llm" in error_str or "api error" in error_str:
-        return "llm_provider_error"
-        
-    if "json" in error_str and "decode" in error_str:
-        return "audit_invalid_json"
         
     return "unknown_error"

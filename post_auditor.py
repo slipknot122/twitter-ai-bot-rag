@@ -1,12 +1,17 @@
 import json
 import re
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple, Annotated
 from pydantic import BaseModel, Field, ValidationError
 from loguru import logger
 from llm_provider import llm
 from utils import classify_safe_error
 import os
 from config import settings
+
+BoundedAuditText = Annotated[
+    str,
+    Field(min_length=1, max_length=300),
+]
 
 class AuditResult(BaseModel, extra='forbid'):
     factual_fidelity: float = Field(ge=0, le=1)
@@ -19,8 +24,8 @@ class AuditResult(BaseModel, extra='forbid'):
     policy_risk: float = Field(ge=0, le=1)
     overall_score: float = Field(ge=0, le=1)
     recommendation: Literal["APPROVE", "REVISE", "REVIEW"]
-    blocking_issues: List[str] = Field(max_length=5) # max items
-    suggestions: List[str] = Field(max_length=5) # max items
+    blocking_issues: List[BoundedAuditText] = Field(max_length=5) # max items
+    suggestions: List[BoundedAuditText] = Field(max_length=5) # max items
     feedback: str = Field(min_length=1, max_length=500)
 
 class AuditFailure(Exception):

@@ -139,6 +139,13 @@ def test_failed_is_terminal(db):
         with db._get_connection() as conn:
             db._transition_draft(conn, draft_id, {"failed"}, "approved")
 
+def test_status_not_in_updates(db):
+    """Ensure that 'status' cannot be passed in the updates dictionary."""
+    draft_id = db.add_message_and_draft("msg_status", "chan_status", "text")
+    db.fetch_next_new_draft()
+    with pytest.raises(InvalidUpdateColumnError):
+        db.complete_ai_processing(draft_id, "review", {"status": "published"})
+
 def test_atomic_publish_success_rollback(db):
     """test_atomic_publish_success_rollback: Rollback of publish success if one step fails."""
     draft_id1 = db.add_message_and_draft("msg5", "chan1", "text")
