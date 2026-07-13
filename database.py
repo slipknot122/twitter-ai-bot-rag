@@ -34,7 +34,9 @@ ALLOWED_UPDATE_COLUMNS = {
     "scheduled_at", "last_error", "retry_count", "last_retry_at",
     "updated_at", "media_status", "media_error", "media_path",
     "media_provider", "media_created_at", "media_mime_type",
-    "media_size_bytes", "media_width", "media_height"
+    "media_size_bytes", "media_width", "media_height",
+    "audit_status", "audit_decision", "audit_score", "audit_result",
+    "audit_error_code", "audit_model", "revision_count"
 }
 
 class Database:
@@ -204,7 +206,26 @@ class Database:
                     )
                     cursor.execute("DELETE FROM published_tweets WHERE id = ?", (r["id"],))
 
-            # 4. Unique indexes creation
+            # 4. Phase 3 Migration
+            cursor.execute("PRAGMA table_info(drafts)")
+            existing_columns = {row['name'] for row in cursor.fetchall()}
+            
+            phase3_columns = {
+                "audit_status": "TEXT DEFAULT NULL",
+                "audit_decision": "TEXT DEFAULT NULL",
+                "audit_score": "REAL DEFAULT NULL",
+                "audit_result": "TEXT DEFAULT NULL",
+                "audit_error_code": "TEXT DEFAULT NULL",
+                "audit_model": "TEXT DEFAULT NULL",
+                "audited_at": "TIMESTAMP DEFAULT NULL",
+                "revision_count": "INTEGER NOT NULL DEFAULT 0"
+            }
+            
+            for col_name, col_def in phase3_columns.items():
+                if col_name not in existing_columns:
+                    cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col_name} {col_def}")
+                    
+            # 5. Unique indexes creation
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_created ON drafts(status, created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_scheduled ON drafts(status, scheduled_at)')
             cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_tweet_id ON published_tweets(tweet_id)')
@@ -212,7 +233,7 @@ class Database:
             
             conn.commit()
             
-            # 5. Transient status recovery
+            # 6. Transient status recovery
             self._recover_stuck_drafts(cursor)
             conn.commit()
             
@@ -345,7 +366,18 @@ class Database:
             conn.commit()
             return dict(draft) if draft else None
 
-    def complete_ai_processing(self, draft_id: int, new_status: str, updates: dict) -> bool:
+    def get_draft(self, draft_id: int) -> Optional[dict]:
+        """Gets a draft by ID."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def complete_ai_processing(self, draft_id: int, new_status: str, updates: dict = None) -> bool:
+        """
+        Атомарно зберігає фінальний текст, результати аудиту та переводить статус.
+        """
         with self._get_connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             success = self._transition_draft(conn, draft_id, {"processing"}, new_status, updates)

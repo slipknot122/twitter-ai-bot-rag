@@ -74,6 +74,7 @@ def test_telegram_configured_no_credentials(mock_settings, tmp_path):
 
 # --- Shadow Mode Tests ---
 
+@pytest.mark.skip(reason="Phase 3 removed approved status. Full Auto is disabled.")
 @pytest.mark.anyio
 @patch('ai_worker.db')
 @patch('ai_worker.ai_engine')
@@ -102,6 +103,7 @@ async def test_shadow_mode_publish(mock_ai_engine, mock_db):
     mock_db.complete_ai_processing.assert_called_once()
     assert mock_db.complete_ai_processing.call_args[0][1] == "approved"
 
+@pytest.mark.skip(reason="Phase 3 removed approved status. Full Auto is disabled.")
 @pytest.mark.anyio
 @patch('ai_worker.db')
 @patch('ai_worker.ai_engine')
