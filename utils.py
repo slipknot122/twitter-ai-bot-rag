@@ -49,3 +49,42 @@ def is_telegram_configured(session_path_override: str = None) -> bool:
             session_file = project_root / session_file
             
     return session_file.exists()
+
+def classify_safe_error(error: Exception) -> str:
+    """
+    Classifies an exception into a safe, generic error code without leaking secrets or source text.
+    Allowed codes: llm_timeout, llm_provider_error, audit_invalid_json, audit_schema_validation,
+    revision_failed, candidate_validation, state_conflict, database_error, unknown_error.
+    """
+    import sqlite3
+    import asyncio
+    from httpx import TimeoutException as HttpxTimeout
+    from litellm.exceptions import Timeout as LitellmTimeout
+    from pydantic import ValidationError as PydanticValidationError
+    
+    if isinstance(error, (asyncio.TimeoutError, HttpxTimeout, LitellmTimeout)):
+        return "llm_timeout"
+    
+    if isinstance(error, ValidationError):
+        return "candidate_validation"
+        
+    if isinstance(error, PydanticValidationError):
+        return "audit_schema_validation"
+        
+    if isinstance(error, sqlite3.Error):
+        # We can narrow this down later if needed
+        if "UNIQUE constraint" in str(error) or "FOREIGN KEY" in str(error):
+             return "state_conflict"
+        return "database_error"
+        
+    error_str = str(error).lower()
+    
+    # Very coarse mapping for llm provider errors. It's safer to catch explicit types,
+    # but litellm wraps many API errors. We just check if it's from LiteLLM.
+    if "litellm" in str(type(error)).lower() or "llm" in error_str or "api error" in error_str:
+        return "llm_provider_error"
+        
+    if "json" in error_str and "decode" in error_str:
+        return "audit_invalid_json"
+        
+    return "unknown_error"

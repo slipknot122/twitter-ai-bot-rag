@@ -524,6 +524,80 @@
                     </div>
                 </div>
 
+                <!-- Post Auditor Section -->
+                {% if draft.audit_data or draft.audit_error_code or draft.audit_status %}
+                <div class="content-block" style="margin-top: 1rem; border-top: 1px solid var(--card-border); padding-top: 1rem;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <h3 style="margin: 0;">🛡️ Post Auditor</h3>
+                        <div style="display: flex; gap: 0.5rem; align-items: center;">
+                            {% if draft.audit_model %}
+                                <span style="font-size: 0.75rem; color: var(--text-muted); background: rgba(255,255,255,0.05); padding: 0.2rem 0.5rem; border-radius: 0.25rem;">{{ draft.audit_model }}</span>
+                            {% endif %}
+                            <span class="status-badge status-{{ draft.audit_status|default('none') }}">{{ draft.audit_status|default('None')|upper }}</span>
+                        </div>
+                    </div>
+                    
+                    {% if draft.audit_error_code %}
+                    <div style="margin-bottom: 1rem; padding: 0.75rem; background: rgba(239, 68, 68, 0.1); border-left: 4px solid var(--danger); border-radius: 0.25rem;">
+                        <strong style="color: var(--danger); font-size: 0.85rem;">Technical Error:</strong>
+                        <span style="color: #fca5a5; font-size: 0.85rem; margin-left: 0.5rem;">{{ draft.audit_error_code }}</span>
+                    </div>
+                    {% endif %}
+
+                    {% if draft.audit_data and draft.audit_data.first_audit %}
+                        {% set audit = draft.audit_data.final_audit if draft.audit_data.final_audit else draft.audit_data.first_audit %}
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
+                            <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 0.5rem;">
+                                <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">Decision</div>
+                                <div style="font-size: 1.1rem; font-weight: bold; color: {% if audit.recommendation == 'APPROVE' %}var(--success){% elif audit.recommendation == 'REVISE' %}var(--warning){% else %}var(--danger){% endif %}">
+                                    {{ audit.recommendation }}
+                                </div>
+                            </div>
+                            <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 0.5rem;">
+                                <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">Score</div>
+                                <div style="font-size: 1.1rem; font-weight: bold;">
+                                    {{ "%.0f"|format(audit.overall_score * 100) }}%
+                                </div>
+                            </div>
+                            <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 0.5rem;">
+                                <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">Revisions</div>
+                                <div style="font-size: 1.1rem; font-weight: bold;">
+                                    {{ draft.revision_count }}
+                                </div>
+                            </div>
+                        </div>
+
+                        {% if audit.blocking_issues and audit.blocking_issues|length > 0 %}
+                        <div style="margin-bottom: 0.75rem;">
+                            <strong style="color: var(--danger); font-size: 0.85rem;">Blocking Issues:</strong>
+                            <ul style="margin-top: 0.25rem; margin-bottom: 0; padding-left: 1.5rem; font-size: 0.9rem;">
+                                {% for issue in audit.blocking_issues %}
+                                    <li style="color: #fca5a5;">{{ issue }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        
+                        {% if audit.suggestions and audit.suggestions|length > 0 %}
+                        <div style="margin-bottom: 0.75rem;">
+                            <strong style="color: var(--warning); font-size: 0.85rem;">Suggestions:</strong>
+                            <ul style="margin-top: 0.25rem; margin-bottom: 0; padding-left: 1.5rem; font-size: 0.9rem;">
+                                {% for sug in audit.suggestions %}
+                                    <li style="color: #fde047;">{{ sug }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        
+                        {% if audit.feedback %}
+                        <div style="margin-top: 0.5rem; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 0.5rem; font-size: 0.9rem; font-style: italic;">
+                            "{{ audit.feedback }}"
+                        </div>
+                        {% endif %}
+                    {% endif %}
+                </div>
+                {% endif %}
+
                 <!-- Media Preview Section -->
                 <div class="media-section" id="media-section-{{ draft.id }}">
                     <h3>

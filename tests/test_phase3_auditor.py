@@ -111,7 +111,7 @@ def test_good_first_audit(mock_process, mock_audit, test_db):
         "sentiment": "Neutral",
         "confidence": 0.9
     }
-    mock_audit.return_value = make_valid_audit()
+    mock_audit.return_value = (make_valid_audit(), "mock_model")
     
     # Process
     ai_worker.process_draft(1, test_db)
@@ -143,8 +143,8 @@ def test_bad_first_audit_good_revision(mock_revise, mock_process, mock_audit, te
     
     # First returns bad, Second returns good
     mock_audit.side_effect = [
-        make_valid_audit(factual_fidelity=0.8), # needs revision
-        make_valid_audit(factual_fidelity=0.96) # passes
+        (make_valid_audit(factual_fidelity=0.8), "mock_model"), # needs revision
+        (make_valid_audit(factual_fidelity=0.96), "mock_model") # passes
     ]
     
     ai_worker.process_draft(1, test_db)
@@ -174,8 +174,8 @@ def test_bad_second_audit_stops(mock_revise, mock_process, mock_audit, test_db):
     
     # Both audits bad
     mock_audit.side_effect = [
-        make_valid_audit(factual_fidelity=0.8),
-        make_valid_audit(factual_fidelity=0.85)
+        (make_valid_audit(factual_fidelity=0.8), "mock_model"),
+        (make_valid_audit(factual_fidelity=0.85), "mock_model")
     ]
     
     ai_worker.process_draft(1, test_db)
@@ -205,7 +205,7 @@ def test_timeout_first_audit(mock_process, mock_audit, test_db):
     ai_worker.process_draft(1, test_db)
     
     draft = test_db.get_draft(1)
-    assert draft['status'] == 'review'
+    assert draft['status'] == 'failed'
     assert draft['audit_status'] == 'failed'
     assert draft['audit_score'] is None
     assert draft['audit_error_code'] == 'timeout'
@@ -225,7 +225,7 @@ def test_revision_failure(mock_revise, mock_process, mock_audit, test_db):
     
     # First audit bad
     mock_audit.side_effect = [
-        make_valid_audit(factual_fidelity=0.8),
+        (make_valid_audit(factual_fidelity=0.8), "mock_model"),
         AuditFailure("timeout", "API Timeout on second audit")
     ]
     
@@ -234,7 +234,7 @@ def test_revision_failure(mock_revise, mock_process, mock_audit, test_db):
     ai_worker.process_draft(1, test_db)
     
     draft = test_db.get_draft(1)
-    assert draft['status'] == 'review'
+    assert draft['status'] == 'failed'
     assert draft['audit_status'] == 'failed'
     assert draft['audit_error_code'] == 'timeout'
     assert draft['audit_score'] is None

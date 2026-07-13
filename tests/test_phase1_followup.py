@@ -74,56 +74,70 @@ def test_telegram_configured_no_credentials(mock_settings, tmp_path):
 
 # --- Shadow Mode Tests ---
 
-@pytest.mark.skip(reason="Phase 3 removed approved status. Full Auto is disabled.")
+@pytest.mark.anyio
+@patch('ai_worker.auditor')
+@patch('ai_worker.db')
+@patch('ai_worker.ai_engine')
+async def test_ai_worker_publish_goes_to_review(mock_ai_engine, mock_db, mock_auditor):
+    # Phase 3 policy: Even if it generates successfully, it goes to review (audit) and stays in review.
+    # We test the end state after auditor.
+    mock_draft = {"id": 1, "original_text": "text", "status": "processing"}
+    mock_db.fetch_next_new_draft.side_effect = [mock_draft, KeyboardInterrupt("Stop loop")]
+    mock_db.get_draft.return_value = mock_draft
+    
+    mock_ai_engine.process_text.return_value = {"action": "GENERATE", "tweet_text": "valid valid valid valid text that passes min length constraints"}
+    
+    # Mock auditor to pass
+    from post_auditor import AuditResult
+    mock_audit = AuditResult(
+        recommendation="APPROVE",
+        overall_score=0.9,
+        factual_fidelity=0.9,
+        clarity=0.9,
+        hook_strength=0.9,
+        originality=0.9,
+        persona_match=0.9,
+        duplicate_risk=0.1,
+        spam_risk=0.1,
+        policy_risk=0.1,
+        blocking_issues=[],
+        suggestions=[],
+        feedback="Looks good"
+    )
+    mock_auditor.audit.return_value = (mock_audit, "mock_model")
+    mock_auditor.requires_revision.return_value = False
+    
+    try:
+        await ai_worker_loop()
+    except KeyboardInterrupt:
+        pass
+        
+    mock_db.complete_ai_processing.assert_called_once()
+    assert mock_db.complete_ai_processing.call_args[0][1] == "review"
+    kwargs = mock_db.complete_ai_processing.call_args[0][2]
+    assert kwargs["audit_status"] == "passed"
+    assert kwargs["audit_model"] == "mock_model"
+
 @pytest.mark.anyio
 @patch('ai_worker.db')
 @patch('ai_worker.ai_engine')
-async def test_shadow_mode_publish(mock_ai_engine, mock_db):
+async def test_ai_worker_other_actions(mock_ai_engine, mock_db):
     mock_draft = {"id": 1, "original_text": "text", "status": "processing"}
     mock_db.fetch_next_new_draft.side_effect = [mock_draft, KeyboardInterrupt("Stop loop")]
-    mock_ai_engine.process_text.return_value = {"action": "PUBLISH", "tweet_text": "valid valid valid valid"}
+    mock_db.get_draft.return_value = mock_draft
     
-    # TEST 1: shadow_mode = True -> review
-    mock_db.get_setting.return_value = True
+    # FAILED action
+    mock_ai_engine.process_text.return_value = {"action": "FAILED", "tweet_text": ""}
     try:
         await ai_worker_loop()
     except KeyboardInterrupt:
         pass
     mock_db.complete_ai_processing.assert_called_once()
-    assert mock_db.complete_ai_processing.call_args[0][1] == "review"
-    
-    # TEST 2: shadow_mode = False -> approved
-    mock_db.reset_mock()
-    mock_db.get_setting.return_value = False
-    mock_db.fetch_next_new_draft.side_effect = [mock_draft, KeyboardInterrupt("Stop loop")]
-    try:
-        await ai_worker_loop()
-    except KeyboardInterrupt:
-        pass
-    mock_db.complete_ai_processing.assert_called_once()
-    assert mock_db.complete_ai_processing.call_args[0][1] == "approved"
-
-@pytest.mark.skip(reason="Phase 3 removed approved status. Full Auto is disabled.")
-@pytest.mark.anyio
-@patch('ai_worker.db')
-@patch('ai_worker.ai_engine')
-async def test_shadow_mode_other_actions(mock_ai_engine, mock_db):
-    mock_draft = {"id": 1, "original_text": "text", "status": "processing"}
-    mock_db.fetch_next_new_draft.side_effect = [mock_draft, KeyboardInterrupt("Stop loop")]
-    mock_db.get_setting.return_value = False # shadow_mode is False
-    
-    # REVIEW action
-    mock_ai_engine.process_text.return_value = {"action": "REVIEW", "tweet_text": "valid valid valid valid"}
-    try:
-        await ai_worker_loop()
-    except KeyboardInterrupt:
-        pass
-    mock_db.complete_ai_processing.assert_called_once()
-    assert mock_db.complete_ai_processing.call_args[0][1] == "review"
+    assert mock_db.complete_ai_processing.call_args[0][1] == "failed"
 
     mock_db.reset_mock()
     mock_db.fetch_next_new_draft.side_effect = [mock_draft, KeyboardInterrupt("Stop loop")]
-    mock_db.get_setting.return_value = False
+    mock_db.get_draft.return_value = mock_draft
     
     # IGNORE action
     mock_ai_engine.process_text.return_value = {"action": "IGNORE", "tweet_text": "valid valid valid valid"}

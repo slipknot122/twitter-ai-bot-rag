@@ -62,6 +62,18 @@ def index(request: Request, tab: str = "review"):
         statuses = ["review", "pending"]
 
     drafts = db.get_drafts_by_status(statuses)
+    
+    # Parse audit_result for UI rendering
+    import json
+    for d in drafts:
+        if d.get("audit_result"):
+            try:
+                d["audit_data"] = json.loads(d["audit_result"])
+            except Exception:
+                d["audit_data"] = None
+        else:
+            d["audit_data"] = None
+
     analytics = db.get_analytics()
         
     return templates.TemplateResponse(
@@ -91,9 +103,6 @@ def publish_draft(draft_id: int):
     success = db.approve_draft(draft_id, {"rewritten_text": validated_text})
     if not success:
         raise HTTPException(status_code=409, detail="Failed to transition draft to approved state (possible race condition or invalid state)")
-    
-    if validated_text:
-        semantic_memory.save(validated_text)
             
     return {"status": "success"}
 

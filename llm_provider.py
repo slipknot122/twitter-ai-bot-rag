@@ -2,8 +2,14 @@ from litellm import completion, embedding
 from loguru import logger
 from config import settings
 from tenacity import retry, wait_exponential, stop_after_attempt
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
 import os
+
+@dataclass(frozen=True)
+class LLMResult:
+    text: str
+    model_used: str | None
 
 class LLMProvider:
     def __init__(self):
@@ -12,9 +18,9 @@ class LLMProvider:
         # If no key is set and we try to call it, litellm will throw an error.
         
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-    def generate(self, prompt: str, system_prompt: str = "", temperature: Optional[float] = None) -> str:
+    def generate_with_metadata(self, prompt: str, system_prompt: str = "", temperature: Optional[float] = None) -> LLMResult:
         """
-        Відправляє запит до LLM через LiteLLM.
+        Відправляє запит до LLM через LiteLLM та повертає результат з метаданими.
         """
         messages = []
         if system_prompt:
@@ -54,7 +60,7 @@ class LLMProvider:
                     usage = response.usage
                     logger.info(f"LLM Success with {current_model}. Tokens used: {usage.total_tokens} (Prompt: {usage.prompt_tokens}, Completion: {usage.completion_tokens})")
                     
-                    return result.strip()
+                    return LLMResult(text=result.strip(), model_used=current_model)
                 except Exception as e:
                     logger.warning(f"Model {current_model} failed: {e}. Trying next model...")
                     last_error = e
@@ -66,6 +72,13 @@ class LLMProvider:
         except Exception as e:
             logger.error(f"Error during LLM generation setup: {e}")
             raise
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+    def generate(self, prompt: str, system_prompt: str = "", temperature: Optional[float] = None) -> str:
+        """
+        Backward compatible generate that returns only the text.
+        """
+        return self.generate_with_metadata(prompt, system_prompt, temperature).text
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def get_embedding(self, text: str) -> List[float]:

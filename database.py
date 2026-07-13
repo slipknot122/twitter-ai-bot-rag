@@ -29,14 +29,14 @@ ALLOWED_TRANSITIONS = {
 }
 
 ALLOWED_UPDATE_COLUMNS = {
-    "rewritten_text", "reason", "confidence",
+    "rewritten_text", "status", "reason", "confidence",
     "image_prompt", "sentiment", "category",
     "scheduled_at", "last_error", "retry_count", "last_retry_at",
     "updated_at", "media_status", "media_error", "media_path",
     "media_provider", "media_created_at", "media_mime_type",
     "media_size_bytes", "media_width", "media_height",
     "audit_status", "audit_decision", "audit_score", "audit_result",
-    "audit_error_code", "audit_model", "revision_count"
+    "audit_error_code", "audit_model", "revision_count", "audited_at"
 }
 
 class Database:

@@ -3,6 +3,7 @@ from loguru import logger
 from pathlib import Path
 from config import settings
 from database import db
+from semantic_memory import semantic_memory
 
 class TwitterPublisher:
     def __init__(self):
@@ -54,6 +55,7 @@ class TwitterPublisher:
             if full_media_path and full_media_path.exists():
                 logger.info(f"[DRY RUN] Attached Media: {full_media_path}")
             db.record_publish_success(draft_id, f"mock_tweet_{draft_id}")
+            logger.info(f"[DRY RUN] Skipping semantic_memory.save() in Dry Run mode.")
             return True
 
         if not self.client or not self.api_v1:
@@ -78,6 +80,13 @@ class TwitterPublisher:
         logger.success(f"Tweet published successfully! ID: {tweet_id}")
 
         db.record_publish_success(draft_id, str(tweet_id))
+        
+        # Semantic memory update ONLY after confirmed real publish and local DB transaction
+        try:
+            semantic_memory.save(text)
+        except Exception as e:
+            logger.warning(f"Failed to update semantic memory for draft {draft_id}: {e}")
+            
         return True
 
 publisher = TwitterPublisher()
