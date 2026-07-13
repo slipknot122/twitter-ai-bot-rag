@@ -294,20 +294,20 @@ class PollingWorker:
                 async with client.stream('GET', url, headers=headers) as resp:
                     result.status_code = resp.status_code
                     if resp.status_code in (301, 302, 303, 307, 308):
-                        loc_list = resp.headers.get_list("Location")
-                        if not loc_list:
+                        loc_headers = [v.decode('utf-8', errors='ignore') for k, v in resp.headers.raw if k.lower() == b'location']
+                        if not loc_headers:
                             result.error_code = "redirect_missing_location"
                             return result
                         
-                        valid_locs = [l for l in loc_list if l.strip()]
-                        if len(valid_locs) == 0:
-                            result.error_code = "redirect_missing_location"
-                            return result
-                        elif len(valid_locs) > 1:
+                        if len(loc_headers) > 1:
                             result.error_code = "redirect_ambiguous_location"
                             return result
                             
-                        loc = valid_locs[0].strip()
+                        loc = loc_headers[0].strip()
+                        if not loc:
+                            result.error_code = "redirect_missing_location"
+                            return result
+                            
                         if any(ord(c) < 32 or ord(c) == 127 for c in loc):
                             result.error_code = "redirect_ambiguous_location"
                             return result
@@ -379,7 +379,8 @@ class PollingWorker:
                 result.error_code = "network_error"
             except httpx.DecodingError:
                 result.error_code = "unsupported_encoding"
-            except Exception:
+            except Exception as e:
+                import traceback; traceback.print_exc()
                 result.error_code = "internal_error"
         finally:
             await self.host_limiter.release(host_key)
@@ -431,9 +432,11 @@ class PollingWorker:
         delay = 0
         
         if res.error_code:
-            decision = 'error'
-            error_code = 'robots_error'
-            ttl = 900
+            print(f"DEBUG: check_robots res.error_code = {res.error_code}, res.status_code = {res.status_code}")
+        
+        if res.status_code in (404, 410):
+            decision = 'allow'
+            ttl = 86400 # 24h
         elif res.status_code == 200:
             text = res.content.decode('utf-8', errors='ignore')
             rp = urllib.robotparser.RobotFileParser()
@@ -457,9 +460,10 @@ class PollingWorker:
             else:
                 ttl = 900
                 delay = 0 # Fallback to standard rng backoff later
-        elif res.status_code in (404, 410):
-            decision = 'allow'
-            ttl = 86400 # 24h
+        elif res.error_code:
+            decision = 'error'
+            error_code = 'robots_error'
+            ttl = 900
         else:
             decision = 'error'
             error_code = 'robots_error'

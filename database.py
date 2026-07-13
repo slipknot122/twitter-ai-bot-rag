@@ -1548,8 +1548,7 @@ class Database:
 
     def complete_source_poll(self, global_token: str, source_id: int, source_token: str, claimed_mode: str, claimed_target: str, outcome_updates: dict, drafts_to_insert: List[dict] = None) -> bool:
         import datetime
-        now = datetime.datetime.now(datetime.timezone.utc)
-        now_str = now.isoformat()
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
         allowed_fields = {
             'collector_status', 'last_error_code', 'consecutive_errors',
