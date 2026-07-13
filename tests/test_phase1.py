@@ -83,7 +83,8 @@ def test_media_builder_error_handling():
         mock_provider1.generate.side_effect = ProviderAuthError("Auth failed")
         
         with patch('media_builder.db.get_setting') as mock_db, \
-             patch('media_builder._validate_and_save_image') as mock_val:
+             patch('media_builder._validate_and_save_image') as mock_val, \
+             patch('pathlib.Path.rename') as mock_rename:
             mock_db.return_value = "none"
             mock_val.return_value = {"width": 1024, "height": 1024, "size_bytes": 100, "mime_type": "image/jpeg"}
             result2 = builder.generate(2, "test prompt")

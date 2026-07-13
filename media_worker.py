@@ -4,7 +4,7 @@ from loguru import logger
 from database import db
 from media_builder import media_builder, TransientMediaError, PermanentMediaError, ContentRejectionError, ProviderAuthError
 
-async def process_media_job(draft_id: int, token: str, prompt: str):
+def process_media_job(draft_id: int, token: str, prompt: str):
     """
     Executes media generation via MediaBuilder.
     Runs inside asyncio.to_thread in the worker loop.
@@ -28,33 +28,33 @@ async def process_media_job(draft_id: int, token: str, prompt: str):
             )
             
     except TransientMediaError as e:
-        logger.warning(f"Media Worker: Transient error for draft {draft_id}: {e}")
+        logger.warning(f"Media Worker: Transient error for draft {draft_id}")
         db.fail_media_generation(
             draft_id=draft_id,
             token=token,
             error_code="TRANSIENT_ERROR",
-            error_message=str(e),
+            error_message="A transient error occurred during media generation",
             is_transient=True
         )
         
     except (PermanentMediaError, ContentRejectionError, ProviderAuthError) as e:
-        logger.error(f"Media Worker: Permanent error for draft {draft_id}: {e}")
+        logger.error(f"Media Worker: Permanent error for draft {draft_id}")
         db.fail_media_generation(
             draft_id=draft_id,
             token=token,
-            error_code="PERMANENT_ERROR",
-            error_message=str(e),
+            error_code=type(e).__name__,
+            error_message="A permanent error occurred during media generation",
             is_transient=False
         )
         
     except Exception as e:
-        logger.error(f"Media Worker: Unexpected exception for draft {draft_id}: {e}\n{traceback.format_exc()}")
+        logger.error(f"Media Worker: Unexpected exception for draft {draft_id}")
         db.fail_media_generation(
             draft_id=draft_id,
             token=token,
             error_code="UNEXPECTED_ERROR",
-            error_message=str(e),
-            is_transient=False  # To be safe against crashes, though we could make it True
+            error_message="An unexpected error occurred",
+            is_transient=False
         )
 
 
@@ -70,16 +70,9 @@ async def media_worker_loop():
     while True:
         try:
             # 1. Recover expired leases
-            # If a lease expires, it moves from generating to pending and nullifies the token.
-            with db._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE drafts SET media_status = 'pending', media_generation_token = NULL "
-                    "WHERE media_status = 'generating' AND media_lease_expires_at < datetime('now')"
-                )
-                if cursor.rowcount > 0:
-                    logger.info(f"Media Worker: Recovered {cursor.rowcount} expired media jobs.")
-                conn.commit()
+            count = db.recover_expired_media_jobs()
+            if count > 0:
+                logger.info(f"Media Worker: Recovered {count} expired media jobs.")
 
             # 2. Claim next pending job
             # The claim logic sets media_status='generating' and media_lease_expires_at
@@ -111,11 +104,14 @@ async def media_worker_loop():
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Media Worker: Job for draft {draft_id} timed out after 540s.")
-                # We do NOT update the DB. The lease expiration will handle recovery.
-                # Since the thread might still run in the background, the token protection
-                # ensures that if it finishes later, it won't be able to update the DB
-                # because the token will be cleared or changed upon recovery.
-                pass
+                # We update the DB immediately to invalidate token and trigger retry policy
+                db.fail_media_generation(
+                    draft_id=draft_id,
+                    token=token,
+                    error_code="TIMEOUT",
+                    error_message="Generation timed out",
+                    is_transient=True
+                )
                 
         except asyncio.CancelledError:
             logger.info("Media Worker loop cancelled.")

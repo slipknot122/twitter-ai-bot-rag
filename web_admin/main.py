@@ -141,9 +141,11 @@ def update_draft(draft_id: int, request: UpdateDraftRequest):
 # Media Generation API
 # ---------------------------------------------------------------------------
 
+from typing import Literal
+
 class GenerateImageRequest(BaseModel):
     image_prompt: Optional[str] = Field(default=None, min_length=20, max_length=1500)
-    action: str = Field(default="generate", description="generate, retry, or regenerate")
+    action: Literal["generate", "retry", "regenerate"] = Field(default="generate", description="generate, retry, or regenerate")
 
 
 @app.post("/api/drafts/{draft_id}/image", status_code=202)
@@ -168,17 +170,12 @@ async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] 
     if not prompt or len(prompt.strip()) < 20:
         raise HTTPException(status_code=422, detail="image_prompt is required (min 20 chars)")
 
-    # Update prompt if changed
-    if prompt != draft["image_prompt"]:
-        with db._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE drafts SET image_prompt = ? WHERE id = ?", (prompt, draft_id))
-            conn.commit()
+    action = request.action if request else "generate"
 
-    # Queue logic
-    success = db.queue_media_generation(draft_id)
+    # Queue logic and atomic prompt update
+    success = db.queue_media_generation(draft_id, prompt=prompt, action=action)
     if not success:
-        raise HTTPException(status_code=409, detail="Image generation already in progress or already ready (use regenerate action if ready)")
+        raise HTTPException(status_code=409, detail="Action not allowed for current state or already in progress")
 
     return {"draft_id": draft_id, "media_status": "pending"}
 
@@ -186,27 +183,9 @@ async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] 
 @app.delete("/api/drafts/{draft_id}/image")
 def delete_image(draft_id: int):
     """Безпечне видалення зображення."""
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT media_path FROM drafts WHERE id = ?", (draft_id,))
-        draft = cursor.fetchone()
-
-    if not draft:
-        raise HTTPException(status_code=404, detail="Draft not found")
-
-    if draft["media_path"]:
-        media_builder.delete_media_file(draft["media_path"])
-        
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE drafts SET media_status = 'none', media_path = NULL, "
-            "media_error = NULL, media_provider = NULL, media_mime_type = NULL, "
-            "media_size_bytes = NULL, media_width = NULL, media_height = NULL, "
-            "media_created_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (draft_id,)
-        )
-        conn.commit()
+    success = db.delete_media(draft_id)
+    if not success:
+        raise HTTPException(status_code=409, detail="Cannot delete media")
 
     return {"status": "success"}
 
@@ -217,7 +196,7 @@ def get_image_status(draft_id: int):
     with db._get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT media_status, media_path, media_error, media_provider, "
+            "SELECT media_status, media_path, media_error_code, media_error_message, media_provider, "
             "media_width, media_height, media_size_bytes, image_prompt "
             "FROM drafts WHERE id = ?", (draft_id,)
         )

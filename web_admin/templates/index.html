@@ -601,12 +601,14 @@
                 <!-- Media Preview Section -->
                 <div class="media-section" id="media-section-{{ draft.id }}">
                     <h3>
-                        🖼️ Media Preview
+                        Media Preview
                         <span class="media-status-badge media-status-{{ draft.media_status|default('none') }}" id="media-badge-{{ draft.id }}">
-                            {% if draft.media_status == 'generating' %}⏳ Generating...
-                            {% elif draft.media_status == 'ready' %}✅ Ready ({{ draft.media_provider }})
-                            {% elif draft.media_status == 'failed' %}❌ Failed
-                            {% else %}○ No image
+                            {% if draft.media_status == 'pending' %}Pending
+                            {% elif draft.media_status == 'generating' %}Generating...
+                            {% elif draft.media_status == 'ready' %}Ready ({{ draft.media_provider }})
+                            {% elif draft.media_status == 'failed' %}Failed
+                            {% elif draft.media_status == 'cancelled' %}Cancelled
+                            {% else %}None
                             {% endif %}
                         </span>
                     </h3>
@@ -616,9 +618,9 @@
                         <div id="media-preview-{{ draft.id }}">
                             {% if draft.media_status == 'ready' and draft.media_path %}
                             <img src="/media/{{ draft.media_path.split('/')[-1] }}" class="media-preview-img" alt="Generated preview">
-                            {% elif draft.media_status == 'generating' %}
+                            {% elif draft.media_status == 'generating' or draft.media_status == 'pending' %}
                             <div style="width:200px;height:120px;display:flex;align-items:center;justify-content:center;background:rgba(139,92,246,0.1);border-radius:0.5rem;border:1px dashed rgba(139,92,246,0.3);">
-                                <span style="color:#c4b5fd;font-size:0.9rem;">⏳ Generating...</span>
+                                <span style="color:#c4b5fd;font-size:0.9rem;">Processing...</span>
                             </div>
                             {% endif %}
                         </div>
@@ -630,18 +632,22 @@
 
                             <div class="media-buttons">
                                 {% if draft.media_status == 'ready' %}
-                                <button class="btn-media" onclick="generateImage({{ draft.id }}, true)">🔄 Regenerate</button>
-                                <button class="btn-media btn-media-remove" onclick="removeImage({{ draft.id }})">🗑️ Remove</button>
-                                {% elif draft.media_status == 'generating' %}
-                                <button class="btn-media" disabled>⏳ Generating...</button>
+                                <button class="btn-media" onclick="generateImage({{ draft.id }}, 'regenerate')">Regenerate</button>
+                                <button class="btn-media btn-media-remove" onclick="removeImage({{ draft.id }})">Remove</button>
+                                {% elif draft.media_status in ('pending', 'generating') %}
+                                <button class="btn-media" disabled>Processing...</button>
+                                <button class="btn-media btn-media-remove" onclick="removeImage({{ draft.id }})">Cancel</button>
+                                {% elif draft.media_status == 'failed' %}
+                                <button class="btn-media" onclick="generateImage({{ draft.id }}, 'retry')">Retry</button>
+                                <button class="btn-media btn-media-remove" onclick="removeImage({{ draft.id }})">Remove</button>
                                 {% else %}
-                                <button class="btn-media" onclick="generateImage({{ draft.id }}, false)">🎨 Generate Image</button>
+                                <button class="btn-media" onclick="generateImage({{ draft.id }}, 'generate')">Generate</button>
                                 {% endif %}
                             </div>
 
-                            {% if draft.media_error %}
+                            {% if draft.media_error_message %}
                             <div style="padding:0.5rem;background:rgba(239,68,68,0.1);border-left:3px solid var(--danger);border-radius:0.25rem;font-size:0.8rem;color:#fca5a5;">
-                                {{ draft.media_error }}
+                                <strong>{{ draft.media_error_code|e }}</strong>: {{ draft.media_error_message|e }}
                             </div>
                             {% endif %}
 
@@ -693,7 +699,7 @@
         // Media generation polling intervals
         const _pollingIntervals = {};
 
-        async function generateImage(id, regenerate) {
+        async function generateImage(id, actionStr) {
             const promptEl = document.getElementById(`prompt-${id}`);
             const prompt = promptEl ? promptEl.value.trim() : '';
 
@@ -706,20 +712,16 @@
                 const resp = await fetch(`/api/drafts/${id}/image`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image_prompt: prompt, regenerate: regenerate })
+                    body: JSON.stringify({ image_prompt: prompt, action: actionStr })
                 });
 
-                if (resp.status === 409) {
-                    alert('Image generation already in progress!');
-                    return;
-                }
-                if (resp.status === 400) {
+                if (resp.status === 409 || resp.status === 422) {
                     const data = await resp.json();
-                    alert(data.detail || 'Bad request');
+                    alert(data.detail || 'Request failed');
                     return;
                 }
                 if (resp.status === 202) {
-                    updateMediaUI(id, 'generating', null, null);
+                    updateMediaUI(id, 'pending', null, null);
                     startPolling(id);
                 }
             } catch (e) {
@@ -772,41 +774,47 @@
             // Update badge
             if (badge) {
                 badge.className = `media-status-badge media-status-${status}`;
-                if (status === 'generating') badge.textContent = '⏳ Generating...';
-                else if (status === 'ready') badge.textContent = `✅ Ready (${data?.media_provider || ''})`;
-                else if (status === 'failed') badge.textContent = '❌ Failed';
-                else badge.textContent = '○ No image';
+                if (status === 'pending') badge.textContent = 'Pending';
+                else if (status === 'generating') badge.textContent = 'Generating...';
+                else if (status === 'ready') badge.textContent = `Ready (${data?.media_provider || ''})`;
+                else if (status === 'failed') badge.textContent = 'Failed';
+                else if (status === 'cancelled') badge.textContent = 'Cancelled';
+                else badge.textContent = 'None';
             }
 
             // Update preview image
             if (preview) {
                 if (status === 'ready' && mediaUrl) {
                     preview.innerHTML = `<img src="${mediaUrl}?t=${Date.now()}" class="media-preview-img" alt="Generated preview">`;
-                } else if (status === 'generating') {
-                    preview.innerHTML = '<div style="width:200px;height:120px;display:flex;align-items:center;justify-content:center;background:rgba(139,92,246,0.1);border-radius:0.5rem;border:1px dashed rgba(139,92,246,0.3);"><span style="color:#c4b5fd;font-size:0.9rem;">⏳ Generating...</span></div>';
+                } else if (status === 'generating' || status === 'pending') {
+                    preview.innerHTML = '<div style="width:200px;height:120px;display:flex;align-items:center;justify-content:center;background:rgba(139,92,246,0.1);border-radius:0.5rem;border:1px dashed rgba(139,92,246,0.3);"><span style="color:#c4b5fd;font-size:0.9rem;">Processing...</span></div>';
                 } else {
                     preview.innerHTML = '';
                 }
             }
 
-            // Update buttons (reload section for simplicity)
+            // Update buttons
             const buttonsDiv = section?.querySelector('.media-buttons');
             if (buttonsDiv) {
                 if (status === 'ready') {
                     buttonsDiv.innerHTML = `
-                        <button class="btn-media" onclick="generateImage(${id}, true)">🔄 Regenerate</button>
-                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">🗑️ Remove</button>`;
-                } else if (status === 'generating') {
-                    buttonsDiv.innerHTML = '<button class="btn-media" disabled>⏳ Generating...</button>';
+                        <button class="btn-media" onclick="generateImage(${id}, 'regenerate')">Regenerate</button>
+                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">Remove</button>`;
+                } else if (status === 'generating' || status === 'pending') {
+                    buttonsDiv.innerHTML = `
+                        <button class="btn-media" disabled>Processing...</button>
+                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">Cancel</button>`;
                 } else if (status === 'failed') {
-                    buttonsDiv.innerHTML = `<button class="btn-media" onclick="generateImage(${id}, false)">🎨 Retry Generate</button>`;
+                    buttonsDiv.innerHTML = `
+                        <button class="btn-media" onclick="generateImage(${id}, 'retry')">Retry</button>
+                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">Remove</button>`;
                 } else {
-                    buttonsDiv.innerHTML = `<button class="btn-media" onclick="generateImage(${id}, false)">🎨 Generate Image</button>`;
+                    buttonsDiv.innerHTML = `<button class="btn-media" onclick="generateImage(${id}, 'generate')">Generate</button>`;
                 }
             }
 
             // Show/hide error
-            if (data?.media_error && status === 'failed') {
+            if (data?.media_error_message && status === 'failed') {
                 let errDiv = section?.querySelector('[data-media-error]');
                 if (!errDiv) {
                     errDiv = document.createElement('div');
@@ -814,7 +822,15 @@
                     errDiv.style.cssText = 'padding:0.5rem;background:rgba(239,68,68,0.1);border-left:3px solid var(--danger);border-radius:0.25rem;font-size:0.8rem;color:#fca5a5;margin-top:0.5rem;';
                     section?.querySelector('.media-controls')?.appendChild(errDiv);
                 }
-                errDiv.textContent = data.media_error;
+                const escCode = document.createElement('strong');
+                escCode.textContent = data.media_error_code || 'ERROR';
+                const escMsg = document.createTextNode(`: ${data.media_error_message}`);
+                errDiv.innerHTML = '';
+                errDiv.appendChild(escCode);
+                errDiv.appendChild(escMsg);
+            } else {
+                const errDiv = section?.querySelector('[data-media-error]');
+                if (errDiv) errDiv.remove();
             }
         }
 

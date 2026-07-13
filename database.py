@@ -32,7 +32,7 @@ ALLOWED_UPDATE_COLUMNS = {
     "rewritten_text", "reason", "confidence",
     "image_prompt", "sentiment", "category",
     "scheduled_at", "last_error", "retry_count", "last_retry_at",
-    "updated_at", "media_status", "media_error", "media_path",
+    "updated_at", "media_status", "media_error_code", "media_error_message", "media_path",
     "media_provider", "media_created_at", "media_mime_type",
     "media_size_bytes", "media_width", "media_height",
     "audit_status", "audit_decision", "audit_score", "audit_result",
@@ -409,11 +409,15 @@ class Database:
                         media_error_code = NULL,
                         media_error_message = NULL,
                         media_path = NULL,
-                        media_provider = NULL
-                    WHERE id = ? AND media_status IN ('none', 'failed')
+                        media_provider = NULL,
+                        media_lease_expires_at = NULL
+                    WHERE id = ? AND media_status IN ('none', 'failed', 'cancelled')
                     """,
                     (new_token, now_iso, draft_id)
                 )
+                if cursor.rowcount == 0:
+                    success = False
+            
             if success:
                 conn.commit()
             else:
@@ -554,36 +558,77 @@ class Database:
 
     # --- Phase 4: Media State Machine ---
 
-    def queue_media_generation(self, draft_id: int) -> bool:
+    def recover_expired_media_jobs(self) -> int:
+        import uuid
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            cursor.execute("BEGIN IMMEDIATE")
+            
+            cursor.execute("SELECT id FROM drafts WHERE media_status = 'generating' AND media_lease_expires_at < ?", (now_iso,))
+            expired_ids = [row["id"] for row in cursor.fetchall()]
+            if not expired_ids:
+                return 0
+                
+            for draft_id in expired_ids:
+                cursor.execute(
+                    """
+                    UPDATE drafts 
+                    SET media_status = 'pending',
+                        media_generation_token = ?,
+                        media_lease_expires_at = NULL
+                    WHERE id = ?
+                    """,
+                    (str(uuid.uuid4()), draft_id)
+                )
+            conn.commit()
+            return len(expired_ids)
+
+    def queue_media_generation(self, draft_id: int, prompt: str = None, action: str = "generate") -> bool:
         import uuid
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             
-            cursor.execute("SELECT media_status FROM drafts WHERE id = ?", (draft_id,))
+            cursor.execute("SELECT media_status, image_prompt FROM drafts WHERE id = ?", (draft_id,))
             row = cursor.fetchone()
-            if not row or row['media_status'] in ('pending', 'generating', 'ready'):
+            if not row:
+                conn.rollback()
+                return False
+                
+            status = row['media_status']
+            
+            # Action guards
+            if action == "generate" and status not in ('none', 'cancelled'):
+                conn.rollback()
+                return False
+            if action == "retry" and status != 'failed':
+                conn.rollback()
+                return False
+            if action == "regenerate" and status != 'ready':
                 conn.rollback()
                 return False
                 
             new_token = str(uuid.uuid4())
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             
+            final_prompt = prompt if prompt else row['image_prompt']
+            
             cursor.execute(
                 """
                 UPDATE drafts 
                 SET media_status = 'pending',
+                    image_prompt = ?,
                     media_generation_token = ?,
                     media_requested_at = ?,
                     media_attempt_count = 0,
                     media_next_attempt_at = NULL,
                     media_error_code = NULL,
                     media_error_message = NULL,
-                    media_path = NULL,
-                    media_provider = NULL
+                    media_lease_expires_at = NULL
                 WHERE id = ?
                 """,
-                (new_token, now_iso, draft_id)
+                (final_prompt, new_token, now_iso, draft_id)
             )
             
             success = cursor.rowcount == 1
@@ -608,6 +653,54 @@ class Database:
             )
             success = cursor.rowcount == 1
             conn.commit()
+            return success
+
+    def delete_media(self, draft_id: int) -> bool:
+        """Atomic invalidation first, then cleanup old file."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            
+            cursor.execute("SELECT media_path FROM drafts WHERE id = ?", (draft_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return False
+                
+            old_path = row["media_path"]
+            
+            cursor.execute(
+                """
+                UPDATE drafts 
+                SET media_status = 'none',
+                    media_path = NULL,
+                    media_provider = NULL,
+                    media_mime_type = NULL,
+                    media_size_bytes = NULL,
+                    media_width = NULL,
+                    media_height = NULL,
+                    media_error_code = NULL,
+                    media_error_message = NULL,
+                    media_generation_token = NULL,
+                    media_lease_expires_at = NULL,
+                    media_next_attempt_at = NULL,
+                    media_attempt_count = 0
+                WHERE id = ?
+                """,
+                (draft_id,)
+            )
+            
+            success = cursor.rowcount == 1
+            if success:
+                conn.commit()
+                if old_path:
+                    try:
+                        from media_builder import media_builder
+                        media_builder.delete_media_file(old_path)
+                    except Exception as e:
+                        logger.error(f"Failed to delete media file {old_path}: {e}")
+            else:
+                conn.rollback()
             return success
 
     def claim_next_pending_media(self, timeout_seconds: int = 120) -> Optional[Dict[str, Any]]:
