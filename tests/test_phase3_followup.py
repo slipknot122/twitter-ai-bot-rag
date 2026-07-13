@@ -38,11 +38,13 @@ def test_semantic_memory_real_publish(mock_save, db):
     
     with patch.object(publisher, "dry_run", False), \
          patch.object(publisher, "client") as mock_client, \
+         patch.object(publisher, "api_v1") as mock_api_v1, \
          patch("twitter_publisher.db", db):
         mock_client.create_tweet.return_value = MagicMock(data={"id": "123"})
         publisher.publish(draft_id, "real tweet")
         
     mock_save.assert_called_once_with("real tweet")
+    mock_client.create_tweet.assert_called_once()
     draft = db.get_draft(draft_id)
     assert draft['status'] == 'published'
 
@@ -53,10 +55,14 @@ def test_semantic_memory_dry_run(mock_save, db):
     db.complete_ai_processing(draft_id, "approved", {"rewritten_text": "dry tweet"})
     db.fetch_next_approved_draft_for_publish()
     
-    with patch.object(publisher, "dry_run", True), patch("twitter_publisher.db", db):
+    with patch.object(publisher, "dry_run", True), \
+         patch.object(publisher, "client") as mock_client, \
+         patch.object(publisher, "api_v1") as mock_api_v1, \
+         patch("twitter_publisher.db", db):
         publisher.publish(draft_id, "dry tweet")
         
     mock_save.assert_not_called()
+    mock_client.create_tweet.assert_not_called()
     draft = db.get_draft(draft_id)
     assert draft['status'] == 'published'
 
@@ -71,11 +77,12 @@ def test_semantic_memory_save_failure_does_not_fail_publish(mock_save, db):
     
     with patch.object(publisher, "dry_run", False), \
          patch.object(publisher, "client") as mock_client, \
+         patch.object(publisher, "api_v1") as mock_api_v1, \
          patch("twitter_publisher.db", db):
         mock_client.create_tweet.return_value = MagicMock(data={"id": "123"})
         publisher.publish(draft_id, "real tweet")
         
-    mock_save.assert_called_once()
+    mock_save.assert_called_once_with("real tweet")
     mock_client.create_tweet.assert_called_once()
     draft = db.get_draft(draft_id)
     assert draft['status'] == 'published'
