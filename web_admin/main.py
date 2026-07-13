@@ -149,32 +149,16 @@ class GenerateImageRequest(BaseModel):
 
 
 @app.post("/api/drafts/{draft_id}/image", status_code=202)
-async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] = None):
+async def generate_image(draft_id: int, request: GenerateImageRequest):
     """
     Чергує медіа на генерацію. Повертає 202 Accepted.
     """
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, image_prompt, media_status, media_path FROM drafts WHERE id = ?", (draft_id,))
-        draft = cursor.fetchone()
-
-    if not draft:
+    status = db.queue_media_generation(draft_id, prompt=request.image_prompt, action=request.action)
+    if status == "NOT_FOUND":
         raise HTTPException(status_code=404, detail="Draft not found")
-
-    prompt = None
-    if request and request.image_prompt:
-        prompt = request.image_prompt
-    elif draft["image_prompt"]:
-        prompt = draft["image_prompt"]
-    
-    if not prompt or len(prompt.strip()) < 20:
-        raise HTTPException(status_code=422, detail="image_prompt is required (min 20 chars)")
-
-    action = request.action if request else "generate"
-
-    # Queue logic and atomic prompt update
-    success = db.queue_media_generation(draft_id, prompt=prompt, action=action)
-    if not success:
+    if status == "INVALID_PROMPT":
+        raise HTTPException(status_code=422, detail="image_prompt must be 20-1500 chars")
+    if status == "CONFLICT":
         raise HTTPException(status_code=409, detail="Action not allowed for current state or already in progress")
 
     return {"draft_id": draft_id, "media_status": "pending"}
@@ -183,10 +167,11 @@ async def generate_image(draft_id: int, request: Optional[GenerateImageRequest] 
 @app.delete("/api/drafts/{draft_id}/image")
 def delete_image(draft_id: int):
     """Безпечне видалення зображення."""
-    success = db.delete_media(draft_id)
-    if not success:
-        raise HTTPException(status_code=409, detail="Cannot delete media")
-
+    status = db.delete_media(draft_id)
+    if status == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if status == "CONFLICT":
+        raise HTTPException(status_code=409, detail="Cannot delete media in current state")
     return {"status": "success"}
 
 

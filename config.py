@@ -52,7 +52,17 @@ class Settings(BaseSettings):
     media_image_width: int = Field(default=1200)
     media_image_height: int = Field(default=675)
     media_generation_timeout: int = Field(default=60)
+    media_worker_timeout_seconds: int = Field(default=540)
+    media_lease_seconds: int = Field(default=600)
     media_max_bytes: int = Field(default=10_000_000)
+
+    from pydantic import model_validator
+
+    @model_validator(mode='after')
+    def validate_timeouts(self):
+        if not (self.media_lease_seconds >= self.media_worker_timeout_seconds + 30 and self.media_worker_timeout_seconds >= self.media_generation_timeout + 60):
+            raise ValueError("Invalid timeout settings: lease > worker > provider with margins")
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

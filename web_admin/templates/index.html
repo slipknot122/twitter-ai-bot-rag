@@ -784,32 +784,71 @@
 
             // Update preview image
             if (preview) {
+                preview.replaceChildren();
                 if (status === 'ready' && mediaUrl) {
-                    preview.innerHTML = `<img src="${mediaUrl}?t=${Date.now()}" class="media-preview-img" alt="Generated preview">`;
+                    const img = document.createElement('img');
+                    img.src = `${mediaUrl}?t=${Date.now()}`;
+                    img.className = 'media-preview-img';
+                    img.alt = 'Generated preview';
+                    preview.appendChild(img);
                 } else if (status === 'generating' || status === 'pending') {
-                    preview.innerHTML = '<div style="width:200px;height:120px;display:flex;align-items:center;justify-content:center;background:rgba(139,92,246,0.1);border-radius:0.5rem;border:1px dashed rgba(139,92,246,0.3);"><span style="color:#c4b5fd;font-size:0.9rem;">Processing...</span></div>';
-                } else {
-                    preview.innerHTML = '';
+                    const placeholder = document.createElement('div');
+                    placeholder.style.cssText = 'width:200px;height:120px;display:flex;align-items:center;justify-content:center;background:rgba(139,92,246,0.1);border-radius:0.5rem;border:1px dashed rgba(139,92,246,0.3);';
+                    const span = document.createElement('span');
+                    span.style.cssText = 'color:#c4b5fd;font-size:0.9rem;';
+                    span.textContent = 'Processing...';
+                    placeholder.appendChild(span);
+                    preview.appendChild(placeholder);
                 }
             }
 
             // Update buttons
             const buttonsDiv = section?.querySelector('.media-buttons');
             if (buttonsDiv) {
+                buttonsDiv.replaceChildren();
                 if (status === 'ready') {
-                    buttonsDiv.innerHTML = `
-                        <button class="btn-media" onclick="generateImage(${id}, 'regenerate')">Regenerate</button>
-                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">Remove</button>`;
+                    const btnRegen = document.createElement('button');
+                    btnRegen.className = 'btn-media';
+                    btnRegen.textContent = 'Regenerate';
+                    btnRegen.onclick = () => generateImage(id, 'regenerate');
+                    
+                    const btnRem = document.createElement('button');
+                    btnRem.className = 'btn-media btn-media-remove';
+                    btnRem.textContent = 'Remove';
+                    btnRem.onclick = () => removeImage(id);
+                    
+                    buttonsDiv.append(btnRegen, btnRem);
                 } else if (status === 'generating' || status === 'pending') {
-                    buttonsDiv.innerHTML = `
-                        <button class="btn-media" disabled>Processing...</button>
-                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">Cancel</button>`;
+                    const btnProc = document.createElement('button');
+                    btnProc.className = 'btn-media';
+                    btnProc.disabled = true;
+                    btnProc.textContent = 'Processing...';
+                    
+                    const btnCanc = document.createElement('button');
+                    btnCanc.className = 'btn-media btn-media-remove';
+                    btnCanc.textContent = 'Cancel';
+                    btnCanc.onclick = () => removeImage(id);
+                    
+                    buttonsDiv.append(btnProc, btnCanc);
                 } else if (status === 'failed') {
-                    buttonsDiv.innerHTML = `
-                        <button class="btn-media" onclick="generateImage(${id}, 'retry')">Retry</button>
-                        <button class="btn-media btn-media-remove" onclick="removeImage(${id})">Remove</button>`;
+                    const btnRetry = document.createElement('button');
+                    btnRetry.className = 'btn-media';
+                    btnRetry.textContent = 'Retry';
+                    btnRetry.onclick = () => generateImage(id, 'retry');
+                    
+                    const btnRem = document.createElement('button');
+                    btnRem.className = 'btn-media btn-media-remove';
+                    btnRem.textContent = 'Remove';
+                    btnRem.onclick = () => removeImage(id);
+                    
+                    buttonsDiv.append(btnRetry, btnRem);
                 } else {
-                    buttonsDiv.innerHTML = `<button class="btn-media" onclick="generateImage(${id}, 'generate')">Generate</button>`;
+                    const btnGen = document.createElement('button');
+                    btnGen.className = 'btn-media';
+                    btnGen.textContent = 'Generate';
+                    btnGen.onclick = () => generateImage(id, 'generate');
+                    
+                    buttonsDiv.append(btnGen);
                 }
             }
 
@@ -825,9 +864,7 @@
                 const escCode = document.createElement('strong');
                 escCode.textContent = data.media_error_code || 'ERROR';
                 const escMsg = document.createTextNode(`: ${data.media_error_message}`);
-                errDiv.innerHTML = '';
-                errDiv.appendChild(escCode);
-                errDiv.appendChild(escMsg);
+                errDiv.replaceChildren(escCode, escMsg);
             } else {
                 const errDiv = section?.querySelector('[data-media-error]');
                 if (errDiv) errDiv.remove();
@@ -845,7 +882,7 @@
         async function publishDraft(id) {
             const text = document.getElementById(`editor-${id}`).value;
             const btn = document.querySelector(`#draft-${id} .btn-publish`);
-            btn.innerHTML = 'Approving...';
+            btn.textContent = 'Approving...';
             
             // First save the current text
             await fetch(`/api/drafts/${id}/update`, {
@@ -860,7 +897,7 @@
                 removeCard(id);
             } else {
                 alert("Failed to approve. Check console.");
-                btn.innerHTML = 'Approve for Publish';
+                btn.textContent = 'Approve for Publish';
             }
         }
 
@@ -868,7 +905,7 @@
             if (!confirm("Are you sure you want to ignore this draft?")) return;
             
             const btn = document.querySelector(`#draft-${id} .btn-ignore`);
-            btn.innerHTML = 'Ignoring...';
+            btn.textContent = 'Ignoring...';
             
             const response = await fetch(`/api/drafts/${id}/ignore`, { method: 'POST' });
             if (response.ok) {
@@ -879,9 +916,9 @@
         async function saveDraft(id) {
             const text = document.getElementById(`editor-${id}`).value;
             const button = document.querySelector(`#draft-${id} .btn-save`);
-            const originalText = button.innerHTML;
+            const originalText = button.textContent;
             
-            button.innerHTML = 'Saving...';
+            button.textContent = 'Saving...';
             
             const response = await fetch(`/api/drafts/${id}/update`, {
                 method: 'POST',
@@ -890,8 +927,8 @@
             });
             
             if (response.ok) {
-                button.innerHTML = 'Saved!';
-                setTimeout(() => button.innerHTML = originalText, 2000);
+                button.textContent = 'Saved!';
+                setTimeout(() => button.textContent = originalText, 2000);
             }
         }
 

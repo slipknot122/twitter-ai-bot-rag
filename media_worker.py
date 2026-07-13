@@ -15,7 +15,12 @@ def process_media_job(draft_id: int, token: str, prompt: str):
         
         if metadata:
             # We got a successful image!
-            db.complete_media_generation(draft_id=draft_id, token=token, meta=metadata)
+            completed = db.complete_media_generation(draft_id=draft_id, token=token, meta=metadata)
+            if not completed and metadata.get("media_path"):
+                try:
+                    media_builder.delete_media_file(metadata["media_path"])
+                except Exception:
+                    pass
         else:
             # All providers failed, but didn't throw an unhandled exception.
             # We treat this as a transient failure for the overarching system if it didn't throw.
@@ -77,8 +82,10 @@ async def media_worker_loop():
             # 2. Claim next pending job
             # The claim logic sets media_status='generating' and media_lease_expires_at
             # It also returns the new token and job details
-            job = db.claim_next_pending_media(timeout_seconds=600)  # 10 minutes lease to be safe
+            from config import settings
+            job = db.claim_next_pending_media(timeout_seconds=settings.media_lease_seconds)
             
+            from config import settings
             if not job:
                 await asyncio.sleep(5)
                 continue
@@ -96,11 +103,10 @@ async def media_worker_loop():
             logger.info(f"Media Worker: Claimed draft {draft_id} for media generation. Attempt {job['media_attempt_count']}")
             
             # 3. Execute job with timeout
-            # We use a 9-minute timeout so it aborts before the 10-minute lease expires
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(process_media_job, draft_id, token, prompt),
-                    timeout=540
+                    timeout=settings.media_worker_timeout_seconds
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Media Worker: Job for draft {draft_id} timed out after 540s.")
@@ -117,7 +123,9 @@ async def media_worker_loop():
             logger.info("Media Worker loop cancelled.")
             raise
         except Exception as e:
-            logger.error(f"Media Worker: Loop exception: {e}")
+            from utils import classify_safe_error
+            safe_code = classify_safe_error(e)
+            logger.error(f"Media Worker: Loop exception: {safe_code}")
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
