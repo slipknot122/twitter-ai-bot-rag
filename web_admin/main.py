@@ -78,7 +78,7 @@ def publish_draft(draft_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Draft not found")
         if row['status'] not in ['review', 'pending']:
-            raise HTTPException(status_code=400, detail="Only drafts in review status can be approved")
+            raise HTTPException(status_code=409, detail="Only drafts in review status can be approved")
             
         text = row['rewritten_text']
         from utils import validate_post_text, ValidationError

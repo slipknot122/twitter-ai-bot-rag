@@ -307,7 +307,7 @@ def test_fastapi_admin_approve(db):
         
         # Second approve
         resp2 = client.post(f"/api/drafts/{draft_id}/publish")
-        assert resp2.status_code == 400
+        assert resp2.status_code == 409
     finally:
         web_main.db = original_db
 
