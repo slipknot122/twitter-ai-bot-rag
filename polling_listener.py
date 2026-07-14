@@ -52,6 +52,12 @@ def parse_content_encoding(headers) -> str:
     return value
 
 async def read_bounded_body(response, *, max_bytes: int) -> bytes:
+    """Read decoded response bytes without taking ownership of the response.
+
+    The surrounding ``client.stream`` context owns closure. Keeping ownership in
+    one place guarantees that success, decoding failures, size failures, and
+    cancellation all close the transport stream exactly once.
+    """
     chunks = []
     total = 0
     try:
@@ -61,10 +67,8 @@ async def read_bounded_body(response, *, max_bytes: int) -> bytes:
                 raise FetchFailure("body_too_large")
             chunks.append(chunk)
         return b"".join(chunks)
-    except httpx.DecodingError as exc:
+    except httpx.DecodingError:
         raise FetchFailure("content_decoding_error") from None
-    finally:
-        await response.aclose()
 
 
 class CancellationReason(str, Enum):
@@ -460,12 +464,10 @@ class PollingWorker:
                     # content_bytes is already assigned
             except httpx.TimeoutException:
                 error_code = "timeout"
+            except httpx.DecodingError:
+                error_code = "content_decoding_error"
             except httpx.RequestError:
                 error_code = "network_error"
-            except httpx.DecodingError:
-                error_code = "invalid_content_encoding"
-            except Exception as e:
-                error_code = "internal_error"
         finally:
             await self.host_limiter.release(host_key, host_state)
 

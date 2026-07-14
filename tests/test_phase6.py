@@ -1,288 +1,384 @@
-
-import pytest
 import asyncio
-import zlib
 import gzip
-import httpx
-from datetime import datetime
+import zlib
 
-from polling_listener import PollingWorker, HostLimiter, FetchFailure, FetchResult
-from database import Database
+import httpx
+import pytest
+
+from polling_listener import (
+    FetchFailure,
+    MAX_DECODED_BYTES,
+    PollingWorker,
+    read_bounded_body,
+)
+
 
 VALID_FEED = (
     b'<?xml version="1.0" encoding="UTF-8"?>'
-    b'<rss version="2.0"><channel>'
-    b'<title>Example</title>'
-    b'<item><guid>1</guid><title>Entry</title></item>'
-    b'</channel></rss>'
+    b'<rss version="2.0"><channel><title>Example</title>'
+    b'<item><guid>1</guid><title>Entry</title></item></channel></rss>'
 )
 
-GZIP_FEED = gzip.compress(VALID_FEED)
-DEFLATE_FEED = zlib.compress(VALID_FEED)
 
 class FakeResolver:
-    def __init__(self, answers_by_host):
-        self.answers_by_host = answers_by_host
-        self.calls = []
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
 
-    async def resolve(self, hostname: str, *args, **kwargs):
-        self.calls.append(hostname)
-        if hostname not in self.answers_by_host:
-            raise RuntimeError("unexpected_dns_lookup")
-        answer = self.answers_by_host[hostname]
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
+    async def resolve(self, hostname: str, port: int) -> list[str]:
+        self.calls.append((hostname, port))
+        return ["93.184.216.34"]
 
-class FakeResponse:
-    def __init__(self, *, status_code, url, headers=None, chunks=None, stream_error=None):
-        self.status_code = status_code
-        self.url = url
-        self.headers = httpx.Headers(headers or {})
-        self._chunks = list(chunks or [])
-        self._stream_error = stream_error
-        self.iteration_count = 0
+
+class SpyLimiter:
+    def __init__(self) -> None:
+        self.state = object()
+        self.acquires: list[tuple[str, object]] = []
+        self.releases: list[tuple[str, object]] = []
+
+    async def acquire(self, url: str) -> tuple[str, object]:
+        lease = (url, self.state)
+        self.acquires.append(lease)
+        return lease
+
+    async def release(self, origin: str, state: object) -> None:
+        self.releases.append((origin, state))
+
+
+class TrackingStream(httpx.AsyncByteStream):
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        error: BaseException | None = None,
+        block_after_first: bool = False,
+    ) -> None:
+        self.chunks = chunks
+        self.error = error
+        self.block_after_first = block_after_first
+        self.started = asyncio.Event()
+        self.blocker = asyncio.Event()
         self.close_count = 0
+        self.yield_count = 0
 
-    async def aiter_bytes(self):
-        for chunk in self._chunks:
-            self.iteration_count += 1
-            yield chunk
-
-        if self._stream_error is not None:
-            raise self._stream_error
-
-    async def aclose(self):
-        self.close_count += 1
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.aclose()
-
-class FakeTransport:
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.requests = []
-
-    def stream(self, method, url, *, headers=None, **kwargs):
-        self.requests.append({
-            "method": method,
-            "url": url,
-            "headers": dict(headers) if headers else {},
-        })
-
-        if not self.responses:
-            raise RuntimeError("unexpected_transport_call")
-
-        return self.responses.pop(0)
-
-class SpyHostLimiter(HostLimiter):
-    def __init__(self, max_concurrent_per_host):
-        super().__init__(max_concurrent_per_host)
-        self.acquire_calls = []
-        self.release_calls = []
-
-    async def acquire(self, origin_url: str):
-        self.acquire_calls.append(origin_url)
-        return await super().acquire(origin_url)
-
-    async def release(self, origin: str, state):
-        self.release_calls.append((origin, state))
-        return await super().release(origin, state)
-
-class SpyDB(Database):
-    def __init__(self):
-        self.writes = []
-
-    def transition_source_status(self, source_id, source_token, old_status, new_status, reason, delay_seconds=0):
-        self.writes.append({
-            "type": "transition",
-            "source_id": source_id,
-            "new_status": new_status,
-            "reason": reason
-        })
-
-    def insert_stuck_source_log(self, source_id, url, status, error_code, http_status=None):
-        self.writes.append({
-            "type": "insert_stuck_source_log",
-            "source_id": source_id,
-            "error_code": error_code
-        })
-
-    def complete_source_poll(self, global_token, source_id, source_token, claimed_mode, claimed_target, outcome_updates, drafts_to_insert=None):
-        self.writes.append({
-            "type": "complete_source_poll",
-            "source_id": source_id,
-            "error_code": outcome_updates.get("last_error_code"),
-            "reason": claimed_target
-        })
-
-class SpyWorker(PollingWorker):
-    def __init__(self, spy_db, spy_host_limiter):
-        super().__init__()
-        self.parser_calls = 0
-        self.last_parsed_bytes = None
-        self.host_limiter = spy_host_limiter
-        import polling_listener
-        polling_listener.db = spy_db
-
-    def parse_feed(self, source, content_bytes, final_url):
-        self.parser_calls += 1
-        self.last_parsed_bytes = content_bytes
-        class DummyFeed:
-            pass
-        feed = DummyFeed()
-        feed.entries = [{"id": "1", "title": "Entry"}]
-        return feed
-
-
-def create_source():
-    return {
-        'source_id': 1,
-        'lease_token': 'token',
-        'source_type': 'rss',
-        'claimed_mode': 'feed',
-        'claimed_target': 'http://example.com/feed.xml',
-        'url': 'http://example.com/feed.xml',
-        'validator_url': None,
-        'etag': None,
-        'last_modified': None,
-        'initial_sync_completed_at': '2023-01-01',
-        'consecutive_errors': 0
-    }
-
-def chunk_bytes(data: bytes, chunk_size=1024):
-    return [data[i:i+chunk_size] for i in range(0, len(data), chunk_size)]
-
-
-class TrackingByteStream(httpx.AsyncByteStream):
-    def __init__(self, data_or_exc):
-        self.data_or_exc = data_or_exc
-        self.close_count = 0
     async def __aiter__(self):
-        if isinstance(self.data_or_exc, BaseException):
-            raise self.data_or_exc
-        for i in range(0, len(self.data_or_exc), 10):
-            yield self.data_or_exc[i:i+10]
-    async def aclose(self):
+        for index, chunk in enumerate(self.chunks):
+            self.yield_count += 1
+            yield chunk
+            if index == 0 and self.block_after_first:
+                self.started.set()
+                await self.blocker.wait()
+        if self.error is not None:
+            raise self.error
+
+    async def aclose(self) -> None:
         self.close_count += 1
 
-class RealHttpxMockTransport(httpx.AsyncBaseTransport):
-    def __init__(self, responses_by_url):
-        self.responses_by_url = responses_by_url
-        self.stream_close_counts = []
-        self.requests = []
+
+class SingleResponseTransport(httpx.AsyncBaseTransport):
+    def __init__(self, stream: TrackingStream, headers: list[tuple[bytes, bytes]]) -> None:
+        self.stream = stream
+        self.headers = headers
+        self.requests: list[httpx.Request] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        url = str(request.url)
-        if url not in self.responses_by_url:
-            raise RuntimeError(f"Unexpected URL: {url}")
+        return httpx.Response(200, headers=self.headers, stream=self.stream, request=request)
 
-        resp_data = self.responses_by_url[url]
-        if isinstance(resp_data, Exception):
-            raise resp_data
 
-        status_code, headers, body = resp_data
-        stream = TrackingByteStream(body)
-        self.stream_close_counts.append(stream)
-        return httpx.Response(status_code, headers=headers, stream=stream)
+class DecodedResponse:
+    def __init__(self, chunks: list[bytes], error: BaseException | None = None) -> None:
+        self.chunks = chunks
+        self.error = error
+        self.yield_count = 0
+        self.close_count = 0
 
-def get_cp_cases():
-    import gzip
-    import zlib
-    VALID = b'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Example</title><item><guid>1</guid><title>Entry</title></item></channel></rss>'
-    return [
-        pytest.param('CP-01', [], VALID, None, VALID, 1, 1, id='CP-01'),
-        pytest.param('CP-02', [(b'content-encoding', b'gzip')], gzip.compress(VALID), None, VALID, 1, 1, id='CP-02'),
-        pytest.param('CP-03', [(b'content-encoding', b'deflate')], zlib.compress(VALID), None, VALID, 1, 1, id='CP-03'),
-        pytest.param('CP-04', [(b'content-encoding', b'GZIP')], gzip.compress(VALID), None, VALID, 1, 1, id='CP-04'),
-        pytest.param('CP-05', [(b'content-encoding', b'gzip')], b'not-a-gzip', 'content_decoding_error', None, 1, 0, id='CP-05'),
-        pytest.param('CP-06', [(b'content-encoding', b'deflate')], b'not-a-deflate', 'content_decoding_error', None, 1, 0, id='CP-06'),
-        pytest.param('CP-07', [(b'content-encoding', b'gzip, identity')], b'', 'ambiguous_content_encoding', None, 0, 0, id='CP-07'),
-        pytest.param('CP-08', [(b'content-encoding', b'gzip'), (b'content-encoding', b'identity')], b'', 'ambiguous_content_encoding', None, 0, 0, id='CP-08'),
-        pytest.param('CP-09', [(b'content-encoding', b'br')], b'', 'unsupported_content_encoding', None, 0, 0, id='CP-09'),
-        pytest.param('CP-10', [], b'', None, b'', 1, 1, id='CP-10'),
-        pytest.param('CP-11', [], b'A' * (5*1024*1024), None, b'A' * (5*1024*1024), 1, 1, id='CP-11'),
-        pytest.param('CP-12', [], b'A' * (5*1024*1024 + 1), 'body_too_large', None, 1, 0, id='CP-12'),
-        pytest.param('CP-13', [(b'content-encoding', b'gzip')], gzip.compress(b'A' * (5*1024*1024 + 1)), 'body_too_large', None, 1, 0, id='CP-13'),
-        pytest.param('CP-14', [(b'content-length', b'99999999')], VALID, None, VALID, 1, 1, id='CP-14'),
-        pytest.param('CP-15', [], b'A' * (5*1024*1024), None, b'A' * (5*1024*1024), 1, 1, id='CP-15'),
-        pytest.param('CP-16', [(b'content-encoding', b'deflate')], b'\x78\x9c' + b'garbage', 'content_decoding_error', None, 1, 0, id='CP-16'),
-        pytest.param('CP-17', [], httpx.ReadTimeout("timeout"), 'timeout', None, 1, 0, id='CP-17'),
-        pytest.param('CP-18', [], httpx.NetworkError("network_error"), 'network_error', None, 1, 0, id='CP-18'),
-        pytest.param('CP-19', [(b'content-encoding', b'identity')], VALID, None, VALID, 1, 1, id='CP-19'),
-        pytest.param('CP-20', [], asyncio.CancelledError("cancelled"), None, None, 1, 0, id='CP-20'),
-    ]
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            self.yield_count += 1
+            yield chunk
+        if self.error is not None:
+            raise self.error
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+
+async def fetch_with_httpx(
+    *,
+    body: bytes,
+    encoding_headers: list[tuple[bytes, bytes]],
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+    stream: TrackingStream | None = None,
+):
+    raw_stream = stream or TrackingStream([body])
+    headers = [(b"content-type", b"application/rss+xml"), *encoding_headers]
+    headers.extend(extra_headers or [])
+    transport = SingleResponseTransport(raw_stream, headers)
+    limiter = SpyLimiter()
+    worker = PollingWorker()
+    worker.host_limiter = limiter
+    resolver = FakeResolver()
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await worker.fetch_url_single(
+            client,
+            "http://example.com/feed.xml",
+            MAX_DECODED_BYTES,
+            resolver=resolver,
+        )
+    return result, raw_stream, transport, limiter, resolver
+
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "test_id, headers, body_or_exc, error_code, parsed_bytes, expected_close_count, expected_parser_calls",
-    get_cp_cases()
-)
-async def test_compression_parser_CP(test_id, headers, body_or_exc, error_code, parsed_bytes, expected_close_count, expected_parser_calls):
-    import polling_listener
-    robots_data = (200, [], b"User-agent: *\nAllow: /")
-    feed_data = body_or_exc if isinstance(body_or_exc, Exception) else (200, headers + [(b"content-type", b"application/rss+xml")], body_or_exc)
+async def test_CP_01_missing_content_encoding_is_identity():
+    result, stream, transport, limiter, resolver = await fetch_with_httpx(
+        body=VALID_FEED, encoding_headers=[]
+    )
+    assert result.error_code is None
+    assert result.body == VALID_FEED
+    assert stream.close_count == 1
+    assert len(transport.requests) == 1
+    assert resolver.calls == [("example.com", 80)]
+    assert limiter.releases == limiter.acquires
 
-    transport = RealHttpxMockTransport({
-        "http://example.com/robots.txt": robots_data,
-        "http://example.com/feed.xml": feed_data
-    })
 
-    db = SpyDB()
-    host_limiter = SpyHostLimiter(2)
-    worker = SpyWorker(db, host_limiter)
-    source = create_source()
-    resolver = FakeResolver({"example.com": ["93.184.216.34"]})
+@pytest.mark.asyncio
+async def test_CP_02_explicit_identity_preserves_body():
+    result, stream, _, limiter, _ = await fetch_with_httpx(
+        body=VALID_FEED, encoding_headers=[(b"content-encoding", b"identity")]
+    )
+    assert result.error_code is None
+    assert result.body == VALID_FEED
+    assert stream.close_count == 1
+    assert limiter.releases == limiter.acquires
 
-    from unittest.mock import patch, MagicMock
-    with patch('polling_listener.feedparser.parse') as mock_parse:
-        mock_parse.return_value = MagicMock(entries=[], bozo=0)
-        try:
-            async with httpx.AsyncClient(transport=transport) as client:
-                await worker.process_source(client, source, resolver=resolver)
-        except asyncio.CancelledError:
-            if not isinstance(body_or_exc, asyncio.CancelledError):
-                raise
-        except Exception as exc:
-            if not isinstance(body_or_exc, Exception):
-                raise
 
-        assert mock_parse.call_count == expected_parser_calls, f"failed: {db.writes}"
-        if expected_parser_calls > 0:
-            assert mock_parse.call_args[0][0] == parsed_bytes
+@pytest.mark.asyncio
+async def test_CP_03_httpx_decodes_real_gzip():
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=gzip.compress(VALID_FEED),
+        encoding_headers=[(b"content-encoding", b"gzip")],
+    )
+    assert result.error_code is None
+    assert result.body == VALID_FEED
+    assert stream.close_count == 1
 
-    feed_stream = transport.stream_close_counts[-1] if len(transport.stream_close_counts) > 1 else (transport.stream_close_counts[0] if len(transport.stream_close_counts) == 1 and not isinstance(body_or_exc, Exception) and not error_code == "robots_parse_error" else None)
-    if feed_stream and not isinstance(body_or_exc, Exception):
-        assert feed_stream.close_count >= expected_close_count
 
-    assert len(host_limiter.acquire_calls) >= 1, f"{test_id} acquires: {host_limiter.acquire_calls}"
-    assert len(host_limiter.release_calls) >= 1, f"{test_id} releases: {host_limiter.release_calls}"
+@pytest.mark.asyncio
+async def test_CP_04_httpx_decodes_real_deflate():
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=zlib.compress(VALID_FEED),
+        encoding_headers=[(b"content-encoding", b"deflate")],
+    )
+    assert result.error_code is None
+    assert result.body == VALID_FEED
+    assert stream.close_count == 1
 
-    if error_code:
-        found_err = False
-        for write in db.writes:
-            if write["type"] == "complete_source_poll" and write.get("error_code") == error_code:
-                found_err = True
-            elif write["type"] == "transition":
-                # Maybe fallback or transition
-                pass
-        assert found_err, f"Expected DB write with error_code {error_code}, got {db.writes}"
-    else:
-        for write in db.writes:
-            if write["type"] == "complete_source_poll":
-                assert write.get("error_code") is None
 
-def test_meta_check_no_duplicates():
-    import collections
-    ids = [
-        "CP-01", "CP-02", "CP-03", "CP-04", "CP-05", "CP-06", "CP-07", "CP-08",
-        "CP-09", "CP-10", "CP-11", "CP-12", "CP-13", "CP-14", "CP-15", "CP-16",
-        "CP-17", "CP-18", "CP-19", "CP-20"
-    ]
-    counts = collections.Counter(ids)
-    for k, v in counts.items():
-        assert v == 1, f"Duplicate ID: {k}"
+@pytest.mark.asyncio
+async def test_CP_05_corrupt_gzip_is_bounded_error():
+    result, stream, _, limiter, _ = await fetch_with_httpx(
+        body=b"not-gzip", encoding_headers=[(b"content-encoding", b"gzip")]
+    )
+    assert result.error_code == "content_decoding_error"
+    assert result.body == b""
+    assert stream.close_count == 1
+    assert limiter.releases == limiter.acquires
+
+
+@pytest.mark.asyncio
+async def test_CP_06_corrupt_deflate_is_bounded_error():
+    result, stream, _, limiter, _ = await fetch_with_httpx(
+        body=b"not-deflate", encoding_headers=[(b"content-encoding", b"deflate")]
+    )
+    assert result.error_code == "content_decoding_error"
+    assert result.body == b""
+    assert stream.close_count == 1
+    assert limiter.releases == limiter.acquires
+
+
+@pytest.mark.asyncio
+async def test_CP_07_brotli_is_rejected_before_body_iteration():
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=VALID_FEED, encoding_headers=[(b"content-encoding", b"br")]
+    )
+    assert result.error_code == "unsupported_content_encoding"
+    assert stream.yield_count == 0
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_08_empty_encoding_is_rejected_before_read():
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=VALID_FEED, encoding_headers=[(b"content-encoding", b"")]
+    )
+    assert result.error_code == "invalid_content_encoding"
+    assert stream.yield_count == 0
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_09_comma_separated_encodings_are_ambiguous():
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=VALID_FEED,
+        encoding_headers=[(b"content-encoding", b"gzip, deflate")],
+    )
+    assert result.error_code == "ambiguous_content_encoding"
+    assert stream.yield_count == 0
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_10_multiple_physical_encoding_fields_are_ambiguous():
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=VALID_FEED,
+        encoding_headers=[
+            (b"content-encoding", b"gzip"),
+            (b"content-encoding", b"deflate"),
+        ],
+    )
+    assert result.error_code == "ambiguous_content_encoding"
+    assert stream.yield_count == 0
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_11_exact_decoded_limit_is_accepted_by_reader():
+    response = DecodedResponse([b"A" * MAX_DECODED_BYTES])
+    assert await read_bounded_body(response, max_bytes=MAX_DECODED_BYTES) == b"A" * MAX_DECODED_BYTES
+    assert response.close_count == 0
+    await response.aclose()
+    assert response.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_12_one_byte_over_limit_stops_immediately():
+    response = DecodedResponse([b"A" * MAX_DECODED_BYTES, b"B", b"unread"])
+    with pytest.raises(FetchFailure, match="body_too_large") as raised:
+        await read_bounded_body(response, max_bytes=MAX_DECODED_BYTES)
+    assert raised.value.code == "body_too_large"
+    assert response.yield_count == 2
+    assert response.close_count == 0
+
+
+@pytest.mark.asyncio
+async def test_CP_13_small_content_length_cannot_bypass_decoded_limit():
+    oversized = gzip.compress(b"A" * (MAX_DECODED_BYTES + 1))
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=oversized,
+        encoding_headers=[(b"content-encoding", b"gzip")],
+        extra_headers=[(b"content-length", b"1")],
+    )
+    assert result.error_code == "body_too_large"
+    assert result.body == b""
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_14_large_content_length_does_not_reject_small_body():
+    result, stream, _, _, _ = await fetch_with_httpx(
+        body=VALID_FEED,
+        encoding_headers=[],
+        extra_headers=[(b"content-length", b"99999999")],
+    )
+    assert result.error_code is None
+    assert result.body == VALID_FEED
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_15_multichunk_exact_limit_is_accepted():
+    chunks = [b"A" * 1_000_000, b"B" * 2_000_000, b"C" * (MAX_DECODED_BYTES - 3_000_000)]
+    response = DecodedResponse(chunks)
+    body = await read_bounded_body(response, max_bytes=MAX_DECODED_BYTES)
+    assert len(body) == MAX_DECODED_BYTES
+    assert response.yield_count == 3
+    assert response.close_count == 0
+
+
+@pytest.mark.asyncio
+async def test_CP_16_partial_body_is_discarded_on_decoding_error():
+    response = DecodedResponse([b"partial"], httpx.DecodingError("secret"))
+    with pytest.raises(FetchFailure) as raised:
+        await read_bounded_body(response, max_bytes=MAX_DECODED_BYTES)
+    assert raised.value.code == "content_decoding_error"
+    assert response.yield_count == 1
+    assert response.close_count == 0
+
+
+@pytest.mark.asyncio
+async def test_CP_17_decoded_gzip_magic_is_not_decompressed_twice():
+    decoded_bytes = b"\x1f\x8bthis-is-application-data"
+    response = DecodedResponse([decoded_bytes])
+    assert await read_bounded_body(response, max_bytes=MAX_DECODED_BYTES) == decoded_bytes
+    assert response.yield_count == 1
+
+
+@pytest.mark.asyncio
+async def test_CP_18_success_closes_and_releases_exactly_once():
+    result, stream, _, limiter, _ = await fetch_with_httpx(
+        body=VALID_FEED, encoding_headers=[]
+    )
+    assert result.error_code is None
+    assert stream.close_count == 1
+    assert len(limiter.acquires) == 1
+    assert len(limiter.releases) == 1
+    assert limiter.releases[0] == limiter.acquires[0]
+
+
+@pytest.mark.asyncio
+async def test_CP_19_decoding_failure_closes_and_releases_exactly_once():
+    result, stream, _, limiter, _ = await fetch_with_httpx(
+        body=b"corrupt", encoding_headers=[(b"content-encoding", b"gzip")]
+    )
+    assert result.error_code == "content_decoding_error"
+    assert stream.close_count == 1
+    assert len(limiter.acquires) == 1
+    assert len(limiter.releases) == 1
+    assert limiter.releases[0] == limiter.acquires[0]
+
+
+@pytest.mark.asyncio
+async def test_CP_20_cancellation_closes_and_releases_exactly_once():
+    stream = TrackingStream([VALID_FEED[:20], VALID_FEED[20:]], block_after_first=True)
+    transport = SingleResponseTransport(
+        stream,
+        [(b"content-type", b"application/rss+xml")],
+    )
+    limiter = SpyLimiter()
+    worker = PollingWorker()
+    worker.host_limiter = limiter
+    resolver = FakeResolver()
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        task = asyncio.create_task(
+            worker.fetch_url_single(
+                client,
+                "http://example.com/feed.xml",
+                MAX_DECODED_BYTES,
+                resolver=resolver,
+            )
+        )
+        await asyncio.wait_for(stream.started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert stream.close_count == 1
+    assert len(limiter.acquires) == 1
+    assert len(limiter.releases) == 1
+    assert limiter.releases[0] == limiter.acquires[0]
+
+
+def test_CP_matrix_has_exact_explicit_inventory(request):
+    expected = {
+        "CP-01", "CP-02", "CP-03", "CP-04", "CP-05",
+        "CP-06", "CP-07", "CP-08", "CP-09", "CP-10",
+        "CP-11", "CP-12", "CP-13", "CP-14", "CP-15",
+        "CP-16", "CP-17", "CP-18", "CP-19", "CP-20",
+    }
+    collected = {
+        name.removeprefix("test_")[:5].replace("_", "-")
+        for name, value in vars(request.module).items()
+        if name.startswith("test_CP_") and asyncio.iscoroutinefunction(value)
+    }
+    assert collected == expected
