@@ -102,22 +102,35 @@ class HostLimiter:
 
         try:
             await request_lock.acquire()
-            now = time.monotonic()
-            elapsed = now - state.last_used_monotonic
-            if elapsed < self._interval:
-                await asyncio.sleep(self._interval - elapsed)
-            state.owner_count += 1
-            return key, state
+            try:
+                now = time.monotonic()
+                elapsed = now - state.last_used_monotonic
+                if elapsed < self._interval:
+                    await asyncio.sleep(self._interval - elapsed)
+                
+                async with self._registry_lock:
+                    state.owner_count += 1
+                return key, state
+            except asyncio.CancelledError:
+                request_lock.release()
+                raise
         finally:
             async with self._registry_lock:
                 state.waiter_count -= 1
 
     async def release(self, key: str, state: HostState) -> None:
-        try:
-            state.last_used_monotonic = time.monotonic()
-            state.owner_count -= 1
-        finally:
-            state.request_lock.release()
+        async with self._registry_lock:
+            current = self._states.get(key)
+            if current is not state:
+                # bounded internal error; registry unchanged; counts unchanged; stale lock не звільняється
+                logger.error(f"Bounded internal error: HostLimiter state mismatch for {key}")
+                return
+            
+            try:
+                state.last_used_monotonic = time.monotonic()
+                state.owner_count -= 1
+            finally:
+                state.request_lock.release()
 
     async def gc_idle(self) -> None:
         now = time.monotonic()
@@ -171,18 +184,21 @@ class SafeHTMLParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_lower = tag.casefold()
-        if tag_lower in SUPPRESSED_TAGS or self._suppressed_stack:
+        if tag_lower in SUPPRESSED_TAGS:
             self._suppressed_stack.append(tag_lower)
 
     def handle_endtag(self, tag: str) -> None:
         tag_lower = tag.casefold()
-        if not self._suppressed_stack:
-            return
-        # Pop up to matching tag to handle malformed/missing closures
-        for i in range(len(self._suppressed_stack) - 1, -1, -1):
-            if self._suppressed_stack[i] == tag_lower:
-                del self._suppressed_stack[i:]
-                break
+        if tag_lower in SUPPRESSED_TAGS:
+            # Pop up to matching tag to handle malformed/missing closures
+            for i in range(len(self._suppressed_stack) - 1, -1, -1):
+                if self._suppressed_stack[i] == tag_lower:
+                    del self._suppressed_stack[i:]
+                    break
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
         if self._suppressed_stack:
@@ -292,12 +308,13 @@ from dataclasses import dataclass
 class FetchResult:
     status_code: int
     final_url: str
-    redirect_url: str | None
+    redirect_count: int
     conditional_headers_sent: bool
     conditional_request_url: str | None
     candidate_etag: str | None
     candidate_last_modified: str | None
     body: bytes | None
+    redirect_url: str | None = None
     error_code: str | None = None
     retry_after: int | None = None
 
@@ -312,23 +329,23 @@ class PollingWorker:
         self.active_poll_task = None
         self._rng = random.Random()
 
-    async def fetch_url_single(self, client: httpx.AsyncClient, url: str, max_bytes: int, etag=None, last_modified=None, website_mode=False, resolver=None) -> FetchResult:
+    async def fetch_url_single(self, client: httpx.AsyncClient, url: str, max_bytes: int, etag=None, last_modified=None, website_mode=False, resolver=None, redirect_count: int = 0) -> FetchResult:
         final_url = url
         status_code = None
         content_bytes = b""
         res_etag = None
         res_last_modified = None
-        error_code = None
         redirect_url = None
+        error_code = None
         retry_after = None
         conditional_headers_sent = False
         conditional_request_url = None
 
         try:
-            from ssrf_validator import system_resolver
+            from ssrf_validator import validate_url_and_dns, SSRFError, URLValidationError, system_resolver
             final_url = await validate_url_and_dns(url, resolver=resolver or system_resolver)
         except (SSRFError, URLValidationError):
-            return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, "ssrf_blocked", retry_after)
+            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, "ssrf_blocked", retry_after)
 
         host_key, host_state = await self.host_limiter.acquire(final_url)
         try:
@@ -356,7 +373,7 @@ class PollingWorker:
                                 error_code = "redirect_invalid_location"
                             else:
                                 redirect_url = loc
-                        return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
                     res_etag = resp.headers.get("ETag")
                     res_last_modified = resp.headers.get("Last-Modified")
@@ -364,7 +381,7 @@ class PollingWorker:
                         retry_after = parse_retry_after(resp.headers["retry-after"])
 
                     if resp.status_code == 304:
-                        return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
                         
                     if resp.status_code >= 400:
                         if resp.status_code in (429, 503):
@@ -373,50 +390,50 @@ class PollingWorker:
                             error_code = "http_4xx"
                         else:
                             error_code = f"http_{resp.status_code}"
-                        return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
                     content_type = resp.headers.get("Content-Type", "").lower()
                     if website_mode:
                         if "text/html" not in content_type:
                             error_code = "unsupported_content_type"
-                            return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
                     else:
                         if max_bytes != MAX_ROBOTS_BYTES:
                             if "application/xml" not in content_type and "application/rss+xml" not in content_type and "application/atom+xml" not in content_type:
                                 if "text/plain" not in content_type:
                                     error_code = "unsupported_content_type"
-                                    return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                                    return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
                     raw_enc_list = [v.decode('utf-8', errors='ignore') for k, v in resp.headers.raw if k.lower() == b'content-encoding']
                     if len(raw_enc_list) > 1:
                         error_code = "ambiguous_content_encoding"
-                        return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
                     elif len(raw_enc_list) == 1:
                         encoding = raw_enc_list[0].lower().strip()
                         if not encoding or "," in encoding:
                             error_code = "multiple_content_encodings" if "," in encoding else "invalid_content_encoding"
-                            return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
                         if encoding not in ("identity", "gzip", "deflate"):
                             error_code = "unsupported_content_encoding"
-                            return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
                     cl = resp.headers.get("Content-Length")
                     if cl and cl.isdigit() and int(cl) > max_bytes:
                         error_code = "content_too_large"
-                        return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
                     buffer = bytearray()
                     async for chunk in resp.aiter_bytes():
                         buffer.extend(chunk)
                         if len(buffer) > max_bytes:
                             error_code = "content_too_large"
-                            return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, bytes(buffer), error_code, retry_after)
+                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, bytes(buffer), redirect_url, error_code, retry_after)
 
                     if not website_mode and max_bytes != MAX_ROBOTS_BYTES and "text/plain" in content_type:
                         sniff = bytes(buffer[:50]).decode('utf-8', errors='ignore').strip()
                         if not sniff.startswith("<?xml") and not sniff.startswith("<rss") and not sniff.startswith("<feed"):
                             error_code = "unsupported_content_type"
-                            return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, bytes(buffer), error_code, retry_after)
+                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, bytes(buffer), redirect_url, error_code, retry_after)
 
                     content_bytes = bytes(buffer)
             except httpx.TimeoutException:
@@ -430,7 +447,7 @@ class PollingWorker:
         finally:
             await self.host_limiter.release(host_key, host_state)
             
-        return FetchResult(status_code, final_url, redirect_url, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, error_code, retry_after)
+        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
     async def check_robots(self, client: httpx.AsyncClient, origin_url: str, resolver=None) -> RobotsDecision:
         cached = self.robots_cache.check_hit(origin_url)
@@ -456,7 +473,7 @@ class PollingWorker:
         res = None
         
         while redirect_count <= MAX_REDIRECTS:
-            res = await self.fetch_url_single(client, url_to_fetch, MAX_ROBOTS_BYTES, website_mode=False, resolver=resolver)
+            res = await self.fetch_url_single(client, url_to_fetch, MAX_ROBOTS_BYTES, website_mode=False, resolver=resolver, redirect_count=redirect_count)
             if self.cancellation_event.is_set():
                 return RobotsDecision("error", "cancelled", None, 900, False)
                 
@@ -494,14 +511,35 @@ class PollingWorker:
         elif res.status_code == 200:
             try:
                 text = res.body.decode('utf-8')
-                rp = urllib.robotparser.RobotFileParser()
-                rp.parse(text.splitlines())
-                if rp.can_fetch(ROBOTS_PRODUCT_TOKEN, origin_url):
-                    kind = 'allow'
+                lines = text.splitlines()
+                has_valid_directive = False
+                has_content = False
+                is_html = '<html' in text.lower() or '<body' in text.lower() or text.strip().startswith('<!doctype') or text.strip().startswith('<')
+                
+                if not is_html:
+                    for line in lines:
+                        line = line.strip()
+                        if not line or line.startswith('#'): continue
+                        has_content = True
+                        if ':' in line:
+                            k = line.split(':', 1)[0].strip().lower()
+                            if k in ('user-agent', 'allow', 'disallow', 'sitemap', 'crawl-delay', 'host'):
+                                has_valid_directive = True
+                                break
+                                
+                if is_html or (has_content and not has_valid_directive):
+                    kind = 'error'
+                    error_code = 'robots_parse_error'
+                    ttl = 900
                 else:
-                    kind = 'deny'
-                    error_code = 'robots_rule_denied'
-                ttl = 3600
+                    rp = urllib.robotparser.RobotFileParser()
+                    rp.parse(lines)
+                    if rp.can_fetch(ROBOTS_PRODUCT_TOKEN, origin_url):
+                        kind = 'allow'
+                    else:
+                        kind = 'deny'
+                        error_code = 'robots_rule_denied'
+                    ttl = 3600
             except UnicodeDecodeError:
                 kind = 'error'
                 error_code = 'robots_parse_error'
@@ -587,7 +625,7 @@ class PollingWorker:
             
             res = await self.fetch_url_single(
                 client, url_to_fetch, MAX_DECODED_BYTES, 
-                etag=req_etag, last_modified=req_lm, website_mode=website_mode, resolver=resolver
+                etag=req_etag, last_modified=req_lm, website_mode=website_mode, resolver=resolver, redirect_count=redirect_count
             )
             
             if self.cancellation_event.is_set():
@@ -629,14 +667,8 @@ class PollingWorker:
             return
 
         if res.status_code == 304:
-            if not res.conditional_headers_sent:
-                self.fail_poll(source, "unsolicited_304", None, res.status_code)
-                return
-            if res.conditional_request_url != current_validator_url:
-                self.fail_poll(source, "validator_url_mismatch", None, res.status_code)
-                return
-            if res.final_url != res.conditional_request_url:
-                self.fail_poll(source, "redirected_304", None, res.status_code)
+            if not res.conditional_headers_sent or res.final_url != current_validator_url:
+                self.fail_poll(source, "invalid_status", None, res.status_code)
                 return
             self.succeed_poll(source, current_etag, current_last_modified, res.final_url, res.status_code, [])
             return

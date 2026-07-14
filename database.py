@@ -1613,9 +1613,7 @@ class Database:
                 return False # Stale worker or expired source lease
                 
             if row['is_active'] == 0 or row['source_type'] not in ('rss', 'website'):
-                # Still clear lease if we own it but it became invalid
-                cursor.execute("UPDATE source_poll_state SET lease_token = NULL, lease_expires_at = NULL WHERE source_id = ?", (source_id,))
-                conn.commit()
+                conn.rollback()
                 return False
 
             if row['source_type'] == 'rss':
@@ -1648,33 +1646,37 @@ class Database:
                 
             set_clauses_str = ", ".join(set_clauses)
             params.append(source_id)
-            cursor.execute(f"UPDATE source_poll_state SET {set_clauses_str} WHERE source_id = ?", params)
-            
-            if drafts_to_insert:
-                cursor.execute(
-                    "SELECT name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
-                    (source_id,)
-                )
-                src_meta = cursor.fetchone()
+            try:
+                cursor.execute(f"UPDATE source_poll_state SET {set_clauses_str} WHERE source_id = ?", params)
                 
-                for draft in drafts_to_insert:
-                    cursor.execute("""
-                        INSERT INTO drafts (
-                            original_text, status, source_id, source_name_snapshot, 
-                            source_priority_snapshot, source_trust_snapshot, 
-                            source_processing_mode_snapshot, source_item_id,
-                            source_published_at, source_updated_at, created_at, updated_at
-                        ) VALUES (?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(source_id, source_item_id) DO NOTHING
-                    """, (
-                        draft['original_text'], source_id, src_meta['name'],
-                        src_meta['priority'], src_meta['trust_rating'], src_meta['processing_mode'],
-                        draft['source_item_id'], draft.get('source_published_at'), draft.get('source_updated_at'),
-                        now_str, now_str
-                    ))
-                        
-            conn.commit()
-            return True
+                if drafts_to_insert:
+                    cursor.execute(
+                        "SELECT name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
+                        (source_id,)
+                    )
+                    src_meta = cursor.fetchone()
+                    
+                    for draft in drafts_to_insert:
+                        cursor.execute("""
+                            INSERT INTO drafts (
+                                original_text, status, source_id, source_name_snapshot, 
+                                source_priority_snapshot, source_trust_snapshot, 
+                                source_processing_mode_snapshot, source_item_id,
+                                source_published_at, source_updated_at, created_at, updated_at
+                            ) VALUES (?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(source_id, source_item_id) DO NOTHING
+                        """, (
+                            draft['original_text'], source_id, src_meta['name'],
+                            src_meta['priority'], src_meta['trust_rating'], src_meta['processing_mode'],
+                            draft['source_item_id'], draft.get('source_published_at'), draft.get('source_updated_at'),
+                            now_str, now_str
+                        ))
+                            
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                raise
             
     def get_poll_state(self, source_id: int) -> Optional[dict]:
         with self._get_connection() as conn:
