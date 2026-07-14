@@ -19,6 +19,7 @@ import post_auditor as auditor_module
 from web_admin.main import app
 from polling_listener import (
     CancellationReason,
+    CANCELLATION_PRIORITY,
     canonicalize_entry_url,
     build_entry_drafts,
     compute_entry_identity,
@@ -776,6 +777,83 @@ async def test_C_03_wait_for_cancellation_reports_timeout():
     assert await worker.wait_for_cancellation(0) is False
 
 
+def test_C_04_transient_cancellation_sets_event():
+    worker = PollingWorker()
+    worker.trigger_cancellation(CancellationReason.TRANSIENT_INTERNAL)
+    assert worker.cancellation_event.is_set()
+    assert worker.cancellation_reason is CancellationReason.TRANSIENT_INTERNAL
+
+
+def test_C_05_source_lease_loss_overrides_shutdown():
+    worker = PollingWorker()
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    worker.trigger_cancellation(CancellationReason.SOURCE_LEASE_LOST)
+    assert worker.cancellation_reason is CancellationReason.SOURCE_LEASE_LOST
+
+
+def test_C_06_shutdown_does_not_override_source_lease_loss():
+    worker = PollingWorker()
+    worker.trigger_cancellation(CancellationReason.SOURCE_LEASE_LOST)
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    assert worker.cancellation_reason is CancellationReason.SOURCE_LEASE_LOST
+
+
+def test_C_07_global_lease_loss_overrides_every_other_reason():
+    worker = PollingWorker()
+    for reason in (
+        CancellationReason.TRANSIENT_INTERNAL,
+        CancellationReason.SHUTDOWN,
+        CancellationReason.SOURCE_LEASE_LOST,
+        CancellationReason.GLOBAL_LEASE_LOST,
+    ):
+        worker.trigger_cancellation(reason)
+    assert worker.cancellation_reason is CancellationReason.GLOBAL_LEASE_LOST
+
+
+def test_C_08_equal_priority_reason_is_stable():
+    worker = PollingWorker()
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    assert worker.cancellation_reason is CancellationReason.SHUTDOWN
+
+
+@pytest.mark.asyncio
+async def test_C_09_trigger_cancellation_cancels_active_poll_task():
+    worker = PollingWorker()
+    started = asyncio.Event()
+
+    async def poll():
+        started.set()
+        await asyncio.Future()
+
+    task = asyncio.create_task(poll())
+    await started.wait()
+    worker.active_poll_task = task
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+
+def test_C_10_trigger_without_active_task_is_safe():
+    worker = PollingWorker()
+    worker.active_poll_task = None
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    assert worker.cancellation_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_C_11_preexisting_event_returns_immediately():
+    worker = PollingWorker()
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    assert await worker.wait_for_cancellation(60) is True
+
+
+def test_C_12_priority_table_is_complete_and_unique():
+    assert set(CANCELLATION_PRIORITY) == set(CancellationReason)
+    assert len(set(CANCELLATION_PRIORITY.values())) == len(CancellationReason)
+
+
 @pytest.mark.parametrize(
     ("bozo", "exception_factory", "entries", "accepted"),
     [
@@ -1089,6 +1167,57 @@ def test_LC_12_completion_validates_http_status_before_write(tmp_path):
             claim["claimed_target"], {"last_http_status": 999},
         )
     assert database.get_poll_state(source_id)["lease_token"] == claim["lease_token"]
+
+
+def test_LC_13_completion_rejects_changed_claim_mode(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    with database._get_connection() as connection:
+        connection.execute("UPDATE sources SET source_type = 'website' WHERE id = ?", (source_id,))
+        connection.commit()
+    assert database.complete_source_poll(
+        token, source_id, claim["lease_token"], claim["claimed_mode"],
+        claim["claimed_target"], {"collector_status": "healthy"},
+    ) is False
+
+
+def test_LC_14_expired_global_lease_cannot_complete_source(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    with database._get_connection() as connection:
+        connection.execute("UPDATE worker_leases SET expires_at = '2000-01-01T00:00:00+00:00'")
+        connection.commit()
+    assert database.complete_source_poll(
+        token, source_id, claim["lease_token"], claim["claimed_mode"],
+        claim["claimed_target"], {"collector_status": "healthy"},
+    ) is False
+
+
+def test_LC_15_poll_now_rejects_live_source_lease_without_mutation(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    before = database.get_poll_state(source_id)
+    assert database.poll_now(source_id) == "conflict"
+    after = database.get_poll_state(source_id)
+    assert after["lease_token"] == before["lease_token"] == claim["lease_token"]
+    assert after["lease_expires_at"] == before["lease_expires_at"]
+
+
+def test_LC_16_successful_completion_releases_source_for_future_claim(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    assert database.complete_source_poll(
+        token, source_id, claim["lease_token"], claim["claimed_mode"],
+        claim["claimed_target"], {"collector_status": "healthy", "next_poll_at": "2000-01-01T00:00:00+00:00"},
+    ) is True
+    next_claim = database.claim_due_poll_source(token, 60)
+    assert next_claim is not None
+    assert next_claim["source_id"] == source_id
+    assert next_claim["lease_token"] != claim["lease_token"]
 
 
 @pytest.mark.parametrize(
@@ -1661,3 +1790,23 @@ def test_UI_06_media_image_url_is_server_derived_and_filename_scoped(tmp_path):
     assert response.status_code == 200
     assert response.json()["media_url"] == "/media/<script>.png"
     assert "/private/path" not in response.text
+
+
+def test_ZZ_272_inventory_metadata_is_exact(request):
+    all_items = [item for item in request.session.items if item.fspath.basename == "test_phase6.py"]
+    items = [item for item in all_items if not item.name.startswith("test_CP_matrix_") and not item.name.startswith("test_ZZ_")]
+    nodeids = [item.nodeid for item in items]
+    assert len(nodeids) == 272
+    assert len(set(nodeids)) == 272
+    assert not any(item.get_closest_marker(name) for item in items for name in ("skip", "skipif", "xfail"))
+    expected = {
+        "CP": 20, "SSRF": 23, "V": 18, "RD": 16, "RB": 27, "HL": 12,
+        "C": 12, "BZ": 12, "XXE": 5, "CAN": 26, "ID": 8, "IS": 18,
+        "LC": 16, "DB": 20, "API": 9, "START": 7, "MIG": 9, "PI": 8,
+        "UI": 6,
+    }
+    actual = {}
+    for item in items:
+        name = item.name.removeprefix("test_").split("_", 1)[0]
+        actual[name] = actual.get(name, 0) + 1
+    assert actual == expected
