@@ -51,6 +51,18 @@ def parse_content_encoding(headers) -> str:
         raise FetchFailure("unsupported_content_encoding")
     return value
 
+
+def parse_redirect_location(raw_headers: list[tuple[bytes, bytes]]) -> str:
+    values = [value.decode("utf-8", errors="strict") for key, value in raw_headers if key.lower() == b"location"]
+    if not values or not values[0].strip():
+        raise FetchFailure("redirect_missing_location")
+    if len(values) != 1:
+        raise FetchFailure("redirect_ambiguous_location")
+    location = values[0].strip()
+    if any(ord(character) < 32 or ord(character) == 127 for character in location):
+        raise FetchFailure("redirect_invalid_location")
+    return location
+
 async def read_bounded_body(response, *, max_bytes: int) -> bytes:
     """Read decoded response bytes without taking ownership of the response.
 
@@ -359,6 +371,19 @@ class FetchResult:
     error_code: str | None = None
     retry_after: int | None = None
 
+
+def validate_not_modified(result: FetchResult, *, persisted_validator_url: str | None) -> None:
+    """Validate that a 304 belongs to the terminal conditional request."""
+    if not result.conditional_headers_sent or result.conditional_request_url is None:
+        raise FetchFailure("unsolicited_304")
+    if persisted_validator_url is None:
+        raise FetchFailure("validator_url_mismatch")
+    if result.conditional_request_url != persisted_validator_url:
+        raise FetchFailure("validator_url_mismatch")
+    if result.final_url != result.conditional_request_url:
+        raise FetchFailure("redirected_304")
+
+
 class PollingWorker:
     def __init__(self):
         self.worker_id = str(uuid.uuid4())
@@ -401,19 +426,10 @@ class PollingWorker:
                 async with client.stream('GET', final_url, headers=headers) as resp:
                     status_code = resp.status_code
                     if resp.status_code in (301, 302, 303, 307, 308):
-                        loc_headers = [v.decode('utf-8', errors='ignore') for k, v in resp.headers.raw if k.lower() == b'location']
-                        if not loc_headers:
-                            error_code = "redirect_missing_location"
-                        elif len(loc_headers) > 1:
-                            error_code = "redirect_ambiguous_location"
-                        else:
-                            loc = loc_headers[0].strip()
-                            if not loc:
-                                error_code = "redirect_missing_location"
-                            elif any(ord(c) < 32 or ord(c) == 127 for c in loc):
-                                error_code = "redirect_invalid_location"
-                            else:
-                                redirect_url = loc
+                        try:
+                            redirect_url = parse_redirect_location(resp.headers.raw)
+                        except (FetchFailure, UnicodeDecodeError) as failure:
+                            error_code = failure.code if isinstance(failure, FetchFailure) else "redirect_invalid_location"
                         return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
                     res_etag = resp.headers.get("ETag")
@@ -498,7 +514,6 @@ class PollingWorker:
 
         while redirect_count <= MAX_REDIRECTS:
             res = await self.fetch_url_single(client, url_to_fetch, MAX_ROBOTS_BYTES, website_mode=False, resolver=resolver, redirect_count=redirect_count)
-            print(f"ROBOTS FETCH RESULT: {res}")
             if self.cancellation_event.is_set():
                 return RobotsDecision("error", "cancelled", None, 900, False)
 
@@ -589,9 +604,9 @@ class PollingWorker:
         elif res.error_code:
             kind = 'error'
             ttl = 900
-            if res.error_code == 'content_too_large':
+            if res.error_code == 'body_too_large':
                 error_code = 'robots_body_too_large'
-            elif res.error_code == 'invalid_content_encoding':
+            elif res.error_code == 'content_decoding_error':
                 error_code = 'robots_decoding_error'
             elif res.error_code in ('timeout', 'network_error'):
                 error_code = f"robots_{res.error_code}"
@@ -633,7 +648,6 @@ class PollingWorker:
 
         robots_decision = await self.check_robots(client, url_to_fetch, resolver=resolver)
         if robots_decision.kind != 'allow':
-            print(f"ROBOTS FAILED: {robots_decision}")
             self.fail_poll(source, robots_decision.error_code or 'blocked_by_robots', robots_decision.delay_seconds)
             return
 
@@ -693,8 +707,10 @@ class PollingWorker:
             return
 
         if res.status_code == 304:
-            if not res.conditional_headers_sent or res.final_url != current_validator_url:
-                self.fail_poll(source, "invalid_status", None, res.status_code)
+            try:
+                validate_not_modified(res, persisted_validator_url=current_validator_url)
+            except FetchFailure as failure:
+                self.fail_poll(source, failure.code, None, res.status_code)
                 return
             self.succeed_poll(source, current_etag, current_last_modified, res.final_url, res.status_code, [])
             return

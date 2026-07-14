@@ -7,6 +7,7 @@ import pytest
 
 from polling_listener import (
     FetchFailure,
+    FetchResult,
     MAX_DECODED_BYTES,
     PollingWorker,
     read_bounded_body,
@@ -75,14 +76,26 @@ class TrackingStream(httpx.AsyncByteStream):
 
 
 class SingleResponseTransport(httpx.AsyncBaseTransport):
-    def __init__(self, stream: TrackingStream, headers: list[tuple[bytes, bytes]]) -> None:
+    def __init__(
+        self,
+        stream: TrackingStream,
+        headers: list[tuple[bytes, bytes]],
+        *,
+        status_code: int = 200,
+    ) -> None:
         self.stream = stream
         self.headers = headers
+        self.status_code = status_code
         self.requests: list[httpx.Request] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        return httpx.Response(200, headers=self.headers, stream=self.stream, request=request)
+        return httpx.Response(
+            self.status_code,
+            headers=self.headers,
+            stream=self.stream,
+            request=request,
+        )
 
 
 class DecodedResponse:
@@ -437,3 +450,83 @@ async def test_SSRF_behavior_matrix(url, answers, error_type, code, normalized, 
         result = await validate_url_and_dns(url, resolver=resolver)
         assert result == normalized
     assert len(resolver.calls) == expected_calls
+
+
+@pytest.mark.parametrize(
+    ("result", "validator_url", "error_code"),
+    [
+        pytest.param(FetchResult(304, "https://feed.test/rss", 0, True, "https://feed.test/rss", None, None, None), "https://feed.test/rss", None, id="V-01"),
+        pytest.param(FetchResult(304, "https://feed.test/atom", 0, True, "https://feed.test/atom", None, None, None), "https://feed.test/atom", None, id="V-02"),
+        pytest.param(FetchResult(304, "https://feed.test/both", 0, True, "https://feed.test/both", None, None, None), "https://feed.test/both", None, id="V-03"),
+        pytest.param(FetchResult(304, "https://feed.test/rss", 0, False, None, None, None, None), "https://feed.test/rss", "unsolicited_304", id="V-04"),
+        pytest.param(FetchResult(304, "https://feed.test/rss", 0, True, "https://feed.test/rss", None, None, None), None, "validator_url_mismatch", id="V-05"),
+        pytest.param(FetchResult(304, "https://feed.test/new", 0, True, "https://feed.test/new", None, None, None), "https://feed.test/old", "validator_url_mismatch", id="V-06"),
+        pytest.param(FetchResult(304, "https://feed.test/final", 1, True, "https://feed.test/start", None, None, None), "https://feed.test/start", "redirected_304", id="V-07"),
+        pytest.param(FetchResult(304, "https://feed.test/final", 1, True, "https://feed.test/final", None, None, None), "https://feed.test/final", None, id="V-08"),
+        pytest.param(FetchResult(304, "https://other.test/rss", 0, False, None, None, None, None), "https://feed.test/rss", "unsolicited_304", id="V-09"),
+        pytest.param(FetchResult(200, "https://feed.test/rss", 0, False, None, '"new"', None, b"feed"), "https://feed.test/rss", "not_applicable", id="V-10"),
+        pytest.param(FetchResult(200, "https://feed.test/rss", 0, False, None, '"candidate"', None, b"bad"), "https://feed.test/rss", "not_applicable", id="V-11"),
+        pytest.param(FetchResult(200, "https://feed.test/rss", 0, False, None, '"candidate"', None, b"good"), "https://feed.test/rss", "not_applicable", id="V-12"),
+        pytest.param(FetchResult(200, "https://feed.test/rss", 0, False, None, None, "Tue, 14 Jul 2026 00:00:00 GMT", b"good"), "https://feed.test/rss", "not_applicable", id="V-13"),
+        pytest.param(FetchResult(200, "https://feed.test/new", 0, False, None, None, None, b"good"), "https://feed.test/old", "not_applicable", id="V-14"),
+        pytest.param(FetchResult(200, "https://feed.test/rss", 0, False, None, None, None, b"good"), "https://feed.test/rss", "not_applicable", id="V-15"),
+        pytest.param(FetchResult(304, "https://feed.test/rss", 0, False, None, None, None, None), None, "unsolicited_304", id="V-16"),
+        pytest.param(FetchResult(304, "https://feed.test/rss", 0, True, "https://feed.test/rss", None, None, None), "https://other.test/rss", "validator_url_mismatch", id="V-17"),
+        pytest.param(FetchResult(304, "https://feed.test/rss", 0, True, "https://feed.test/rss", None, None, None), "https://feed.test/rss", None, id="V-18"),
+    ],
+)
+def test_V_validator_matrix(result, validator_url, error_code):
+    from polling_listener import FetchFailure, validate_not_modified
+
+    if error_code == "not_applicable":
+        assert result.status_code == 200
+        assert result.body is not None
+        return
+    if error_code is None:
+        validate_not_modified(result, persisted_validator_url=validator_url)
+        assert result.status_code == 304
+        assert result.final_url == result.conditional_request_url
+        return
+    with pytest.raises(FetchFailure) as caught:
+        validate_not_modified(result, persisted_validator_url=validator_url)
+    assert caught.value.code == error_code
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected_url", "expected_error"),
+    [
+        pytest.param([], None, "redirect_missing_location", id="RD-01"),
+        pytest.param([(b"location", b"")], None, "redirect_missing_location", id="RD-02"),
+        pytest.param([(b"location", b"/next")], "/next", None, id="RD-03"),
+        pytest.param([(b"location", b"https://other.test/feed")], "https://other.test/feed", None, id="RD-04"),
+        pytest.param([(b"location", b"/a"), (b"location", b"/b")], None, "redirect_ambiguous_location", id="RD-05"),
+        pytest.param([(b"location", b"/bad-\xff-path")], None, "redirect_invalid_location", id="RD-06"),
+        pytest.param([(b"location", b"../feed")], "../feed", None, id="RD-07"),
+        pytest.param([(b"location", b"?page=2")], "?page=2", None, id="RD-08"),
+        pytest.param([(b"location", b"#fragment")], "#fragment", None, id="RD-09"),
+        pytest.param([(b"location", b"http://example.com/feed")], "http://example.com/feed", None, id="RD-10"),
+        pytest.param([(b"location", b"https://example.com/feed")], "https://example.com/feed", None, id="RD-11"),
+        pytest.param([(b"location", b"file:///secret")], "file:///secret", None, id="RD-12"),
+        pytest.param([(b"location", b"http://user:pass@example.com/")], "http://user:pass@example.com/", None, id="RD-13"),
+        pytest.param([(b"location", b"http://127.0.0.1/")], "http://127.0.0.1/", None, id="RD-14"),
+        pytest.param([(b"location", b"/loop")], "/loop", None, id="RD-15"),
+        pytest.param([(b"location", b"/fourth")], "/fourth", None, id="RD-16"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_RD_physical_location_matrix(headers, expected_url, expected_error):
+    stream = TrackingStream([])
+    transport = SingleResponseTransport(stream, headers, status_code=302)
+    worker = PollingWorker()
+    worker.host_limiter = SpyLimiter()
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await worker.fetch_url_single(
+            client,
+            "http://example.com/feed.xml",
+            MAX_DECODED_BYTES,
+            resolver=FakeResolver(),
+        )
+    assert result.redirect_url == expected_url
+    assert result.error_code == expected_error
+    assert stream.close_count == 1
+    assert stream.yield_count == 0
