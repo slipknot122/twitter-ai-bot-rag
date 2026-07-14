@@ -382,3 +382,58 @@ def test_CP_matrix_has_exact_explicit_inventory(request):
         if name.startswith("test_CP_") and asyncio.iscoroutinefunction(value)
     }
     assert collected == expected
+
+
+class MatrixResolver:
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    async def resolve(self, hostname, port):
+        self.calls.append((hostname, port))
+        return self.answers
+
+
+@pytest.mark.parametrize(
+    ("url", "answers", "error_type", "code", "normalized", "expected_calls"),
+    [
+        pytest.param("http://127.0.0.1/", [], "ssrf", "unsafe_resolved_address", None, 0, id="SSRF-01"),
+        pytest.param("http://[::1]/", [], "ssrf", "unsafe_resolved_address", None, 0, id="SSRF-02"),
+        pytest.param("http://private.test/", ["10.0.0.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-03"),
+        pytest.param("http://private.test/", ["172.16.0.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-04"),
+        pytest.param("http://private.test/", ["192.168.0.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-05"),
+        pytest.param("http://metadata.test/", ["169.254.169.254"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-06"),
+        pytest.param("http://linklocal.test/", ["fe80::1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-07"),
+        pytest.param("http://multicast.test/", ["224.0.0.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-08"),
+        pytest.param("http://unspecified.test/", ["0.0.0.0"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-09"),
+        pytest.param("http://cgnat.test/", ["100.64.0.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-10"),
+        pytest.param("http://benchmark.test/", ["198.18.0.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-11"),
+        pytest.param("http://docs.test/", ["192.0.2.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-12"),
+        pytest.param("http://[::ffff:127.0.0.1]/", [], "ssrf", "unsafe_resolved_address", None, 0, id="SSRF-13"),
+        pytest.param("http://mixed.test/", ["8.8.8.8", "10.0.0.1"], "ssrf", "unsafe_resolved_address", None, 1, id="SSRF-14"),
+        pytest.param("https://public.test/feed", ["8.8.8.8", "1.1.1.1"], None, None, "https://public.test/feed", 1, id="SSRF-15"),
+        pytest.param("http://malformed.test/", ["8.8.8.8", "not-an-ip"], "ssrf", "dns_invalid_address", None, 1, id="SSRF-16"),
+        pytest.param("file://public.test/feed", ["8.8.8.8"], "url", "unsafe_scheme", None, 0, id="SSRF-17"),
+        pytest.param("http://public.test:8080/feed", ["8.8.8.8"], "url", "unsafe_port", None, 0, id="SSRF-18"),
+        pytest.param("http://user:secret@public.test/feed", ["8.8.8.8"], "url", "url_credentials", None, 0, id="SSRF-19"),
+        pytest.param("http://public.test/\nfeed", ["8.8.8.8"], "url", "url_control_character", None, 0, id="SSRF-20"),
+        pytest.param("http://0x7f000001/", [], "url", "ambiguous_numeric_hostname", None, 0, id="SSRF-21"),
+        pytest.param("http://public.test./feed", ["8.8.8.8"], "url", "trailing_dot_hostname", None, 0, id="SSRF-22"),
+        pytest.param("https://bücher.example/feed", ["8.8.8.8"], None, None, "https://xn--bcher-kva.example/feed", 1, id="SSRF-23"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_SSRF_behavior_matrix(url, answers, error_type, code, normalized, expected_calls):
+    from ssrf_validator import SSRFError, URLValidationError, validate_url_and_dns
+
+    resolver = MatrixResolver(answers)
+    if error_type is not None:
+        expected_exception = SSRFError if error_type == "ssrf" else URLValidationError
+        with pytest.raises(expected_exception) as caught:
+            await validate_url_and_dns(url, resolver=resolver)
+        assert caught.value.code == code
+        assert str(caught.value) == code
+    else:
+        result = await validate_url_and_dns(url, resolver=resolver)
+        assert result == normalized
+    assert len(resolver.calls) == expected_calls
