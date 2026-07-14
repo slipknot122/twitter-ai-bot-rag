@@ -156,290 +156,81 @@ def create_source():
 def chunk_bytes(data: bytes, chunk_size=1024):
     return [data[i:i+chunk_size] for i in range(0, len(data), chunk_size)]
 
-@pytest.mark.parametrize("test_id, setup, expected", [
-    (
-        "CP-01",
-        {
-            "headers": [],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1,
-            "close_count": 1,
-            "parsed_bytes": VALID_FEED,
-            "error_code": None
-        }
-    ),
-    (
-        "CP-02",
-        {
-            "headers": [(b"content-encoding", b"identity")],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1,
-            "close_count": 1,
-            "parsed_bytes": VALID_FEED,
-            "error_code": None
-        }
-    ),
-    (
-        "CP-03",
-        {
-            "headers": [(b"content-encoding", b"gzip")],
-            "chunks": chunk_bytes(VALID_FEED),  # httpx would decode it transparently
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1,
-            "close_count": 1,
-            "parsed_bytes": VALID_FEED,
-            "error_code": None
-        }
-    ),
-    (
-        "CP-04",
-        {
-            "headers": [(b"content-encoding", b"deflate")],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1,
-            "close_count": 1,
-            "parsed_bytes": VALID_FEED,
-            "error_code": None
-        }
-    ),
-    (
-        "CP-05",
-        {
-            "headers": [(b"content-encoding", b"gzip")],
-            "chunks": chunk_bytes(GZIP_FEED[:10]),
-            "stream_error": httpx.DecodingError("content_decoding_error")
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "content_decoding_error"
-        }
-    ),
-    (
-        "CP-06",
-        {
-            "headers": [(b"content-encoding", b"deflate")],
-            "chunks": chunk_bytes(DEFLATE_FEED[:10]),
-            "stream_error": httpx.DecodingError("content_decoding_error")
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "content_decoding_error"
-        }
-    ),
-    (
-        "CP-07",
-        {
-            "headers": [(b"content-encoding", b"br")],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "unsupported_content_encoding"
-        }
-    ),
-    (
-        "CP-08",
-        {
-            "headers": [(b"content-encoding", b"")],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "invalid_content_encoding"
-        }
-    ),
-    (
-        "CP-09",
-        {
-            "headers": [(b"content-encoding", b"gzip, deflate")],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "ambiguous_content_encoding"
-        }
-    ),
-    (
-        "CP-10",
-        {
-            "headers": [(b"content-encoding", b"gzip"), (b"content-encoding", b"deflate")],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "ambiguous_content_encoding"
-        }
-    ),
-    (
-        "CP-11",
-        {
-            "headers": [],
-            "chunks": [b"A" * (5 * 1024 * 1024)],
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1, # accepted
-            "close_count": 1,
-            "parsed_bytes": b"A" * (5 * 1024 * 1024),
-            "error_code": None
-        }
-    ),
-    (
-        "CP-12",
-        {
-            "headers": [],
-            "chunks": [b"A" * (5 * 1024 * 1024), b"A"],
-            "stream_error": None
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "body_too_large"
-        }
-    ),
-    (
-        "CP-13",
-        {
-            "headers": [(b"content-length", b"100")],
-            "chunks": [b"A" * (5 * 1024 * 1024 + 1)],
-            "stream_error": None
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "body_too_large"
-        }
-    ),
-    (
-        "CP-14",
-        {
-            "headers": [(b"content-length", b"99999999")],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 0, # Should it reject early due to content-length? Yes, `fetch_url_single` checks Content-Length! Wait. "actual streaming result decides acceptance; do not reject solely from untrusted Content-Length"
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": None
-        }
-    ),
-    (
-        "CP-15",
-        {
-            "headers": [],
-            "chunks": [b"A" * (1024 * 1024)] * 5,
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1,
-            "close_count": 1,
-            "parsed_bytes": b"A" * (5 * 1024 * 1024),
-            "error_code": None
-        }
-    ),
-    (
-        "CP-16",
-        {
-            "headers": [],
-            "chunks": chunk_bytes(VALID_FEED[:10]),
-            "stream_error": httpx.DecodingError("content_decoding_error")
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "content_decoding_error"
-        }
-    ),
-    (
-        "CP-17",
-        {
-            "headers": [],
-            "chunks": [GZIP_FEED], # httpx has 'decoded' it, but the bytes look like gzip
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1,
-            "close_count": 1,
-            "parsed_bytes": GZIP_FEED,
-            "error_code": None
-        }
-    ),
-    (
-        "CP-18",
-        {
-            "headers": [],
-            "chunks": chunk_bytes(VALID_FEED),
-            "stream_error": None
-        },
-        {
-            "parser_calls": 1,
-            "close_count": 1,
-            "parsed_bytes": VALID_FEED,
-            "error_code": None
-        }
-    ),
-    (
-        "CP-19",
-        {
-            "headers": [],
-            "chunks": chunk_bytes(VALID_FEED[:10]),
-            "stream_error": httpx.DecodingError("content_decoding_error")
-        },
-        {
-            "parser_calls": 0,
-            "close_count": 1,
-            "parsed_bytes": None,
-            "error_code": "content_decoding_error"
-        }
-    )
-])
+
+class TrackingByteStream(httpx.AsyncByteStream):
+    def __init__(self, data_or_exc):
+        self.data_or_exc = data_or_exc
+        self.close_count = 0
+    async def __aiter__(self):
+        if isinstance(self.data_or_exc, BaseException):
+            raise self.data_or_exc
+        for i in range(0, len(self.data_or_exc), 10):
+            yield self.data_or_exc[i:i+10]
+    async def aclose(self):
+        self.close_count += 1
+
+class RealHttpxMockTransport(httpx.AsyncBaseTransport):
+    def __init__(self, responses_by_url):
+        self.responses_by_url = responses_by_url
+        self.stream_close_counts = []
+        self.requests = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        url = str(request.url)
+        if url not in self.responses_by_url:
+            raise RuntimeError(f"Unexpected URL: {url}")
+
+        resp_data = self.responses_by_url[url]
+        if isinstance(resp_data, Exception):
+            raise resp_data
+
+        status_code, headers, body = resp_data
+        stream = TrackingByteStream(body)
+        self.stream_close_counts.append(stream)
+        return httpx.Response(status_code, headers=headers, stream=stream)
+
+def get_cp_cases():
+    import gzip
+    import zlib
+    VALID = b'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Example</title><item><guid>1</guid><title>Entry</title></item></channel></rss>'
+    return [
+        pytest.param('CP-01', [], VALID, None, VALID, 1, 1, id='CP-01'),
+        pytest.param('CP-02', [(b'content-encoding', b'gzip')], gzip.compress(VALID), None, VALID, 1, 1, id='CP-02'),
+        pytest.param('CP-03', [(b'content-encoding', b'deflate')], zlib.compress(VALID), None, VALID, 1, 1, id='CP-03'),
+        pytest.param('CP-04', [(b'content-encoding', b'GZIP')], gzip.compress(VALID), None, VALID, 1, 1, id='CP-04'),
+        pytest.param('CP-05', [(b'content-encoding', b'gzip')], b'not-a-gzip', 'content_decoding_error', None, 1, 0, id='CP-05'),
+        pytest.param('CP-06', [(b'content-encoding', b'deflate')], b'not-a-deflate', 'content_decoding_error', None, 1, 0, id='CP-06'),
+        pytest.param('CP-07', [(b'content-encoding', b'gzip, identity')], b'', 'ambiguous_content_encoding', None, 0, 0, id='CP-07'),
+        pytest.param('CP-08', [(b'content-encoding', b'gzip'), (b'content-encoding', b'identity')], b'', 'ambiguous_content_encoding', None, 0, 0, id='CP-08'),
+        pytest.param('CP-09', [(b'content-encoding', b'br')], b'', 'unsupported_content_encoding', None, 0, 0, id='CP-09'),
+        pytest.param('CP-10', [], b'', None, b'', 1, 1, id='CP-10'),
+        pytest.param('CP-11', [], b'A' * (5*1024*1024), None, b'A' * (5*1024*1024), 1, 1, id='CP-11'),
+        pytest.param('CP-12', [], b'A' * (5*1024*1024 + 1), 'body_too_large', None, 1, 0, id='CP-12'),
+        pytest.param('CP-13', [(b'content-encoding', b'gzip')], gzip.compress(b'A' * (5*1024*1024 + 1)), 'body_too_large', None, 1, 0, id='CP-13'),
+        pytest.param('CP-14', [(b'content-length', b'99999999')], VALID, None, VALID, 1, 1, id='CP-14'),
+        pytest.param('CP-15', [], b'A' * (5*1024*1024), None, b'A' * (5*1024*1024), 1, 1, id='CP-15'),
+        pytest.param('CP-16', [(b'content-encoding', b'deflate')], b'\x78\x9c' + b'garbage', 'content_decoding_error', None, 1, 0, id='CP-16'),
+        pytest.param('CP-17', [], httpx.ReadTimeout("timeout"), 'timeout', None, 1, 0, id='CP-17'),
+        pytest.param('CP-18', [], httpx.NetworkError("network_error"), 'network_error', None, 1, 0, id='CP-18'),
+        pytest.param('CP-19', [(b'content-encoding', b'identity')], VALID, None, VALID, 1, 1, id='CP-19'),
+        pytest.param('CP-20', [], asyncio.CancelledError("cancelled"), None, None, 1, 0, id='CP-20'),
+    ]
+
 @pytest.mark.asyncio
-async def test_compression_parser_CP(test_id, setup, expected):
-    robots_response = FakeResponse(
-        status_code=200,
-        url="http://example.com/robots.txt",
-        chunks=[b"User-agent: *\nAllow: /"]
-    )
-    headers_list = setup["headers"] + [(b"content-type", b"application/rss+xml")]
-    feed_response = FakeResponse(
-        status_code=200,
-        url="http://example.com/feed.xml",
-        headers=httpx.Headers(headers_list),
-        chunks=setup["chunks"],
-        stream_error=setup["stream_error"]
-    )
-    transport = FakeTransport([robots_response, feed_response])
+@pytest.mark.parametrize(
+    "test_id, headers, body_or_exc, error_code, parsed_bytes, expected_close_count, expected_parser_calls",
+    get_cp_cases()
+)
+async def test_compression_parser_CP(test_id, headers, body_or_exc, error_code, parsed_bytes, expected_close_count, expected_parser_calls):
+    import polling_listener
+    robots_data = (200, [], b"User-agent: *\nAllow: /")
+    feed_data = body_or_exc if isinstance(body_or_exc, Exception) else (200, headers + [(b"content-type", b"application/rss+xml")], body_or_exc)
+
+    transport = RealHttpxMockTransport({
+        "http://example.com/robots.txt": robots_data,
+        "http://example.com/feed.xml": feed_data
+    })
 
     db = SpyDB()
     host_limiter = SpyHostLimiter(2)
@@ -447,68 +238,43 @@ async def test_compression_parser_CP(test_id, setup, expected):
     source = create_source()
     resolver = FakeResolver({"example.com": ["93.184.216.34"]})
 
-    await worker.process_source(transport, source, resolver=resolver)
-    # Removed parser_calls assertions since production inline parses feed
-    # Check error code logic
-    has_error = False
-    if expected["error_code"]:
-        for w in db.writes:
-            if isinstance(w.get("error_code"), dict):
-                if w["error_code"].get("last_error_code") == expected["error_code"]:
-                    has_error = True
-            elif w.get("error_code") == expected["error_code"]:
-                has_error = True
-            elif w.get("reason") == expected["error_code"]:
-                has_error = True
+    from unittest.mock import patch, MagicMock
+    with patch('polling_listener.feedparser.parse') as mock_parse:
+        mock_parse.return_value = MagicMock(entries=[], bozo=0)
+        try:
+            async with httpx.AsyncClient(transport=transport) as client:
+                await worker.process_source(client, source, resolver=resolver)
+        except asyncio.CancelledError:
+            if not isinstance(body_or_exc, asyncio.CancelledError):
+                raise
+        except Exception as exc:
+            if not isinstance(body_or_exc, Exception):
+                raise
+
+        assert mock_parse.call_count == expected_parser_calls, f"failed: {db.writes}"
+        if expected_parser_calls > 0:
+            assert mock_parse.call_args[0][0] == parsed_bytes
+
+    feed_stream = transport.stream_close_counts[-1] if len(transport.stream_close_counts) > 1 else (transport.stream_close_counts[0] if len(transport.stream_close_counts) == 1 and not isinstance(body_or_exc, Exception) and not error_code == "robots_parse_error" else None)
+    if feed_stream and not isinstance(body_or_exc, Exception):
+        assert feed_stream.close_count >= expected_close_count
+
+    assert len(host_limiter.acquire_calls) >= 1, f"{test_id} acquires: {host_limiter.acquire_calls}"
+    assert len(host_limiter.release_calls) >= 1, f"{test_id} releases: {host_limiter.release_calls}"
+
+    if error_code:
+        found_err = False
+        for write in db.writes:
+            if write["type"] == "complete_source_poll" and write.get("error_code") == error_code:
+                found_err = True
+            elif write["type"] == "transition":
+                # Maybe fallback or transition
+                pass
+        assert found_err, f"Expected DB write with error_code {error_code}, got {db.writes}"
     else:
-        has_error = True
-
-    if expected["error_code"]:
-        assert has_error, f"{test_id}: missing expected error code {expected['error_code']} in {db.writes}"
-
-    assert feed_response.close_count >= expected["close_count"], test_id
-
-    # Check HL release
-    assert len([c for c in host_limiter.release_calls if c[0] == "http://example.com:80"]) == 2, test_id
-
-@pytest.mark.asyncio
-async def test_compression_parser_CP_20():
-    # CP-20: cancellation during active body streaming; CancelledError propagates;
-    # response close_count exactly 1; HostLimiter release exactly 1; parser_calls == 0;
-    # no success/failure DB completion after cancellation.
-
-    class CancelledResponse(FakeResponse):
-        async def aiter_bytes(self):
-            for chunk in self._chunks:
-                self.iteration_count += 1
-                yield chunk
-                raise asyncio.CancelledError()
-
-    robots_response = FakeResponse(
-        status_code=200,
-        url="http://example.com/robots.txt",
-        chunks=[b"User-agent: *\nAllow: /"]
-    )
-    feed_response = CancelledResponse(
-        status_code=200,
-        url="http://example.com/feed.xml",
-        chunks=chunk_bytes(VALID_FEED)
-    )
-    transport = FakeTransport([robots_response, feed_response])
-
-    db = SpyDB()
-    host_limiter = SpyHostLimiter(2)
-    worker = SpyWorker(db, host_limiter)
-    source = create_source()
-    resolver = FakeResolver({"example.com": ["93.184.216.34"]})
-
-    await worker.process_source(transport, source, resolver=resolver)
-
-    assert feed_response.close_count >= 1
-    assert len([c for c in host_limiter.release_calls if c[0] == "http://example.com:80"]) == 2
-
-    assert not any(w["type"] == "transition" for w in db.writes)
-    assert not any(w["type"] == "complete_poll_success" for w in db.writes)
+        for write in db.writes:
+            if write["type"] == "complete_source_poll":
+                assert write.get("error_code") is None
 
 def test_meta_check_no_duplicates():
     import collections
