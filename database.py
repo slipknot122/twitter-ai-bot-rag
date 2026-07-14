@@ -1658,22 +1658,20 @@ class Database:
                 src_meta = cursor.fetchone()
                 
                 for draft in drafts_to_insert:
-                    try:
-                        cursor.execute("""
-                            INSERT INTO drafts (
-                                original_text, status, source_id, source_name_snapshot, 
-                                source_priority_snapshot, source_trust_snapshot, 
-                                source_processing_mode_snapshot, source_item_id,
-                                source_published_at, source_updated_at, created_at, updated_at
-                            ) VALUES (?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            draft['original_text'], source_id, src_meta['name'],
-                            src_meta['priority'], src_meta['trust_rating'], src_meta['processing_mode'],
-                            draft['source_item_id'], draft.get('source_published_at'), draft.get('source_updated_at'),
-                            now_str, now_str
-                        ))
-                    except sqlite3.IntegrityError:
-                        pass
+                    cursor.execute("""
+                        INSERT INTO drafts (
+                            original_text, status, source_id, source_name_snapshot, 
+                            source_priority_snapshot, source_trust_snapshot, 
+                            source_processing_mode_snapshot, source_item_id,
+                            source_published_at, source_updated_at, created_at, updated_at
+                        ) VALUES (?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(source_id, source_item_id) DO NOTHING
+                    """, (
+                        draft['original_text'], source_id, src_meta['name'],
+                        src_meta['priority'], src_meta['trust_rating'], src_meta['processing_mode'],
+                        draft['source_item_id'], draft.get('source_published_at'), draft.get('source_updated_at'),
+                        now_str, now_str
+                    ))
                         
             conn.commit()
             return True

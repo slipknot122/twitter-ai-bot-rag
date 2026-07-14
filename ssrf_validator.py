@@ -1,4 +1,5 @@
 import urllib.parse
+from typing import Optional, Protocol
 import ipaddress
 import socket
 import asyncio
@@ -8,6 +9,21 @@ class SSRFError(Exception):
 
 class URLValidationError(Exception):
     pass
+
+class ResolverProtocol(Protocol):
+    async def resolve(self, hostname: str, port: int) -> list[str]:
+        ...
+
+class SystemResolver(ResolverProtocol):
+    async def resolve(self, hostname: str, port: int) -> list[str]:
+        loop = asyncio.get_running_loop()
+        try:
+            info = await loop.getaddrinfo(hostname, port, family=socket.AF_INET)
+            return [ip[4][0] for ip in info]
+        except socket.gaierror:
+            return []
+
+system_resolver = SystemResolver()
 
 def validate_url_syntax(url: str) -> str:
     """
@@ -55,7 +71,7 @@ def validate_url_syntax(url: str) -> str:
 
     return url
 
-async def validate_dns_resolution(hostname: str):
+async def validate_dns_resolution(hostname: str, *, resolver: ResolverProtocol = system_resolver):
     """
     Resolves the hostname and validates all returned IPs against SSRF policies.
     Raises SSRFError if ANY resolved IP is in a forbidden range.
@@ -68,23 +84,16 @@ async def validate_dns_resolution(hostname: str):
     except ValueError:
         pass # Not a direct IP, need DNS resolution
 
-    try:
-        loop = asyncio.get_running_loop()
-        addr_info = await loop.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-    except socket.gaierror as e:
-        raise SSRFError(f"DNS resolution failed: {e}")
+    ips = await resolver.resolve(hostname, 80)
+    if not ips:
+        raise SSRFError(f"DNS resolution failed or returned no results for {hostname}")
 
-    if not addr_info:
-        raise SSRFError("No DNS records found")
-
-    ips = {info[4][0] for info in addr_info}
-    
     for ip_str in ips:
         try:
             ip_obj = ipaddress.ip_address(ip_str)
             _validate_ip(ip_obj)
-        except ValueError as e:
-            raise SSRFError(f"Invalid IP resolved: {e}")
+        except ValueError:
+            continue
 
 def _validate_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
     """
@@ -139,12 +148,12 @@ def _validate_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
     # If it passed all checks, it's considered safe (public routable IP)
     return True
 
-async def validate_url_and_dns(url: str) -> str:
+async def validate_url_and_dns(url: str, *, resolver: ResolverProtocol = system_resolver) -> str:
     """
     Combined validation for URL syntax, policy, and DNS SSRF.
     Returns the normalized URL on success, or raises URLValidationError / SSRFError.
     """
     normalized_url = validate_url_syntax(url)
     parsed = urllib.parse.urlparse(normalized_url)
-    await validate_dns_resolution(parsed.hostname)
+    await validate_dns_resolution(parsed.hostname, resolver=resolver)
     return normalized_url
