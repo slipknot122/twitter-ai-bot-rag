@@ -72,6 +72,9 @@ def check_startup_config():
     if POLL_DEADLINE_SEC >= SOURCE_LEASE_SEC:
         raise StartupConfigError("Poll deadline must be strictly less than source lease duration")
 
+class HostStateMismatchError(Exception):
+    pass
+
 @dataclass
 class HostState:
     request_lock: asyncio.Lock
@@ -92,7 +95,7 @@ class HostLimiter:
         host = parsed.hostname if parsed.hostname else ""
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
         key = f"{parsed.scheme}://{host}:{port}"
-        
+
         async with self._registry_lock:
             if key not in self._states:
                 self._states[key] = HostState(request_lock=asyncio.Lock())
@@ -107,7 +110,7 @@ class HostLimiter:
                 elapsed = now - state.last_used_monotonic
                 if elapsed < self._interval:
                     await asyncio.sleep(self._interval - elapsed)
-                
+
                 async with self._registry_lock:
                     state.owner_count += 1
                 return key, state
@@ -122,10 +125,8 @@ class HostLimiter:
         async with self._registry_lock:
             current = self._states.get(key)
             if current is not state:
-                # bounded internal error; registry unchanged; counts unchanged; stale lock не звільняється
-                logger.error(f"Bounded internal error: HostLimiter state mismatch for {key}")
-                return
-            
+                raise HostStateMismatchError("Bounded internal error: HostLimiter stale-state mismatch")
+
             try:
                 state.last_used_monotonic = time.monotonic()
                 state.owner_count -= 1
@@ -137,7 +138,7 @@ class HostLimiter:
         async with self._registry_lock:
             idle_keys = [
                 k for k, s in self._states.items()
-                if s.waiter_count == 0 and s.owner_count == 0 
+                if s.waiter_count == 0 and s.owner_count == 0
                 and (now - s.last_used_monotonic) > self._idle_ttl
             ]
             for k in idle_keys:
@@ -214,7 +215,7 @@ class SafeHTMLParser(HTMLParser):
         if bounded:
             self.parts.append(bounded)
             self.total_len += len(bounded)
-            
+
     def get_text(self) -> str:
         raw = " ".join(self.parts)
         norm = unicodedata.normalize('NFC', raw)
@@ -257,7 +258,7 @@ def compute_entry_identity(entry: dict, fallback_feed_url: str) -> str:
         norm = unicodedata.normalize('NFC', guid)
         digest = hashlib.sha256(norm.encode('utf-8')).hexdigest()
         return f"guid:{digest}"
-    
+
     if 'link' in entry and entry['link']:
         link = str(entry['link'])[:2048]
         base = entry.get('base') or fallback_feed_url
@@ -268,7 +269,7 @@ def compute_entry_identity(entry: dict, fallback_feed_url: str) -> str:
             return f"link:{digest}"
         except:
             pass
-            
+
     title = unicodedata.normalize('NFC', str(entry.get('title', ''))[:200])
     published = str(entry.get('published', ''))[:100]
     content_raw = unicodedata.normalize('NFC', str(entry.get('description', ''))[:3000])
@@ -382,7 +383,7 @@ class PollingWorker:
 
                     if resp.status_code == 304:
                         return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
-                        
+
                     if resp.status_code >= 400:
                         if resp.status_code in (429, 503):
                             error_code = f"http_{resp.status_code}"
@@ -446,7 +447,7 @@ class PollingWorker:
                 error_code = "internal_error"
         finally:
             await self.host_limiter.release(host_key, host_state)
-            
+
         return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
     async def check_robots(self, client: httpx.AsyncClient, origin_url: str, resolver=None) -> RobotsDecision:
@@ -471,12 +472,12 @@ class PollingWorker:
         visited = set()
         visited.add(url_to_fetch)
         res = None
-        
+
         while redirect_count <= MAX_REDIRECTS:
             res = await self.fetch_url_single(client, url_to_fetch, MAX_ROBOTS_BYTES, website_mode=False, resolver=resolver, redirect_count=redirect_count)
             if self.cancellation_event.is_set():
                 return RobotsDecision("error", "cancelled", None, 900, False)
-                
+
             if res.redirect_url:
                 try:
                     next_url = urllib.parse.urljoin(url_to_fetch, res.redirect_url)
@@ -504,7 +505,7 @@ class PollingWorker:
         error_code = None
         ttl = 900
         delay = None
-        
+
         if res.status_code in (404, 410):
             kind = 'allow'
             ttl = 3600
@@ -515,7 +516,7 @@ class PollingWorker:
                 has_valid_directive = False
                 has_content = False
                 is_html = '<html' in text.lower() or '<body' in text.lower() or text.strip().startswith('<!doctype') or text.strip().startswith('<')
-                
+
                 if not is_html:
                     for line in lines:
                         line = line.strip()
@@ -526,7 +527,7 @@ class PollingWorker:
                             if k in ('user-agent', 'allow', 'disallow', 'sitemap', 'crawl-delay', 'host'):
                                 has_valid_directive = True
                                 break
-                                
+
                 if is_html or (has_content and not has_valid_directive):
                     kind = 'error'
                     error_code = 'robots_parse_error'
@@ -596,16 +597,16 @@ class PollingWorker:
     async def process_source(self, client: httpx.AsyncClient, source: dict, resolver=None):
         from ssrf_validator import system_resolver
         resolver = resolver or system_resolver
-        
+
         source_id = source['source_id']
         source_token = source['lease_token']
         source_type = source['source_type']
         claimed_mode = source['claimed_mode']
         claimed_target = source['claimed_target']
-        
+
         url_to_fetch = claimed_target
         website_mode = claimed_mode == 'website discovery'
-        
+
         robots_decision = await self.check_robots(client, url_to_fetch, resolver=resolver)
         if robots_decision.kind != 'allow':
             self.fail_poll(source, robots_decision.error_code or 'blocked_by_robots', robots_decision.delay_seconds)
@@ -618,16 +619,16 @@ class PollingWorker:
         current_validator_url = source.get('validator_url')
         current_etag = source.get('etag')
         current_last_modified = source.get('last_modified')
-        
+
         while redirect_count <= MAX_REDIRECTS:
             req_etag = current_etag if current_validator_url == url_to_fetch else None
             req_lm = current_last_modified if current_validator_url == url_to_fetch else None
-            
+
             res = await self.fetch_url_single(
-                client, url_to_fetch, MAX_DECODED_BYTES, 
+                client, url_to_fetch, MAX_DECODED_BYTES,
                 etag=req_etag, last_modified=req_lm, website_mode=website_mode, resolver=resolver, redirect_count=redirect_count
             )
-            
+
             if self.cancellation_event.is_set():
                 self.requeue_poll(source, self.cancellation_reason or CancellationReason.TRANSIENT_INTERNAL)
                 return
@@ -640,12 +641,12 @@ class PollingWorker:
                 except:
                     self.fail_poll(source, "invalid_redirect", res.retry_after, res.status_code)
                     return
-                
+
                 if next_url in visited:
                     self.fail_poll(source, "redirect_loop", res.retry_after, res.status_code)
                     return
                 visited.add(next_url)
-                
+
                 prev_origin = urllib.parse.urlparse(url_to_fetch).netloc
                 next_origin = urllib.parse.urlparse(next_url).netloc
                 if prev_origin != next_origin:
@@ -653,7 +654,7 @@ class PollingWorker:
                     if robots_decision2.kind != 'allow':
                         self.fail_poll(source, robots_decision2.error_code or 'blocked_by_robots', robots_decision2.delay_seconds, res.status_code)
                         return
-                        
+
                 url_to_fetch = next_url
                 redirect_count += 1
                 if redirect_count > MAX_REDIRECTS:
@@ -677,7 +678,7 @@ class PollingWorker:
             html = res.body.decode('utf-8', errors='ignore')
             parser = AutodiscoveryParser()
             parser.feed(html)
-            
+
             candidates = parser.candidates
             best = None
             if candidates:
@@ -697,10 +698,10 @@ class PollingWorker:
                         await validate_url_and_dns(base, resolver=resolver)
                     except:
                         base = res.final_url
-                        
+
                     resolved = urllib.parse.urljoin(base, best)
                     await validate_url_and_dns(resolved, resolver=resolver)
-                    
+
                     db.complete_source_poll(
                         self.global_token, source_id, source_token, claimed_mode, claimed_target,
                         {
@@ -736,7 +737,7 @@ class PollingWorker:
         # Feed Mode
         try:
             feed = feedparser.parse(res.body)
-            
+
             if feed.bozo:
                 if isinstance(feed.bozo_exception, FATAL_BOZO_TYPES):
                     self.fail_poll(source, "feed_parse_error", http_status=res.status_code)
@@ -748,9 +749,9 @@ class PollingWorker:
                 else:
                     self.fail_poll(source, "feed_parse_error", http_status=res.status_code)
                     return
-                    
+
             if not feed.entries:
-                self.succeed_poll(source, res.etag, res.last_modified, res.final_url, res.status_code, [], is_empty=True)
+                self.succeed_poll(source, res.candidate_etag, res.candidate_last_modified, res.final_url, res.status_code, [], is_empty=True)
                 return
         except Exception:
             self.fail_poll(source, "feed_parse_error", http_status=res.status_code)
@@ -758,22 +759,22 @@ class PollingWorker:
 
         is_initial = source['initial_sync_completed_at'] is None
         limit = 10 if is_initial else 50
-        
+
         drafts = []
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         cutoff_dt = now_dt - datetime.timedelta(hours=72)
-        
+
         seen_identities = set()
-        
+
         for entry in feed.entries:
             if len(drafts) >= limit:
                 break
-                
+
             entry_id = compute_entry_identity(entry, res.final_url)
             if entry_id in seen_identities:
                 continue
             seen_identities.add(entry_id)
-            
+
             pub_dt = None
             if hasattr(entry, 'published_parsed') and entry.published_parsed:
                 pub_dt = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
@@ -781,7 +782,7 @@ class PollingWorker:
                     continue
                 if pub_dt > now_dt:
                     pub_dt = now_dt
-            
+
             upd_dt = None
             if hasattr(entry, 'updated_parsed') and entry.updated_parsed:
                 upd_dt = datetime.datetime(*entry.updated_parsed[:6], tzinfo=datetime.timezone.utc)
@@ -804,7 +805,7 @@ class PollingWorker:
     def fail_poll(self, source: dict, error_code: str, retry_after: int = None, http_status: int = None):
         delay = self.get_backoff_delay(source['consecutive_errors'], retry_after, is_4xx=(error_code=='http_4xx'))
         next_poll = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)
-        
+
         db.complete_source_poll(
             self.global_token, source['source_id'], source['lease_token'], source['claimed_mode'], source['claimed_target'],
             {
@@ -819,16 +820,16 @@ class PollingWorker:
 
     def succeed_poll(self, source: dict, etag: str, last_modified: str, validator_url: str, status_code: int, drafts: list, is_initial: bool = False, is_empty: bool = False):
         now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        
+
         prio = source.get('priority', 3)
         if prio == 1: delay = 1800
         elif prio == 2: delay = 3600
         elif prio == 3: delay = 7200
         elif prio == 4: delay = 21600
         else: delay = 43200
-            
+
         next_poll = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)
-        
+
         updates = {
             "collector_status": "healthy",
             "consecutive_errors": 0,
@@ -841,10 +842,10 @@ class PollingWorker:
             "last_modified": last_modified,
             "last_http_status": status_code
         }
-        
+
         if is_initial and not is_empty:
             updates["initial_sync_completed_at"] = now_str
-            
+
         db.complete_source_poll(self.global_token, source['source_id'], source['lease_token'], source['claimed_mode'], source['claimed_target'], updates, drafts)
 
     def requeue_poll(self, source: dict, reason: CancellationReason):
@@ -883,29 +884,29 @@ class PollingWorker:
             check_startup_config()
         except StartupConfigError:
             sys.exit(1)
-            
+
         while True:
             self.global_token = db.acquire_global_lease(self.worker_id, GLOBAL_LEASE_DURATION_SEC)
             if not self.global_token:
                 await asyncio.sleep(5)
                 continue
-                
+
             self.cancellation_event.clear()
             self.cancellation_reason = None
             heartbeat_task = asyncio.create_task(self.heartbeat_loop())
             cleanup_task = asyncio.create_task(self.cleanup_loop())
-            
+
             try:
                 limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
                 timeout = httpx.Timeout(5.0, read=10.0, connect=5.0)
-                
+
                 async with httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=False) as client:
                     while not self.cancellation_event.is_set():
                         source = db.claim_due_poll_source(self.global_token, SOURCE_LEASE_SEC)
                         if not source:
                             await asyncio.sleep(5)
                             continue
-                            
+
                         self.active_poll_task = asyncio.create_task(self.process_source(client, source))
                         try:
                             await asyncio.wait_for(
@@ -920,7 +921,7 @@ class PollingWorker:
                             break
                         except Exception:
                             self.fail_poll(source, "internal_error")
-                            
+
             finally:
                 self.trigger_cancellation(CancellationReason.SHUTDOWN)
                 await asyncio.gather(heartbeat_task, cleanup_task, return_exceptions=True)
