@@ -8,8 +8,11 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from database import Database
+import main as bot_main
+from web_admin.main import app
 from polling_listener import (
     CancellationReason,
     canonicalize_entry_url,
@@ -1211,3 +1214,275 @@ def test_DB_20_sqlite_integrity_and_foreign_keys_are_clean(tmp_path):
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def call_poll_now(database, source_id):
+    with patch("web_admin.main.db", database):
+        return TestClient(app).post(f"/api/sources/{source_id}/poll_now")
+
+
+def test_API_01_poll_now_queues_active_rss(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    response = call_poll_now(database, source_id)
+    assert response.status_code == 202
+    assert response.json() == {"status": "queued"}
+    assert database.get_poll_state(source_id)["collector_status"] == "queued"
+
+
+def test_API_02_poll_now_queues_active_website(tmp_path):
+    database = Database(str(tmp_path / "website-poll.db"))
+    source = database.add_source("website", "https://example.com", "Website", "https://example.com")
+    response = call_poll_now(database, source["id"])
+    assert response.status_code == 202
+    assert response.json() == {"status": "queued"}
+
+
+def test_API_03_poll_now_missing_source_is_404(tmp_path):
+    database = Database(str(tmp_path / "missing-poll.db"))
+    response = call_poll_now(database, 999)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Source not found"}
+
+
+def test_API_04_poll_now_inactive_source_is_409(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    database.deactivate_source(source_id)
+    response = call_poll_now(database, source_id)
+    assert response.status_code == 409
+    assert "inactive" in response.json()["detail"]
+
+
+def test_API_05_poll_now_telegram_is_404_without_poll_state(tmp_path):
+    database = Database(str(tmp_path / "telegram-poll.db"))
+    source = database.add_source("telegram", "1234567890", "Telegram")
+    response = call_poll_now(database, source["id"])
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Source not found"}
+
+
+def test_API_06_poll_now_active_lease_is_409(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    global_token = database.acquire_global_lease("worker-a", 60)
+    assert database.claim_due_poll_source(global_token, 60)["source_id"] == source_id
+    response = call_poll_now(database, source_id)
+    assert response.status_code == 409
+    assert "active lease" in response.json()["detail"]
+
+
+def test_API_07_poll_now_requeues_error_state(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    with database._get_connection() as connection:
+        connection.execute(
+            "UPDATE source_poll_state SET collector_status = 'backoff', next_poll_at = '2099-01-01' WHERE source_id = ?",
+            (source_id,),
+        )
+        connection.commit()
+    response = call_poll_now(database, source_id)
+    assert response.status_code == 202
+    state = database.get_poll_state(source_id)
+    assert state["collector_status"] == "queued"
+    assert state["next_poll_at"] < "2099-01-01"
+
+
+def test_API_08_poll_now_is_idempotently_queued(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    first = call_poll_now(database, source_id)
+    second = call_poll_now(database, source_id)
+    assert first.status_code == second.status_code == 202
+    assert first.json() == second.json() == {"status": "queued"}
+
+
+def test_API_09_poll_now_rejects_invalid_path_parameter(tmp_path):
+    database = Database(str(tmp_path / "invalid-path.db"))
+    with patch("web_admin.main.db", database):
+        response = TestClient(app).post("/api/sources/not-an-integer/poll_now")
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["path", "source_id"]
+
+
+def test_START_01_service_group_completes_when_all_services_complete():
+    async def service():
+        await asyncio.sleep(0)
+
+    asyncio.run(bot_main.run_service_tasks([("one", service()), ("two", service())]))
+
+
+def test_START_02_service_failure_is_propagated():
+    async def fail():
+        raise RuntimeError("startup failed")
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        asyncio.run(bot_main.run_service_tasks([("failure", fail())]))
+
+
+def test_START_03_service_failure_cancels_and_drains_siblings():
+    sibling_cancelled = asyncio.Event()
+
+    async def sibling():
+        try:
+            await asyncio.Future()
+        finally:
+            sibling_cancelled.set()
+
+    async def fail_after_sibling_starts():
+        await asyncio.sleep(0)
+        raise RuntimeError("worker failed")
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="worker failed"):
+            await bot_main.run_service_tasks(
+                [("sibling", sibling()), ("failure", fail_after_sibling_starts())]
+            )
+        assert sibling_cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_START_04_parent_cancellation_is_propagated_and_drained():
+    started = asyncio.Event()
+    drained = asyncio.Event()
+
+    async def service():
+        try:
+            started.set()
+            await asyncio.Future()
+        finally:
+            drained.set()
+
+    async def scenario():
+        group = asyncio.create_task(bot_main.run_service_tasks([("service", service())]))
+        await started.wait()
+        group.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await group
+        assert drained.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_START_05_service_tasks_receive_diagnostic_names():
+    names = []
+
+    async def service():
+        names.append(asyncio.current_task().get_name())
+
+    asyncio.run(bot_main.run_service_tasks([("NamedService", service())]))
+    assert names == ["NamedService"]
+
+
+def test_START_06_recovery_runs_before_service_coroutines():
+    events = []
+
+    async def service(name):
+        events.append(name)
+
+    with (
+        patch.object(bot_main.db, "recover_stuck_drafts", side_effect=lambda: events.append("recovery")),
+        patch.object(bot_main, "start_listener", new=lambda: service("listener")),
+        patch.object(bot_main, "ai_worker_loop", new=lambda: service("ai")),
+        patch.object(bot_main, "media_worker_loop", new=lambda: service("media")),
+        patch.object(bot_main, "scheduler_loop", new=lambda: service("scheduler")),
+        patch.object(bot_main, "start_web_admin", new=lambda: service("web")),
+    ):
+        asyncio.run(bot_main.main())
+    assert events[0] == "recovery"
+    assert set(events[1:]) == {"listener", "ai", "media", "scheduler", "web"}
+
+
+def test_START_07_main_does_not_swallow_critical_service_failure():
+    async def fail():
+        raise LookupError("critical")
+
+    async def complete():
+        await asyncio.sleep(0)
+
+    with (
+        patch.object(bot_main.db, "recover_stuck_drafts"),
+        patch.object(bot_main, "start_listener", new=fail),
+        patch.object(bot_main, "ai_worker_loop", new=complete),
+        patch.object(bot_main, "media_worker_loop", new=complete),
+        patch.object(bot_main, "scheduler_loop", new=complete),
+        patch.object(bot_main, "start_web_admin", new=complete),
+    ):
+        with pytest.raises(LookupError, match="critical"):
+            asyncio.run(bot_main.main())
+
+
+def test_MIG_01_phase6_creates_worker_leases_table(tmp_path):
+    database = Database(str(tmp_path / "migration.db"))
+    with database._get_connection() as connection:
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worker_leases'"
+        ).fetchone()[0]
+    assert "CHECK (id = 1)" in sql
+
+
+def test_MIG_02_phase6_creates_poll_state_with_source_foreign_key(tmp_path):
+    database = Database(str(tmp_path / "migration.db"))
+    with database._get_connection() as connection:
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(source_poll_state)").fetchall()
+    assert any(row[2] == "sources" and row[3] == "source_id" and row[6] == "RESTRICT" for row in foreign_keys)
+
+
+def test_MIG_03_phase6_enforces_singleton_worker_lease(tmp_path):
+    database = Database(str(tmp_path / "migration.db"))
+    with database._get_connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO worker_leases VALUES (2, 'worker', 'token', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+
+
+def test_MIG_04_phase6_enforces_collector_status_domain(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    with database._get_connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE source_poll_state SET collector_status = 'invalid' WHERE source_id = ?",
+                (source_id,),
+            )
+
+
+def test_MIG_05_phase6_adds_publication_timestamps_to_drafts(tmp_path):
+    database = Database(str(tmp_path / "migration.db"))
+    with database._get_connection() as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(drafts)")}
+    assert {"source_published_at", "source_updated_at"} <= columns
+
+
+def test_MIG_06_phase6_backfills_rss_and_website_poll_state(tmp_path):
+    database = Database(str(tmp_path / "migration.db"))
+    rss = database.add_source("rss", "https://example.com/feed", "Feed", "https://example.com/feed")
+    website = database.add_source("website", "https://example.com", "Site", "https://example.com")
+    assert database.get_poll_state(rss["id"])["collector_status"] == "idle"
+    assert database.get_poll_state(website["id"])["collector_status"] == "idle"
+
+
+def test_MIG_07_phase6_does_not_create_telegram_poll_state(tmp_path):
+    database = Database(str(tmp_path / "migration.db"))
+    telegram = database.add_source("telegram", "1234567890", "Telegram")
+    assert database.get_poll_state(telegram["id"]) is None
+
+
+def test_MIG_08_phase6_migration_is_idempotent_and_preserves_state(tmp_path):
+    path = tmp_path / "phase6-leases.db"
+    database, source_id = make_polling_db(tmp_path)
+    with database._get_connection() as connection:
+        connection.execute(
+            "UPDATE source_poll_state SET collector_status = 'healthy', etag = 'v1' WHERE source_id = ?",
+            (source_id,),
+        )
+        connection.commit()
+    reopened = Database(str(path))
+    state = reopened.get_poll_state(source_id)
+    assert state["collector_status"] == "healthy"
+    assert state["etag"] == "v1"
+
+
+def test_MIG_09_phase6_schema_passes_integrity_checks_after_reopen(tmp_path):
+    path = tmp_path / "migration.db"
+    Database(str(path))
+    reopened = Database(str(path))
+    with reopened._get_connection() as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

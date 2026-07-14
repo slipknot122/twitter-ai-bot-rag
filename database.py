@@ -333,6 +333,14 @@ class Database:
             if self.get_setting("minimum_similarity") is None:
                 self.set_setting("minimum_similarity", 0.82)
 
+    def recover_stuck_drafts(self) -> None:
+        """Recover transient draft states in an explicit startup transaction."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            self._recover_stuck_drafts(cursor)
+            conn.commit()
+
     def _recover_stuck_drafts(self, cursor: sqlite3.Cursor):
         cursor.execute("UPDATE drafts SET status = 'new', updated_at = CURRENT_TIMESTAMP WHERE status = 'processing'")
         cursor.execute("UPDATE drafts SET status = 'review', last_error = 'Recovered after crash during publishing', updated_at = CURRENT_TIMESTAMP WHERE status = 'publishing'")

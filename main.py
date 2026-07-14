@@ -20,27 +20,43 @@ async def start_web_admin():
     server = uvicorn.Server(config)
     await server.serve()
 
-async def main():
-    logger.info("Twitter AI Bot: Starting all services...")
-    
-    # Recovery: повертаємо завислі статуси після можливого крашу
-    db.recover_stuck_drafts()
-    
-    # Запускаємо всі 4 сервіси одночасно
+async def run_service_tasks(service_coroutines):
+    """Run services as a fail-fast group and always drain sibling tasks."""
     tasks = [
-        asyncio.create_task(start_listener(), name="TelegramListener"),
-        asyncio.create_task(ai_worker_loop(), name="AIWorker"),
-        asyncio.create_task(media_worker_loop(), name="MediaWorker"),
-        asyncio.create_task(scheduler_loop(), name="Scheduler"),
-        asyncio.create_task(start_web_admin(), name="WebAdmin")
+        asyncio.create_task(coroutine, name=name)
+        for name, coroutine in service_coroutines
     ]
-    
     try:
         await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def main():
+    logger.info("Twitter AI Bot: Starting all services...")
+
+    # Recovery must complete before any listener or worker starts.
+    db.recover_stuck_drafts()
+
+    services = [
+        ("TelegramListener", start_listener()),
+        ("AIWorker", ai_worker_loop()),
+        ("MediaWorker", media_worker_loop()),
+        ("Scheduler", scheduler_loop()),
+        ("WebAdmin", start_web_admin()),
+    ]
+    try:
+        await run_service_tasks(services)
     except asyncio.CancelledError:
         logger.info("Shutting down gracefully...")
-    except Exception as e:
-        logger.error(f"Critical error in main loop: {e}")
+        raise
+    except Exception:
+        logger.exception("Critical error in main loop")
+        raise
 
 if __name__ == "__main__":
     try:
