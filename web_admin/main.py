@@ -210,8 +210,9 @@ def get_image_status(draft_id: int):
 
     result = dict(draft)
     # Не відправляємо абсолютний filesystem path — тільки URL для браузера
-    if result.get("media_path"):
-        filename = Path(result["media_path"]).name
+    media_path = result.pop("media_path", None)
+    if media_path:
+        filename = Path(media_path).name
         result["media_url"] = f"/media/{filename}"
     else:
         result["media_url"] = None
