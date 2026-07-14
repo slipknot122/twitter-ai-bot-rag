@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import gzip
+import sqlite3
 import zlib
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1081,3 +1082,132 @@ def test_LC_12_completion_validates_http_status_before_write(tmp_path):
             claim["claimed_target"], {"last_http_status": 999},
         )
     assert database.get_poll_state(source_id)["lease_token"] == claim["lease_token"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param({"name": "   "}, "name must not be empty", id="DB-01"),
+        pytest.param({"source_type": "email"}, "Invalid source_type", id="DB-02"),
+        pytest.param({"priority": -1}, "priority must be 0-100", id="DB-03"),
+        pytest.param({"priority": 101}, "priority must be 0-100", id="DB-04"),
+        pytest.param({"trust_rating": -1}, "trust_rating must be 0-100", id="DB-05"),
+        pytest.param({"trust_rating": 101}, "trust_rating must be 0-100", id="DB-06"),
+        pytest.param({"processing_mode": "unsafe"}, "Invalid processing_mode", id="DB-07"),
+        pytest.param({"canonical_url": "file:///etc/passwd"}, "Forbidden URL scheme", id="DB-08"),
+    ],
+)
+def test_DB_add_source_validation_precedes_write(tmp_path, overrides, message):
+    database = Database(str(tmp_path / "database-guards.db"))
+    values = {
+        "source_type": "rss",
+        "external_id": "https://example.com/feed",
+        "name": "Guard Feed",
+        "canonical_url": "https://example.com/feed",
+        "priority": 50,
+        "trust_rating": 50,
+        "processing_mode": "auto",
+    }
+    values.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        database.add_source(**values)
+    assert database.get_sources() == []
+
+
+def test_DB_09_duplicate_source_rolls_back(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        database.add_source("rss", "https://example.com/feed", "Duplicate", "https://example.com/feed")
+    assert [source["id"] for source in database.get_sources()] == [source_id]
+
+
+def test_DB_10_missing_update_is_noop(tmp_path):
+    database = Database(str(tmp_path / "missing.db"))
+    assert database.update_source(999, {"name": "Missing"}) is None
+    assert database.get_sources() == []
+
+
+def test_DB_11_disallowed_update_precedes_transaction(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    with pytest.raises(ValueError, match="Cannot update field"):
+        database.update_source(source_id, {"resolution_status": "unresolved"})
+    assert database.get_source(source_id)["resolution_status"] == "resolved"
+
+
+def test_DB_12_invalid_update_rolls_back_all_fields(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    with pytest.raises(ValueError, match="priority"):
+        database.update_source(source_id, {"name": "Changed", "priority": 101})
+    source = database.get_source(source_id)
+    assert source["name"] == "Lease Feed" and source["priority"] == 50
+
+
+def test_DB_13_rss_source_gets_poll_state_atomically(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    state = database.get_poll_state(source_id)
+    assert state is not None and state["source_id"] == source_id
+
+
+def test_DB_14_telegram_source_has_no_poll_state(tmp_path):
+    database = Database(str(tmp_path / "telegram.db"))
+    source = database.add_source("telegram", "1234567890", "Telegram")
+    assert database.get_poll_state(source["id"]) is None
+
+
+def test_DB_15_duplicate_draft_is_idempotent(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    assert database.create_draft_from_active_source("rss", "https://example.com/feed", "item-1", "First") == "created"
+    assert database.create_draft_from_active_source("rss", "https://example.com/feed", "item-1", "Second") == "duplicate"
+    with database._get_connection() as connection:
+        rows = connection.execute("SELECT original_text FROM drafts WHERE source_id = ?", (source_id,)).fetchall()
+    assert [row["original_text"] for row in rows] == ["First"]
+
+
+def test_DB_16_inactive_source_rejects_draft_without_write(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    database.deactivate_source(source_id)
+    assert database.create_draft_from_active_source("rss", "https://example.com/feed", "item-1", "Blocked") == "rejected"
+    with database._get_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 0
+
+
+def test_DB_17_foreign_key_violation_is_enforced(tmp_path):
+    database = Database(str(tmp_path / "foreign-key.db"))
+    with database._get_connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("INSERT INTO source_poll_state (source_id) VALUES (999)")
+
+
+def test_DB_18_source_delete_is_restricted_when_referenced(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    assert database.create_draft_from_active_source("rss", "https://example.com/feed", "item-1", "Referenced") == "created"
+    with database._get_connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+    assert database.get_source(source_id) is not None
+
+
+def test_DB_19_initial_batch_limit_rejects_before_state_write(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    global_token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(global_token, 60)
+    drafts = [
+        {"source_item_id": f"item-{index}", "original_text": f"Draft {index}"}
+        for index in range(11)
+    ]
+    with pytest.raises(ValueError, match="exceeds limit of 10"):
+        database.complete_source_poll(
+            global_token, source_id, claim["lease_token"], claim["claimed_mode"],
+            claim["claimed_target"], {"collector_status": "healthy"}, drafts,
+        )
+    assert database.get_poll_state(source_id)["lease_token"] == claim["lease_token"]
+    with database._get_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 0
+
+
+def test_DB_20_sqlite_integrity_and_foreign_keys_are_clean(tmp_path):
+    database, _ = make_polling_db(tmp_path)
+    with database._get_connection() as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
