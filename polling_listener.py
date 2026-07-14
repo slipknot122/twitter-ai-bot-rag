@@ -32,6 +32,41 @@ from ssrf_validator import validate_url_and_dns, SSRFError, URLValidationError
 
 logger = logging.getLogger(__name__)
 
+class FetchFailure(Exception):
+    def __init__(self, code: str):
+        self.code = code
+
+def parse_content_encoding(headers) -> str:
+    values = headers.get_list("content-encoding")
+    if len(values) == 0:
+        return "identity"
+    if len(values) != 1:
+        raise FetchFailure("ambiguous_content_encoding")
+    value = values[0].strip().lower()
+    if not value:
+        raise FetchFailure("invalid_content_encoding")
+    if "," in value:
+        raise FetchFailure("ambiguous_content_encoding")
+    if value not in {"identity", "gzip", "deflate"}:
+        raise FetchFailure("unsupported_content_encoding")
+    return value
+
+async def read_bounded_body(response, *, max_bytes: int) -> bytes:
+    chunks = []
+    total = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > max_bytes:
+                raise FetchFailure("body_too_large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except httpx.DecodingError as exc:
+        raise FetchFailure("content_decoding_error") from None
+    finally:
+        await response.aclose()
+
+
 class CancellationReason(str, Enum):
     GLOBAL_LEASE_LOST = "global_lease_lost"
     SOURCE_LEASE_LOST = "source_lease_lost"
@@ -49,6 +84,7 @@ ROBOTS_PRODUCT_TOKEN = "AntigravityBot"
 
 MAX_REDIRECTS = 3
 MAX_DECODED_BYTES = 5 * 1024 * 1024  # 5 MiB
+MAX_ENTRY_HTML_BYTES = 500 * 1024  # 500 KB max for any single entry description
 MAX_ROBOTS_BYTES = 100 * 1024        # 100 KiB
 USER_AGENT = "AntigravityBot/1.0"
 
@@ -405,38 +441,23 @@ class PollingWorker:
                                     error_code = "unsupported_content_type"
                                     return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
-                    raw_enc_list = [v.decode('utf-8', errors='ignore') for k, v in resp.headers.raw if k.lower() == b'content-encoding']
-                    if len(raw_enc_list) > 1:
-                        error_code = "ambiguous_content_encoding"
-                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
-                    elif len(raw_enc_list) == 1:
-                        encoding = raw_enc_list[0].lower().strip()
-                        if not encoding or "," in encoding:
-                            error_code = "multiple_content_encodings" if "," in encoding else "invalid_content_encoding"
-                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
-                        if encoding not in ("identity", "gzip", "deflate"):
-                            error_code = "unsupported_content_encoding"
-                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
+                    try:
+                        parse_content_encoding(resp.headers)
+                    except FetchFailure as e:
+                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, e.code, retry_after)
 
-                    cl = resp.headers.get("Content-Length")
-                    if cl and cl.isdigit() and int(cl) > max_bytes:
-                        error_code = "content_too_large"
-                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
-
-                    buffer = bytearray()
-                    async for chunk in resp.aiter_bytes():
-                        buffer.extend(chunk)
-                        if len(buffer) > max_bytes:
-                            error_code = "content_too_large"
-                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, bytes(buffer), redirect_url, error_code, retry_after)
+                    try:
+                        content_bytes = await read_bounded_body(resp, max_bytes=max_bytes)
+                    except FetchFailure as e:
+                        return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, e.code, retry_after)
 
                     if not website_mode and max_bytes != MAX_ROBOTS_BYTES and "text/plain" in content_type:
-                        sniff = bytes(buffer[:50]).decode('utf-8', errors='ignore').strip()
+                        sniff = content_bytes[:50].decode('utf-8', errors='ignore').strip()
                         if not sniff.startswith("<?xml") and not sniff.startswith("<rss") and not sniff.startswith("<feed"):
                             error_code = "unsupported_content_type"
-                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, bytes(buffer), redirect_url, error_code, retry_after)
+                            return FetchResult(status_code, final_url, redirect_count, conditional_headers_sent, conditional_request_url, res_etag, res_last_modified, content_bytes, redirect_url, error_code, retry_after)
 
-                    content_bytes = bytes(buffer)
+                    # content_bytes is already assigned
             except httpx.TimeoutException:
                 error_code = "timeout"
             except httpx.RequestError:
@@ -475,6 +496,7 @@ class PollingWorker:
 
         while redirect_count <= MAX_REDIRECTS:
             res = await self.fetch_url_single(client, url_to_fetch, MAX_ROBOTS_BYTES, website_mode=False, resolver=resolver, redirect_count=redirect_count)
+            print(f"ROBOTS FETCH RESULT: {res}")
             if self.cancellation_event.is_set():
                 return RobotsDecision("error", "cancelled", None, 900, False)
 
@@ -609,6 +631,7 @@ class PollingWorker:
 
         robots_decision = await self.check_robots(client, url_to_fetch, resolver=resolver)
         if robots_decision.kind != 'allow':
+            print(f"ROBOTS FAILED: {robots_decision}")
             self.fail_poll(source, robots_decision.error_code or 'blocked_by_robots', robots_decision.delay_seconds)
             return
 
@@ -789,7 +812,7 @@ class PollingWorker:
                 if upd_dt > now_dt:
                     upd_dt = now_dt
 
-            html_parser = SafeHTMLParser()
+            html_parser = SafeHTMLParser(max_len=MAX_ENTRY_HTML_BYTES)
             raw_text = str(entry.get('title', '')) + " " + str(entry.get('description', ''))
             html_parser.feed(raw_text)
             clean_text = html_parser.get_text()
@@ -801,7 +824,7 @@ class PollingWorker:
                 "source_updated_at": upd_dt.isoformat() if upd_dt else None
             })
 
-        self.succeed_poll(source, res.etag, res.last_modified, res.final_url, res.status_code, drafts, is_initial=is_initial)
+        self.succeed_poll(source, res.candidate_etag, res.candidate_last_modified, res.final_url, res.status_code, drafts, is_initial=is_initial)
     def fail_poll(self, source: dict, error_code: str, retry_after: int = None, http_status: int = None):
         delay = self.get_backoff_delay(source['consecutive_errors'], retry_after, is_4xx=(error_code=='http_4xx'))
         next_poll = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)

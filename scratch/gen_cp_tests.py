@@ -1,4 +1,7 @@
+import sys
+import os
 
+code = """
 import pytest
 import asyncio
 import zlib
@@ -110,7 +113,7 @@ class SpyDB(Database):
             "source_id": source_id,
             "error_code": error_code
         })
-
+        
     def complete_source_poll(self, global_token, source_id, source_token, claimed_mode, claimed_target, outcome_updates, drafts_to_insert=None):
         self.writes.append({
             "type": "complete_source_poll",
@@ -429,7 +432,7 @@ async def test_compression_parser_CP(test_id, setup, expected):
     robots_response = FakeResponse(
         status_code=200,
         url="http://example.com/robots.txt",
-        chunks=[b"User-agent: *\nAllow: /"]
+        chunks=[b"User-agent: *\\nAllow: /"]
     )
     headers_list = setup["headers"] + [(b"content-type", b"application/rss+xml")]
     feed_response = FakeResponse(
@@ -440,13 +443,13 @@ async def test_compression_parser_CP(test_id, setup, expected):
         stream_error=setup["stream_error"]
     )
     transport = FakeTransport([robots_response, feed_response])
-
+    
     db = SpyDB()
     host_limiter = SpyHostLimiter(2)
     worker = SpyWorker(db, host_limiter)
     source = create_source()
     resolver = FakeResolver({"example.com": ["93.184.216.34"]})
-
+    
     await worker.process_source(transport, source, resolver=resolver)
     # Removed parser_calls assertions since production inline parses feed
     # Check error code logic
@@ -462,12 +465,12 @@ async def test_compression_parser_CP(test_id, setup, expected):
                 has_error = True
     else:
         has_error = True
-
+        
     if expected["error_code"]:
         assert has_error, f"{test_id}: missing expected error code {expected['error_code']} in {db.writes}"
-
+    
     assert feed_response.close_count >= expected["close_count"], test_id
-
+    
     # Check HL release
     assert len([c for c in host_limiter.release_calls if c[0] == "http://example.com:80"]) == 2, test_id
 
@@ -476,7 +479,7 @@ async def test_compression_parser_CP_20():
     # CP-20: cancellation during active body streaming; CancelledError propagates;
     # response close_count exactly 1; HostLimiter release exactly 1; parser_calls == 0;
     # no success/failure DB completion after cancellation.
-
+    
     class CancelledResponse(FakeResponse):
         async def aiter_bytes(self):
             for chunk in self._chunks:
@@ -487,7 +490,7 @@ async def test_compression_parser_CP_20():
     robots_response = FakeResponse(
         status_code=200,
         url="http://example.com/robots.txt",
-        chunks=[b"User-agent: *\nAllow: /"]
+        chunks=[b"User-agent: *\\nAllow: /"]
     )
     feed_response = CancelledResponse(
         status_code=200,
@@ -495,18 +498,18 @@ async def test_compression_parser_CP_20():
         chunks=chunk_bytes(VALID_FEED)
     )
     transport = FakeTransport([robots_response, feed_response])
-
+    
     db = SpyDB()
     host_limiter = SpyHostLimiter(2)
     worker = SpyWorker(db, host_limiter)
     source = create_source()
     resolver = FakeResolver({"example.com": ["93.184.216.34"]})
-
+    
     await worker.process_source(transport, source, resolver=resolver)
-
+        
     assert feed_response.close_count >= 1
     assert len([c for c in host_limiter.release_calls if c[0] == "http://example.com:80"]) == 2
-
+    
     assert not any(w["type"] == "transition" for w in db.writes)
     assert not any(w["type"] == "complete_poll_success" for w in db.writes)
 
@@ -520,3 +523,7 @@ def test_meta_check_no_duplicates():
     counts = collections.Counter(ids)
     for k, v in counts.items():
         assert v == 1, f"Duplicate ID: {k}"
+
+"""
+with open("tests/test_phase6.py", "w") as f:
+    f.write(code)
