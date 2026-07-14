@@ -370,6 +370,46 @@ def compute_entry_identity(entry: dict, fallback_feed_url: str) -> str:
     digest = hashlib.sha256(text_to_hash.encode('utf-8')).hexdigest()
     return f"hash:{digest}"
 
+def build_entry_drafts(entries, feed_url: str, *, is_initial: bool, now: datetime.datetime) -> list[dict]:
+    """Apply deterministic feed ordering, age, timestamp, identity, and batch rules."""
+    limit = 10 if is_initial else 50
+    cutoff = now - datetime.timedelta(hours=72)
+    drafts = []
+    seen_identities = set()
+
+    for entry in entries:
+        if len(drafts) >= limit:
+            break
+        entry_id = compute_entry_identity(entry, feed_url)
+        if entry_id in seen_identities:
+            continue
+        seen_identities.add(entry_id)
+
+        published_parsed = entry.get("published_parsed")
+        published = None
+        if published_parsed:
+            published = datetime.datetime(*published_parsed[:6], tzinfo=datetime.timezone.utc)
+            if is_initial and published < cutoff:
+                continue
+            published = min(published, now)
+
+        updated_parsed = entry.get("updated_parsed")
+        updated = None
+        if updated_parsed:
+            updated = datetime.datetime(*updated_parsed[:6], tzinfo=datetime.timezone.utc)
+            updated = min(updated, now)
+
+        html_parser = SafeHTMLParser(max_len=MAX_ENTRY_HTML_BYTES)
+        html_parser.feed(f"{entry.get('title', '')} {entry.get('description', '')}")
+        drafts.append({
+            "source_item_id": entry_id,
+            "original_text": html_parser.get_text(),
+            "source_published_at": published.isoformat() if published else None,
+            "source_updated_at": updated.isoformat() if updated else None,
+        })
+    return drafts
+
+
 def parse_feed_document(body: bytes):
     """Parse a feed with an explicit bozo and XML entity policy."""
     lowered = body.lower()
@@ -844,48 +884,12 @@ class PollingWorker:
             return
 
         is_initial = source['initial_sync_completed_at'] is None
-        limit = 10 if is_initial else 50
-
-        drafts = []
-        now_dt = datetime.datetime.now(datetime.timezone.utc)
-        cutoff_dt = now_dt - datetime.timedelta(hours=72)
-
-        seen_identities = set()
-
-        for entry in feed.entries:
-            if len(drafts) >= limit:
-                break
-
-            entry_id = compute_entry_identity(entry, res.final_url)
-            if entry_id in seen_identities:
-                continue
-            seen_identities.add(entry_id)
-
-            pub_dt = None
-            if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                pub_dt = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
-                if is_initial and pub_dt < cutoff_dt:
-                    continue
-                if pub_dt > now_dt:
-                    pub_dt = now_dt
-
-            upd_dt = None
-            if hasattr(entry, 'updated_parsed') and entry.updated_parsed:
-                upd_dt = datetime.datetime(*entry.updated_parsed[:6], tzinfo=datetime.timezone.utc)
-                if upd_dt > now_dt:
-                    upd_dt = now_dt
-
-            html_parser = SafeHTMLParser(max_len=MAX_ENTRY_HTML_BYTES)
-            raw_text = str(entry.get('title', '')) + " " + str(entry.get('description', ''))
-            html_parser.feed(raw_text)
-            clean_text = html_parser.get_text()
-
-            drafts.append({
-                "source_item_id": entry_id,
-                "original_text": clean_text,
-                "source_published_at": pub_dt.isoformat() if pub_dt else None,
-                "source_updated_at": upd_dt.isoformat() if upd_dt else None
-            })
+        drafts = build_entry_drafts(
+            feed.entries,
+            res.final_url,
+            is_initial=is_initial,
+            now=datetime.datetime.now(datetime.timezone.utc),
+        )
 
         self.succeed_poll(source, res.candidate_etag, res.candidate_last_modified, res.final_url, res.status_code, drafts, is_initial=is_initial)
     def fail_poll(self, source: dict, error_code: str, retry_after: int = None, http_status: int = None):

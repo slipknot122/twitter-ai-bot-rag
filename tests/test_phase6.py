@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import gzip
 import zlib
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from database import Database
 from polling_listener import (
     CancellationReason,
     canonicalize_entry_url,
+    build_entry_drafts,
     compute_entry_identity,
     parse_feed_document,
     FetchFailure,
@@ -895,6 +897,61 @@ def test_ID_identity_precedence_matrix(entry, feed_url, prefix, request):
         assert identity == compute_entry_identity({"id": "e\u0301"}, feed_url)
     if request.node.callspec.id == "ID-04":
         assert identity == compute_entry_identity({"link": "/post/1"}, feed_url)
+
+
+FIXED_NOW = datetime.datetime(2026, 7, 14, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+def sync_entry(identity, *, hours_old=None, hours_future=None, updated_future=False, title=None, description="Body"):
+    entry = {"id": identity, "title": title or identity, "description": description}
+    if hours_old is not None:
+        value = FIXED_NOW - datetime.timedelta(hours=hours_old)
+        entry["published_parsed"] = value.timetuple()
+    if hours_future is not None:
+        value = FIXED_NOW + datetime.timedelta(hours=hours_future)
+        entry["published_parsed"] = value.timetuple()
+    if updated_future:
+        entry["updated_parsed"] = (FIXED_NOW + datetime.timedelta(hours=1)).timetuple()
+    return entry
+
+
+@pytest.mark.parametrize(
+    ("entries", "initial", "expected_count", "expected_titles"),
+    [
+        pytest.param([], True, 0, [], id="IS-01"),
+        pytest.param([sync_entry("new", hours_old=1)], True, 1, ["new Body"], id="IS-02"),
+        pytest.param([sync_entry("boundary", hours_old=72)], True, 1, ["boundary Body"], id="IS-03"),
+        pytest.param([sync_entry("old", hours_old=73)], True, 0, [], id="IS-04"),
+        pytest.param([sync_entry("old", hours_old=100)], False, 1, ["old Body"], id="IS-05"),
+        pytest.param([sync_entry("undated")], True, 1, ["undated Body"], id="IS-06"),
+        pytest.param([sync_entry("same"), sync_entry("same")], True, 1, ["same Body"], id="IS-07"),
+        pytest.param([sync_entry("a"), sync_entry("b")], True, 2, ["a Body", "b Body"], id="IS-08"),
+        pytest.param([sync_entry(str(index)) for index in range(10)], True, 10, [f"{index} Body" for index in range(10)], id="IS-09"),
+        pytest.param([sync_entry(str(index)) for index in range(11)], True, 10, [f"{index} Body" for index in range(10)], id="IS-10"),
+        pytest.param([sync_entry(str(index)) for index in range(50)], False, 50, [f"{index} Body" for index in range(50)], id="IS-11"),
+        pytest.param([sync_entry(str(index)) for index in range(51)], False, 50, [f"{index} Body" for index in range(50)], id="IS-12"),
+        pytest.param([sync_entry("old", hours_old=80), sync_entry("new", hours_old=1)], True, 1, ["new Body"], id="IS-13"),
+        pytest.param([sync_entry("future", hours_future=1)], True, 1, ["future Body"], id="IS-14"),
+        pytest.param([sync_entry("updated", updated_future=True)], True, 1, ["updated Body"], id="IS-15"),
+        pytest.param([sync_entry("html", title="<b>Title</b>", description="<script>bad()</script> Safe")], True, 1, ["Title Safe"], id="IS-16"),
+        pytest.param([sync_entry("unicode", title="e\u0301")], True, 1, ["é Body"], id="IS-17"),
+        pytest.param([sync_entry("controls", title="A\nB", description="C\tD")], True, 1, ["A B C D"], id="IS-18"),
+    ],
+)
+def test_IS_initial_sync_matrix(entries, initial, expected_count, expected_titles, request):
+    drafts = build_entry_drafts(
+        entries,
+        "https://feed.test/rss",
+        is_initial=initial,
+        now=FIXED_NOW,
+    )
+    assert len(drafts) == expected_count
+    assert [draft["original_text"] for draft in drafts] == expected_titles
+    case_id = request.node.callspec.id
+    if case_id == "IS-14":
+        assert drafts[0]["source_published_at"] == FIXED_NOW.isoformat()
+    if case_id == "IS-15":
+        assert drafts[0]["source_updated_at"] == FIXED_NOW.isoformat()
 
 
 def make_polling_db(tmp_path):
