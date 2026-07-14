@@ -1,6 +1,8 @@
 import asyncio
 import gzip
 import zlib
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -8,6 +10,9 @@ import pytest
 from database import Database
 from polling_listener import (
     CancellationReason,
+    canonicalize_entry_url,
+    compute_entry_identity,
+    parse_feed_document,
     FetchFailure,
     FetchResult,
     HostLimiter,
@@ -759,6 +764,137 @@ async def test_C_02_wait_for_cancellation_wakes_promptly():
 async def test_C_03_wait_for_cancellation_reports_timeout():
     worker = PollingWorker()
     assert await worker.wait_for_cancellation(0) is False
+
+
+@pytest.mark.parametrize(
+    ("bozo", "exception_factory", "entries", "accepted"),
+    [
+        pytest.param(False, None, [], True, id="BZ-01"),
+        pytest.param(False, None, [{"id": "1"}], True, id="BZ-02"),
+        pytest.param(True, "encoding_override", [{"id": "1"}], True, id="BZ-03"),
+        pytest.param(True, "encoding_unknown", [{"id": "1"}], True, id="BZ-04"),
+        pytest.param(True, "non_xml", [{"id": "1"}], True, id="BZ-05"),
+        pytest.param(True, "encoding_override", [], False, id="BZ-06"),
+        pytest.param(True, "encoding_unknown", [], False, id="BZ-07"),
+        pytest.param(True, "non_xml", [], False, id="BZ-08"),
+        pytest.param(True, "sax", [{"id": "1"}], False, id="BZ-09"),
+        pytest.param(True, "expat", [{"id": "1"}], False, id="BZ-10"),
+        pytest.param(True, "unknown", [{"id": "1"}], False, id="BZ-11"),
+        pytest.param(True, "unknown", [], False, id="BZ-12"),
+    ],
+)
+def test_BZ_explicit_bozo_policy(bozo, exception_factory, entries, accepted):
+    from feedparser import CharacterEncodingOverride, CharacterEncodingUnknown, NonXMLContentType
+    from xml.sax import SAXException
+    from xml.parsers.expat import ExpatError
+
+    factories = {
+        "encoding_override": lambda: CharacterEncodingOverride("encoding"),
+        "encoding_unknown": lambda: CharacterEncodingUnknown("encoding"),
+        "non_xml": lambda: NonXMLContentType("content-type"),
+        "sax": lambda: SAXException("xml"),
+        "expat": lambda: ExpatError("xml"),
+        "unknown": lambda: RuntimeError("secret parser detail"),
+    }
+    parsed = SimpleNamespace(
+        bozo=bozo,
+        bozo_exception=factories[exception_factory]() if exception_factory else None,
+        entries=entries,
+    )
+    with patch("polling_listener.feedparser.parse", return_value=parsed) as parser:
+        if accepted:
+            assert parse_feed_document(b"<rss/>") is parsed
+        else:
+            with pytest.raises(FetchFailure) as caught:
+                parse_feed_document(b"<rss/>")
+            assert caught.value.code == "feed_parse_error"
+        parser.assert_called_once_with(b"<rss/>")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b'<!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><rss>&xxe;</rss>', id="XXE-01"),
+        pytest.param(b'<!doctype rss [<!entity x SYSTEM "http://127.0.0.1/">]><rss>&x;</rss>', id="XXE-02"),
+        pytest.param(b'<!ENTITY x SYSTEM "file:///tmp/canary"><rss/>', id="XXE-03"),
+        pytest.param(b'<rss><!DoCtYpE x [<!EnTiTy y SYSTEM "file:///tmp/canary">]></rss>', id="XXE-04"),
+        pytest.param(b'<!DOCTYPE lolz [<!ENTITY a "123"><!ENTITY b "&a;&a;">]><rss>&b;</rss>', id="XXE-05"),
+    ],
+)
+def test_XXE_payloads_are_rejected_before_parser(payload):
+    with patch("polling_listener.feedparser.parse") as parser:
+        with pytest.raises(FetchFailure) as caught:
+            parse_feed_document(payload)
+        assert caught.value.code == "feed_parse_error"
+        parser.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("HTTP://Example.COM", "http://example.com/", id="CAN-01"),
+        pytest.param("https://Example.COM/Feed", "https://example.com/Feed", id="CAN-02"),
+        pytest.param("http://example.com:80/a", "http://example.com/a", id="CAN-03"),
+        pytest.param("https://example.com:443/a", "https://example.com/a", id="CAN-04"),
+        pytest.param("https://example.com:8443/a", "https://example.com:8443/a", id="CAN-05"),
+        pytest.param("https://example.com/a#part", "https://example.com/a", id="CAN-06"),
+        pytest.param("https://example.com/a?utm_source=x", "https://example.com/a", id="CAN-07"),
+        pytest.param("https://example.com/a?fbclid=x", "https://example.com/a", id="CAN-08"),
+        pytest.param("https://example.com/a?gclid=x", "https://example.com/a", id="CAN-09"),
+        pytest.param("https://example.com/a?mc_cid=x", "https://example.com/a", id="CAN-10"),
+        pytest.param("https://example.com/a?mc_eid=x", "https://example.com/a", id="CAN-11"),
+        pytest.param("https://example.com/a?b=2&a=1", "https://example.com/a?a=1&b=2", id="CAN-12"),
+        pytest.param("https://example.com/a?x=", "https://example.com/a?x=", id="CAN-13"),
+        pytest.param("https://example.com/a?x=1&x=2", "https://example.com/a?x=1&x=2", id="CAN-14"),
+        pytest.param("https://example.com/a/./b", "https://example.com/a/b", id="CAN-15"),
+        pytest.param("https://example.com/a/c/../b", "https://example.com/a/b", id="CAN-16"),
+        pytest.param("https://example.com", "https://example.com/", id="CAN-17"),
+        pytest.param("https://example.com/a/", "https://example.com/a/", id="CAN-18"),
+        pytest.param("https://bücher.example/a", "https://xn--bcher-kva.example/a", id="CAN-19"),
+        pytest.param("https://EXAMPLE.com/a?UTM_MEDIUM=x&z=1", "https://example.com/a?z=1", id="CAN-20"),
+        pytest.param("https://example.com/a%20b", "https://example.com/a%20b", id="CAN-21"),
+    ],
+)
+def test_CAN_canonicalization_matrix(raw, expected):
+    assert canonicalize_entry_url(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        pytest.param("file:///secret", "entry_url_invalid", id="CAN-22"),
+        pytest.param("https:///missing", "entry_url_invalid", id="CAN-23"),
+        pytest.param("https://user@example.com/a", "entry_url_credentials", id="CAN-24"),
+        pytest.param("https://user:pass@example.com/a", "entry_url_credentials", id="CAN-25"),
+        pytest.param("https://example.com:bad/a", "entry_url_invalid_port", id="CAN-26"),
+    ],
+)
+def test_CAN_rejected_url_matrix(raw, error):
+    with pytest.raises(ValueError, match=error):
+        canonicalize_entry_url(raw)
+
+
+@pytest.mark.parametrize(
+    ("entry", "feed_url", "prefix"),
+    [
+        pytest.param({"id": "stable-guid"}, "https://feed.test/rss", "guid:", id="ID-01"),
+        pytest.param({"id": "é"}, "https://feed.test/rss", "guid:", id="ID-02"),
+        pytest.param({"link": "/post/1"}, "https://feed.test/rss", "link:", id="ID-03"),
+        pytest.param({"link": "/post/1?utm_source=x"}, "https://feed.test/rss", "link:", id="ID-04"),
+        pytest.param({"link": "https://other.test/post"}, "https://feed.test/rss", "link:", id="ID-05"),
+        pytest.param({"title": "Title", "published": "now", "description": "Body"}, "https://feed.test/rss", "hash:", id="ID-06"),
+        pytest.param({}, "https://feed.test/rss", "hash:", id="ID-07"),
+        pytest.param({"id": "preferred", "link": "/ignored"}, "https://feed.test/rss", "guid:", id="ID-08"),
+    ],
+)
+def test_ID_identity_precedence_matrix(entry, feed_url, prefix, request):
+    identity = compute_entry_identity(entry, feed_url)
+    assert identity.startswith(prefix)
+    assert len(identity) == len(prefix) + 64
+    if request.node.callspec.id == "ID-02":
+        assert identity == compute_entry_identity({"id": "e\u0301"}, feed_url)
+    if request.node.callspec.id == "ID-04":
+        assert identity == compute_entry_identity({"link": "/post/1"}, feed_url)
 
 
 def make_polling_db(tmp_path):

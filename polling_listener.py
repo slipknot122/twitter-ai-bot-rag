@@ -297,13 +297,53 @@ class AutodiscoveryParser(HTMLParser):
                         'title': attrs_dict.get('title', '')
                     })
 
+def canonicalize_entry_url(url: str) -> str:
+    """Return a stable HTTP(S) identity URL without weakening URL validation."""
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("entry_url_invalid")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("entry_url_credentials")
+
+    hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("entry_url_invalid_port") from exc
+    default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = host if port is None or default_port else f"{host}:{port}"
+
+    path = parsed.path or "/"
+    trailing_slash = path.endswith("/")
+    segments = []
+    for segment in path.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    path = "/" + "/".join(segments)
+    if trailing_slash and path != "/":
+        path += "/"
+
+    blocked = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    filtered = sorted(
+        (key, value)
+        for key, value in query
+        if not key.lower().startswith("utm_") and key.lower() not in blocked
+    )
+    return urllib.parse.urlunsplit(
+        (scheme, netloc, path, urllib.parse.urlencode(filtered, doseq=True), "")
+    )
+
+
 def strip_tracking_params(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    qs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    blocked_prefixes = ('utm_', 'fbclid', 'gclid', 'mc_cid', 'mc_eid')
-    filtered = sorted([(k, v) for k, v in qs if not any(k.lower().startswith(p) for p in blocked_prefixes)])
-    new_query = urllib.parse.urlencode(filtered)
-    return urllib.parse.urlunparse((parsed.scheme, parsed.hostname, parsed.path, parsed.params, new_query, ""))
+    return canonicalize_entry_url(url)
 
 def compute_entry_identity(entry: dict, fallback_feed_url: str) -> str:
     if 'id' in entry and entry['id']:
@@ -329,6 +369,21 @@ def compute_entry_identity(entry: dict, fallback_feed_url: str) -> str:
     text_to_hash = f"{title}|{published}|{content_raw}"
     digest = hashlib.sha256(text_to_hash.encode('utf-8')).hexdigest()
     return f"hash:{digest}"
+
+def parse_feed_document(body: bytes):
+    """Parse a feed with an explicit bozo and XML entity policy."""
+    lowered = body.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        raise FetchFailure("feed_parse_error")
+
+    feed = feedparser.parse(body)
+    if feed.bozo:
+        exception = feed.bozo_exception
+        recoverable = isinstance(exception, RECOVERABLE_BOZO_TYPES)
+        if not recoverable or not feed.entries:
+            raise FetchFailure("feed_parse_error")
+    return feed
+
 
 def parse_retry_after(header_val: str) -> Optional[int]:
     try:
@@ -780,24 +835,11 @@ class PollingWorker:
 
         # Feed Mode
         try:
-            feed = feedparser.parse(res.body)
-
-            if feed.bozo:
-                if isinstance(feed.bozo_exception, FATAL_BOZO_TYPES):
-                    self.fail_poll(source, "feed_parse_error", http_status=res.status_code)
-                    return
-                elif isinstance(feed.bozo_exception, RECOVERABLE_BOZO_TYPES):
-                    if not feed.entries: # or any other strict criteria
-                        self.fail_poll(source, "feed_parse_error", http_status=res.status_code)
-                        return
-                else:
-                    self.fail_poll(source, "feed_parse_error", http_status=res.status_code)
-                    return
-
+            feed = parse_feed_document(res.body)
             if not feed.entries:
                 self.succeed_poll(source, res.candidate_etag, res.candidate_last_modified, res.final_url, res.status_code, [], is_empty=True)
                 return
-        except Exception:
+        except FetchFailure:
             self.fail_poll(source, "feed_parse_error", http_status=res.status_code)
             return
 
