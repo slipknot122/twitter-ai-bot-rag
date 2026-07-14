@@ -6,8 +6,12 @@ import httpx
 import pytest
 
 from polling_listener import (
+    CancellationReason,
     FetchFailure,
     FetchResult,
+    HostLimiter,
+    HostState,
+    HostStateMismatchError,
     MAX_DECODED_BYTES,
     MAX_ROBOTS_BYTES,
     PollingWorker,
@@ -624,3 +628,133 @@ async def test_RB_27_failure_stops_before_feed_request():
     decision = await worker.check_robots(object(), "https://example.com/feed", resolver=FakeResolver())
     assert decision.error_code == "robots_auth_denied"
     assert worker.fetch_calls == [("https://example.com/robots.txt", MAX_ROBOTS_BYTES, 0)]
+
+
+@pytest.mark.asyncio
+async def test_HL_01_same_origin_reuses_state():
+    limiter = HostLimiter(interval=0)
+    key1, state1 = await limiter.acquire("https://example.com/a")
+    await limiter.release(key1, state1)
+    key2, state2 = await limiter.acquire("https://example.com/b")
+    assert (key1, state1) == (key2, state2)
+    await limiter.release(key2, state2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [
+        pytest.param("https://example.com/a", "https://example.com:443/b", True, id="HL-02"),
+        pytest.param("http://example.com/a", "http://example.com:80/b", True, id="HL-03"),
+        pytest.param("http://example.com/a", "https://example.com/a", False, id="HL-04"),
+        pytest.param("https://example.com:443/a", "https://example.com:8443/a", False, id="HL-05"),
+    ],
+)
+async def test_HL_origin_key_matrix(first, second, same):
+    limiter = HostLimiter(interval=0)
+    key1, state1 = await limiter.acquire(first)
+    await limiter.release(key1, state1)
+    key2, state2 = await limiter.acquire(second)
+    assert (key1 == key2) is same
+    assert (state1 is state2) is same
+    await limiter.release(key2, state2)
+
+
+@pytest.mark.asyncio
+async def test_HL_06_release_records_idle_state():
+    limiter = HostLimiter(interval=0)
+    key, state = await limiter.acquire("https://example.com/a")
+    assert state.owner_count == 1 and state.request_lock.locked()
+    await limiter.release(key, state)
+    assert state.owner_count == 0 and not state.request_lock.locked()
+    assert state.last_used_monotonic > 0
+
+
+@pytest.mark.asyncio
+async def test_HL_07_gc_removes_only_idle_expired_state():
+    limiter = HostLimiter(interval=0, idle_ttl=-1)
+    key, state = await limiter.acquire("https://example.com/a")
+    await limiter.release(key, state)
+    await limiter.gc_idle()
+    assert key not in limiter._states
+
+
+@pytest.mark.asyncio
+async def test_HL_08_gc_keeps_owned_state():
+    limiter = HostLimiter(interval=0, idle_ttl=-1)
+    key, state = await limiter.acquire("https://example.com/a")
+    await limiter.gc_idle()
+    assert limiter._states[key] is state
+    await limiter.release(key, state)
+
+
+@pytest.mark.asyncio
+async def test_HL_09_gc_keeps_waited_state():
+    limiter = HostLimiter(interval=0, idle_ttl=-1)
+    key = "https://example.com:443"
+    state = HostState(asyncio.Lock(), waiter_count=1)
+    limiter._states[key] = state
+    await limiter.gc_idle()
+    assert limiter._states[key] is state
+
+
+@pytest.mark.asyncio
+async def test_HL_10_stale_state_release_is_bounded_error():
+    limiter = HostLimiter(interval=0)
+    key, state = await limiter.acquire("https://example.com/a")
+    limiter._states[key] = HostState(asyncio.Lock())
+    with pytest.raises(HostStateMismatchError, match="stale-state mismatch"):
+        await limiter.release(key, state)
+    assert state.request_lock.locked()
+    state.request_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_HL_11_double_release_is_bounded_error():
+    limiter = HostLimiter(interval=0)
+    key, state = await limiter.acquire("https://example.com/a")
+    await limiter.release(key, state)
+    with pytest.raises(HostStateMismatchError, match="invalid release"):
+        await limiter.release(key, state)
+    assert state.owner_count == 0
+
+
+@pytest.mark.asyncio
+async def test_HL_12_cancelled_waiter_does_not_leak_count():
+    limiter = HostLimiter(interval=0)
+    key, state = await limiter.acquire("https://example.com/a")
+    waiter = asyncio.create_task(limiter.acquire("https://example.com/b"))
+    await asyncio.sleep(0)
+    assert state.waiter_count == 1
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert state.waiter_count == 0
+    await limiter.release(key, state)
+
+
+@pytest.mark.asyncio
+async def test_C_01_cancellation_priority_is_monotonic():
+    worker = PollingWorker()
+    worker.trigger_cancellation(CancellationReason.TRANSIENT_INTERNAL)
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    worker.trigger_cancellation(CancellationReason.SOURCE_LEASE_LOST)
+    worker.trigger_cancellation(CancellationReason.GLOBAL_LEASE_LOST)
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    assert worker.cancellation_reason is CancellationReason.GLOBAL_LEASE_LOST
+    assert worker.cancellation_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_C_02_wait_for_cancellation_wakes_promptly():
+    worker = PollingWorker()
+    waiter = asyncio.create_task(worker.wait_for_cancellation(60))
+    await asyncio.sleep(0)
+    worker.trigger_cancellation(CancellationReason.SHUTDOWN)
+    assert await asyncio.wait_for(waiter, timeout=0.1) is True
+
+
+@pytest.mark.asyncio
+async def test_C_03_wait_for_cancellation_reports_timeout():
+    worker = PollingWorker()
+    assert await worker.wait_for_cancellation(0) is False

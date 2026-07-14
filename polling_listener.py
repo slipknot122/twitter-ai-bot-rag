@@ -178,12 +178,12 @@ class HostLimiter:
             current = self._states.get(key)
             if current is not state:
                 raise HostStateMismatchError("Bounded internal error: HostLimiter stale-state mismatch")
+            if state.owner_count != 1 or not state.request_lock.locked():
+                raise HostStateMismatchError("Bounded internal error: HostLimiter invalid release")
 
-            try:
-                state.last_used_monotonic = time.monotonic()
-                state.owner_count -= 1
-            finally:
-                state.request_lock.release()
+            state.last_used_monotonic = time.monotonic()
+            state.owner_count = 0
+            state.request_lock.release()
 
     async def gc_idle(self) -> None:
         now = time.monotonic()
@@ -911,17 +911,22 @@ class PollingWorker:
         if self.active_poll_task and not self.active_poll_task.done():
             self.active_poll_task.cancel()
 
+    async def wait_for_cancellation(self, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(self.cancellation_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def heartbeat_loop(self):
-        while not self.cancellation_event.is_set():
-            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        while not await self.wait_for_cancellation(HEARTBEAT_INTERVAL_SEC):
             if not db.heartbeat_global_lease(self.global_token, GLOBAL_LEASE_DURATION_SEC):
                 self.trigger_cancellation(CancellationReason.GLOBAL_LEASE_LOST)
                 return
 
     async def cleanup_loop(self):
-        while not self.cancellation_event.is_set():
-            await asyncio.sleep(60)
-            await self.host_limiter.cleanup_idle()
+        while not await self.wait_for_cancellation(60):
+            await self.host_limiter.gc_idle()
 
     async def run(self):
         try:
