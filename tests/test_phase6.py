@@ -9,7 +9,9 @@ from polling_listener import (
     FetchFailure,
     FetchResult,
     MAX_DECODED_BYTES,
+    MAX_ROBOTS_BYTES,
     PollingWorker,
+    RobotsDecision,
     read_bounded_body,
 )
 
@@ -530,3 +532,95 @@ async def test_RD_physical_location_matrix(headers, expected_url, expected_error
     assert result.error_code == expected_error
     assert stream.close_count == 1
     assert stream.yield_count == 0
+
+
+class ScriptedRobotsWorker(PollingWorker):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = list(responses)
+        self.fetch_calls = []
+
+    async def fetch_url_single(self, client, url, max_bytes, **kwargs):
+        self.fetch_calls.append((url, max_bytes, kwargs.get("redirect_count")))
+        if not self.responses:
+            raise AssertionError("unexpected robots transport call")
+        return self.responses.pop(0)
+
+
+def robots_result(*, status=200, body=b"", error=None, redirect=None, retry_after=None):
+    effective_status = 0 if error is not None and status == 200 else status
+    return FetchResult(
+        effective_status, "https://example.com/robots.txt", 0, False, None,
+        None, None, body, redirect_url=redirect, error_code=error,
+        retry_after=retry_after,
+    )
+
+
+@pytest.mark.parametrize(
+    ("responses", "kind", "code", "delay", "ttl", "calls"),
+    [
+        pytest.param([robots_result(body=b"User-agent: *\nAllow: /\n")], "allow", None, None, 3600, 1, id="RB-01"),
+        pytest.param([robots_result(body=b"User-agent: *\nDisallow: /\n")], "deny", "robots_rule_denied", None, 3600, 1, id="RB-02"),
+        pytest.param([robots_result(body=b"User-agent: AntigravityBot\nAllow: /\nUser-agent: *\nDisallow: /\n")], "allow", None, None, 3600, 1, id="RB-03"),
+        pytest.param([robots_result(body=b"User-agent: *\nDisallow: /private\n")], "allow", None, None, 3600, 1, id="RB-04"),
+        pytest.param([robots_result(status=404)], "allow", None, None, 3600, 1, id="RB-05"),
+        pytest.param([robots_result(status=401)], "error", "robots_auth_denied", None, 900, 1, id="RB-06"),
+        pytest.param([robots_result(status=403)], "error", "robots_auth_denied", None, 900, 1, id="RB-07"),
+        pytest.param([robots_result(status=429, retry_after=120)], "error", "robots_rate_limited", 120, 120, 1, id="RB-08"),
+        pytest.param([robots_result(status=429, retry_after=360)], "error", "robots_rate_limited", 360, 360, 1, id="RB-09"),
+        pytest.param([robots_result(status=429)], "error", "robots_rate_limited", 900, 900, 1, id="RB-10"),
+        pytest.param([robots_result(status=429)], "error", "robots_rate_limited", 900, 900, 1, id="RB-11"),
+        pytest.param([robots_result(status=503)], "error", "robots_server_error", None, 900, 1, id="RB-12"),
+        pytest.param([robots_result(error="timeout")], "error", "robots_timeout", None, 900, 1, id="RB-13"),
+        pytest.param([robots_result(error="network_error")], "error", "robots_network_error", None, 900, 1, id="RB-14"),
+        pytest.param([robots_result(body=b"this is not a robots file")], "error", "robots_parse_error", None, 900, 1, id="RB-15"),
+        pytest.param([robots_result(body=b"<html><body>error</body></html>")], "error", "robots_parse_error", None, 900, 1, id="RB-16"),
+        pytest.param([robots_result(body=b"User-agent: *\nAllow: /\n" + b"#" * 102300)], "allow", None, None, 3600, 1, id="RB-17"),
+        pytest.param([robots_result(error="body_too_large")], "error", "robots_body_too_large", None, 900, 1, id="RB-18"),
+        pytest.param([robots_result(error="content_decoding_error")], "error", "robots_decoding_error", None, 900, 1, id="RB-19"),
+        pytest.param([robots_result(error="redirect_missing_location")], "error", "redirect_missing_location", None, 900, 1, id="RB-20"),
+        pytest.param([robots_result(error="redirect_ambiguous_location")], "error", "redirect_ambiguous_location", None, 900, 1, id="RB-21"),
+        pytest.param([robots_result(redirect="/robots.txt")], "error", "redirect_loop", None, 900, 1, id="RB-22"),
+        pytest.param([
+            robots_result(redirect="/r1"), robots_result(redirect="/r2"),
+            robots_result(redirect="/r3"), robots_result(redirect="/r4"),
+        ], "error", "too_many_redirects", None, 900, 4, id="RB-23"),
+        pytest.param([robots_result(redirect="file:///secret"), robots_result(error="ssrf_blocked")], "error", "unsafe_redirect_target", None, 900, 2, id="RB-24"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_RB_network_policy_matrix(responses, kind, code, delay, ttl, calls):
+    worker = ScriptedRobotsWorker(responses)
+    decision = await worker.check_robots(object(), "https://example.com/feed", resolver=FakeResolver())
+    assert decision.kind == kind
+    assert decision.error_code == code
+    assert decision.delay_seconds == delay
+    assert decision.cache_ttl_seconds == ttl
+    assert decision.from_cache is False
+    assert len(worker.fetch_calls) == calls
+
+
+@pytest.mark.asyncio
+async def test_RB_25_cache_hit_uses_zero_transport_calls():
+    worker = ScriptedRobotsWorker([])
+    worker.robots_cache.store("https://example.com/feed", "allow", None, 0, 3600)
+    decision = await worker.check_robots(object(), "https://example.com/feed", resolver=FakeResolver())
+    assert decision == RobotsDecision("allow", None, 0, 3600, True)
+    assert worker.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_RB_26_cached_deny_preserves_decision():
+    worker = ScriptedRobotsWorker([])
+    worker.robots_cache.store("https://example.com/feed", "deny", "robots_rule_denied", 0, 3600)
+    decision = await worker.check_robots(object(), "https://example.com/feed", resolver=FakeResolver())
+    assert decision == RobotsDecision("deny", "robots_rule_denied", 0, 3600, True)
+    assert worker.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_RB_27_failure_stops_before_feed_request():
+    worker = ScriptedRobotsWorker([robots_result(status=403)])
+    decision = await worker.check_robots(object(), "https://example.com/feed", resolver=FakeResolver())
+    assert decision.error_code == "robots_auth_denied"
+    assert worker.fetch_calls == [("https://example.com/robots.txt", MAX_ROBOTS_BYTES, 0)]

@@ -222,7 +222,8 @@ class RobotsCache:
             'decision': decision,
             'error_code': error_code,
             'delay': delay,
-            'expires_at': now + ttl
+            'ttl': ttl,
+            'expires_at': now + ttl,
         }
 
 SUPPRESSED_TAGS = {"script", "style", "noscript"}
@@ -614,6 +615,8 @@ class PollingWorker:
                 error_code = res.error_code
             elif res.error_code == 'too_many_redirects':
                 error_code = 'too_many_redirects'
+            elif res.error_code == 'ssrf_blocked' and redirect_count > 0:
+                error_code = 'unsafe_redirect_target'
             else:
                 error_code = 'robots_error'
         else:
