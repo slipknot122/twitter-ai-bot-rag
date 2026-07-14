@@ -5,6 +5,7 @@ import zlib
 import httpx
 import pytest
 
+from database import Database
 from polling_listener import (
     CancellationReason,
     FetchFailure,
@@ -758,3 +759,132 @@ async def test_C_02_wait_for_cancellation_wakes_promptly():
 async def test_C_03_wait_for_cancellation_reports_timeout():
     worker = PollingWorker()
     assert await worker.wait_for_cancellation(0) is False
+
+
+def make_polling_db(tmp_path):
+    database = Database(str(tmp_path / "phase6-leases.db"))
+    source = database.add_source(
+        source_type="rss",
+        external_id="https://example.com/feed",
+        name="Lease Feed",
+        canonical_url="https://example.com/feed",
+    )
+    return database, source["id"]
+
+
+def test_LC_01_global_lease_is_exclusive(tmp_path):
+    database, _ = make_polling_db(tmp_path)
+    first = database.acquire_global_lease("worker-a", 60)
+    assert first is not None
+    assert database.acquire_global_lease("worker-b", 60) is None
+
+
+def test_LC_02_global_heartbeat_requires_exact_token(tmp_path):
+    database, _ = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    assert database.heartbeat_global_lease(token, 60) is True
+    assert database.heartbeat_global_lease("stale-token", 60) is False
+
+
+def test_LC_03_global_release_requires_exact_token(tmp_path):
+    database, _ = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    database.release_global_lease("stale-token")
+    assert database.heartbeat_global_lease(token, 60) is True
+    database.release_global_lease(token)
+    assert database.heartbeat_global_lease(token, 60) is False
+
+
+def test_LC_04_claim_requires_live_global_lease(tmp_path):
+    database, _ = make_polling_db(tmp_path)
+    assert database.claim_due_poll_source("missing-token", 60) is None
+
+
+def test_LC_05_claim_sets_exact_source_identity(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    global_token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(global_token, 60)
+    assert claim["source_id"] == source_id
+    assert claim["claimed_mode"] == "rss"
+    assert claim["claimed_target"] == "https://example.com/feed"
+    assert claim["lease_token"]
+
+
+def test_LC_06_claim_is_exclusive_until_expiry(tmp_path):
+    database, _ = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    assert database.claim_due_poll_source(token, 60) is not None
+    assert database.claim_due_poll_source(token, 60) is None
+
+
+def test_LC_07_completion_rejects_stale_global_token(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    assert database.complete_source_poll(
+        "stale", source_id, claim["lease_token"], claim["claimed_mode"],
+        claim["claimed_target"], {"collector_status": "healthy"},
+    ) is False
+    assert database.get_poll_state(source_id)["lease_token"] == claim["lease_token"]
+
+
+def test_LC_08_completion_rejects_stale_source_token(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    assert database.complete_source_poll(
+        token, source_id, "stale", claim["claimed_mode"], claim["claimed_target"],
+        {"collector_status": "healthy"},
+    ) is False
+    assert database.get_poll_state(source_id)["lease_token"] == claim["lease_token"]
+
+
+def test_LC_09_completion_rejects_changed_target(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    with database._get_connection() as connection:
+        connection.execute("UPDATE sources SET canonical_url = ? WHERE id = ?", ("https://example.com/new", source_id))
+        connection.commit()
+    assert database.complete_source_poll(
+        token, source_id, claim["lease_token"], claim["claimed_mode"],
+        claim["claimed_target"], {"collector_status": "healthy"},
+    ) is False
+
+
+def test_LC_10_successful_completion_clears_source_lease(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    assert database.complete_source_poll(
+        token, source_id, claim["lease_token"], claim["claimed_mode"],
+        claim["claimed_target"], {"collector_status": "healthy"},
+    ) is True
+    state = database.get_poll_state(source_id)
+    assert state["lease_token"] is None
+    assert state["lease_expires_at"] is None
+    assert state["collector_status"] == "healthy"
+
+
+def test_LC_11_completion_rejects_disallowed_field_before_write(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    with pytest.raises(ValueError, match="Disallowed outcome field"):
+        database.complete_source_poll(
+            token, source_id, claim["lease_token"], claim["claimed_mode"],
+            claim["claimed_target"], {"lease_token": "attacker"},
+        )
+    assert database.get_poll_state(source_id)["lease_token"] == claim["lease_token"]
+
+
+def test_LC_12_completion_validates_http_status_before_write(tmp_path):
+    database, source_id = make_polling_db(tmp_path)
+    token = database.acquire_global_lease("worker-a", 60)
+    claim = database.claim_due_poll_source(token, 60)
+    with pytest.raises(ValueError, match="last_http_status"):
+        database.complete_source_poll(
+            token, source_id, claim["lease_token"], claim["claimed_mode"],
+            claim["claimed_target"], {"last_http_status": 999},
+        )
+    assert database.get_poll_state(source_id)["lease_token"] == claim["lease_token"]
