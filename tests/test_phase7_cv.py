@@ -1,12 +1,18 @@
+import ast
+import inspect
 import os
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError, MISSING, fields
+import traceback
+from dataclasses import MISSING, FrozenInstanceError, dataclass, fields
 from pathlib import Path
-from typing import Any, get_args, get_origin, get_type_hints
+from typing import Any, NoReturn, get_args, get_origin, get_type_hints
 from unittest.mock import patch
-import pytest
 
+import pytest
+import requests
+
+import llm_provider
 from config import (
     load_settings,
     ConfigStartupError,
@@ -617,3 +623,647 @@ print("OK")
     assert result.returncode == 0, f"Subprocess failed (exit {result.returncode}):\\nSTDOUT:\\n{result.stdout}\\nSTDERR:\\n{result.stderr}"
     assert result.stderr == ""
     assert result.stdout.strip() == "OK"
+
+# --- A3.3a: LLMProvider Environment Mutability & Security Fixes ---
+
+
+
+def _make_llm_config(
+    *,
+    model: str = "gemini/gemini-1.5-pro",
+    temperature: float = 0.2,
+    openai_api_key: str | None = "OPENAI_KEY_SENTINEL_91f2",
+    gemini_api_key: str | None = "GEMINI_KEY_SENTINEL_91f2",
+) -> LLMConfig:
+    return LLMConfig(
+        model=model,
+        temperature=temperature,
+        openai_api_key=openai_api_key,
+        gemini=GeminiConfig(api_key=gemini_api_key),
+    )
+
+
+def _scan_security_source(source: str) -> None:
+    tree = ast.parse(source)
+
+    def _os_names(tree: ast.AST) -> set[str]:
+        names = {"os"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "os":
+                        names.add(alias.asname or alias.name)
+        return names
+
+    os_aliases = _os_names(tree)
+
+    def _is_os_environ_target(target: ast.AST) -> bool:
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Attribute):
+            if isinstance(target.value.value, ast.Name) and target.value.value.id in os_aliases:
+                if target.value.attr == "environ":
+                    return True
+        if isinstance(target, ast.Attribute):
+            if isinstance(target.value, ast.Name) and target.value.id in os_aliases:
+                if target.attr == "environ":
+                    return True
+        return False
+
+    def _is_os_putenv_call(node: ast.Call) -> bool:
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id in os_aliases:
+                if node.func.attr in {"putenv", "unsetenv"}:
+                    return True
+        return False
+
+    def _is_os_environ_call(node: ast.Call) -> bool:
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Attribute):
+                if isinstance(node.func.value.value, ast.Name) and node.func.value.value.id in os_aliases:
+                    if node.func.value.attr == "environ":
+                        if node.func.attr in {"update", "setdefault", "pop", "clear", "popitem"}:
+                            return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if _is_os_environ_target(target):
+                    raise ValueError("os.environ assignment detected")
+
+        if isinstance(node, ast.Call):
+            if _is_os_putenv_call(node):
+                raise ValueError("os.putenv/unsetenv detected")
+            if _is_os_environ_call(node):
+                raise ValueError("os.environ mutation method detected")
+
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                if node.func.value.id == "logger":
+                    tainted = {"api_key", "kwargs", "params", "raw_exception"}
+                    def _is_tainted(val: ast.AST) -> bool:
+                        if isinstance(val, ast.Name) and val.id in tainted:
+                            return True
+                        if isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id == "response" and val.attr == "text":
+                            return True
+                        return False
+                    for kw in node.keywords:
+                        if _is_tainted(kw.value):
+                            raise ValueError("logger call with tainted kwargs detected")
+                    for arg in node.args:
+                        if _is_tainted(arg):
+                            raise ValueError(f"logger with tainted arg detected")
+
+            if isinstance(node.func, ast.Name) and node.func.id == "print":
+                if node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == "api_key":
+                    raise ValueError("print call detected")
+                # allowed print("safe diagnostic") since 'secret' is removed
+
+        if isinstance(node, ast.Delete):
+            for target in node.targets:
+                if _is_os_environ_target(target):
+                    raise ValueError("del os.environ detected")
+
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "GEMINI_EMBEDDING_ENDPOINT":
+                    if not getattr(node, "value", None) or not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+                        raise ValueError("Endpoint is not a string literal")
+
+
+def test_llm_provider_ast_no_env_mutations() -> None:
+    provider_path = Path(llm_provider.__file__)
+    source = provider_path.read_text(encoding="utf-8")
+    _scan_security_source(source)
+
+@pytest.mark.parametrize(
+    "source, match",
+    [
+        ("print(api_key)", "print call detected"),
+        ('os.environ["KEY"] = "value"', "os.environ assignment detected"),
+        ('os.environ: str = "value"', "os.environ assignment detected"),
+        ('os.environ["KEY"] += "value"', "os.environ assignment detected"),
+        ('del os.environ["KEY"]', "del os.environ detected"),
+        ('os.environ.update({"KEY": "value"})', "os.environ mutation method detected"),
+        ('os.environ.setdefault("KEY", "value")', "os.environ mutation method detected"),
+        ('os.environ.pop("KEY")', "os.environ mutation method detected"),
+        ('os.environ.popitem()', "os.environ mutation method detected"),
+        ('os.environ.clear()', "os.environ mutation method detected"),
+        ('os.putenv("KEY", "value")', "os.putenv/unsetenv detected"),
+        ('os.unsetenv("KEY")', "os.putenv/unsetenv detected"),
+        (
+            'import os as operating_system\noperating_system.environ["KEY"] = "secret"',
+            "os.environ assignment detected",
+        ),
+        (
+            'import os as operating_system\noperating_system.putenv("KEY", "secret")',
+            "os.putenv/unsetenv detected",
+        ),
+        ('GEMINI_EMBEDDING_ENDPOINT = f"https://api.com?key={key}"', "Endpoint is not a string literal"),
+        ('GEMINI_EMBEDDING_ENDPOINT = "https://api.com?key=" + key', "Endpoint is not a string literal"),
+        ('logger.info("message", key=api_key)', "logger call with tainted kwargs detected"),
+        ('logger.info("message", key=kwargs)', "logger call with tainted kwargs detected"),
+        ('logger.info("message", key=params)', "logger call with tainted kwargs detected"),
+        ('logger.error("{}", raw_exception)', "logger with tainted arg detected"),
+        ('logger.error(response.text)', "logger with tainted arg detected"),
+    ],
+)
+def test_security_scanner_rejects_bad_patterns(source: str, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        _scan_security_source(source)
+
+
+def test_security_scanner_allows_safe_patterns() -> None:
+    _scan_security_source('print("safe diagnostic")')
+    _scan_security_source('logger.info("model {}", model)')
+    _scan_security_source('logger.info("count", extra={"count": count})')
+    _scan_security_source('os.environ.get("KEY")')
+
+
+class ForbiddenSettings:
+    def __getattribute__(self, name: str) -> object:
+        raise AssertionError(f"unexpected settings access: {name}")
+
+
+def test_explicit_constructor_does_not_read_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_llm_config()
+    monkeypatch.setattr(
+        llm_provider,
+        "settings",
+        ForbiddenSettings(),
+    )
+
+    provider = llm_provider.LLMProvider(config)
+
+    assert provider._config is config
+
+
+def test_explicit_constructor_does_not_call_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_call(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("network call during construction")
+
+    monkeypatch.setattr(llm_provider, "completion", forbidden_call)
+    monkeypatch.setattr(llm_provider, "embedding", forbidden_call)
+    monkeypatch.setattr(llm_provider.requests, "post", forbidden_call)
+
+    provider = llm_provider.LLMProvider(_make_llm_config())
+
+    assert provider.model == "gemini/gemini-1.5-pro"
+
+
+def test_llm_provider_legacy_no_arg_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummySettings:
+        openai_api_key = "old_openai"
+        gemini_api_key = "old_gemini"
+        llm_model = "old_model"
+        llm_temperature = 0.9
+
+    monkeypatch.setattr(llm_provider, "settings", DummySettings())
+
+    provider = llm_provider.LLMProvider()
+    assert provider._config.openai_api_key == "old_openai"
+    assert provider._config.gemini.api_key == "old_gemini"
+    assert provider._config.model == "old_model"
+
+
+def test_llm_provider_constructor_no_env_mutate() -> None:
+    before = dict(os.environ)
+    cfg = _make_llm_config()
+    provider = llm_provider.LLMProvider(cfg)
+    assert dict(os.environ) == before
+
+
+def test_configured_primary_model_is_first() -> None:
+    cfg = _make_llm_config(model="gemini/gemini-custom")
+    provider = llm_provider.LLMProvider(cfg)
+    models = provider._models_to_try()
+    assert models[0] == "gemini/gemini-custom"
+
+
+def test_duplicate_fallback_removed_order_kept() -> None:
+    cfg = _make_llm_config(model="gemini/gemini-2.5-flash")
+    provider = llm_provider.LLMProvider(cfg)
+    models = provider._models_to_try()
+    assert models[0] == "gemini/gemini-2.5-flash"
+    assert models == ("gemini/gemini-2.5-flash", "gemini/gemini-3.5-flash", "gemini/gemini-3.1-flash-lite")
+
+
+def test_non_gemini_no_gemini_fallbacks() -> None:
+    cfg = _make_llm_config(model="openai/gpt-4o")
+    provider = llm_provider.LLMProvider(cfg)
+    models = provider._models_to_try()
+    assert models == ("openai/gpt-4o",)
+
+
+def test_each_attempt_gets_new_kwargs() -> None:
+    cfg = _make_llm_config()
+    provider = llm_provider.LLMProvider(cfg)
+    kw1 = provider._completion_kwargs(model="gemini/1", temperature=0.5)
+    kw2 = provider._completion_kwargs(model="gemini/2", temperature=0.5)
+    assert kw1 is not kw2
+    kw1["mutated"] = True
+    assert "mutated" not in kw2
+
+@pytest.mark.parametrize(
+    "model_id, expected_key",
+    [
+        ("openai/gpt-4o", "OPENAI_KEY_SENTINEL_91f2"),
+        ("gemini/gemini-1.5-pro", "GEMINI_KEY_SENTINEL_91f2"),
+        ("custom/not-gemini", None),
+        ("gpt-4o", None),
+    ],
+)
+def test_api_key_resolver_cases(model_id: str, expected_key: str | None) -> None:
+    cfg = _make_llm_config()
+    provider = llm_provider.LLMProvider(cfg)
+    kw = provider._completion_kwargs(model=model_id, temperature=0.5)
+    assert kw.get("api_key") == expected_key
+
+
+def test_provider_resolver_cases() -> None:
+    assert llm_provider._provider_for_model("gemini/model") == "gemini"
+    assert llm_provider._provider_for_model("openai/model") == "openai"
+    assert llm_provider._provider_for_model("GEMINI/model") == "gemini"
+    assert llm_provider._provider_for_model("custom/not-gemini") is None
+    assert llm_provider._provider_for_model("company/gpt-wrapper") is None
+    assert llm_provider._provider_for_model("gpt-4o") is None
+    assert llm_provider._provider_for_model("") is None
+
+
+def test_primary_and_fallback_get_same_gemini_key() -> None:
+    cfg = _make_llm_config(model="gemini/gemini-3.5-flash")
+    provider = llm_provider.LLMProvider(cfg)
+    models = provider._models_to_try()
+    keys = [provider._completion_kwargs(model=m, temperature=0.5).get("api_key") for m in models]
+    assert all(k == "GEMINI_KEY_SENTINEL_91f2" for k in keys)
+
+@dataclass
+class FakeMessage:
+    content: str = "ok"
+
+@dataclass
+class FakeChoice:
+    message: FakeMessage
+
+@dataclass
+class FakeUsage:
+    total_tokens: int = 3
+    prompt_tokens: int = 2
+    completion_tokens: int = 1
+
+@dataclass
+class FakeCompletionResponse:
+    choices: list[FakeChoice]
+    usage: FakeUsage
+
+
+def test_temperature_override_no_config_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(temperature=0.5)
+    provider = llm_provider.LLMProvider(cfg)
+
+    called_kwargs: dict[str, object] = {}
+
+    def fake_completion(*args: object, **kwargs: object) -> FakeCompletionResponse:
+        called_kwargs.update(kwargs)
+        return FakeCompletionResponse(
+            choices=[FakeChoice(message=FakeMessage(content="ok"))],
+            usage=FakeUsage(),
+        )
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+
+    provider.generate_with_metadata("prompt", temperature=0.1)
+    assert provider._config.temperature == 0.5
+    assert called_kwargs.get("temperature") == 0.1
+
+
+def test_failure_goes_to_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="gemini/gemini-3.5-flash")
+    provider = llm_provider.LLMProvider(cfg)
+
+    call_count = 0
+
+    def fake_completion(*args: object, **kwargs: object) -> FakeCompletionResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise llm_provider.LLMProviderError("fake")
+        return FakeCompletionResponse(
+            choices=[FakeChoice(message=FakeMessage(content="ok"))],
+            usage=FakeUsage(),
+        )
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+
+    res = provider.generate_with_metadata("prompt")
+    assert call_count == 3
+    assert res.model_used == "gemini/gemini-2.5-flash"
+
+
+def test_success_stops_fallback_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="gemini/gemini-3.5-flash")
+    provider = llm_provider.LLMProvider(cfg)
+
+    call_count = 0
+
+    def fake_completion(*args: object, **kwargs: object) -> FakeCompletionResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise llm_provider.LLMProviderError("fake")
+        return FakeCompletionResponse(
+            choices=[FakeChoice(message=FakeMessage(content="ok"))],
+            usage=FakeUsage(),
+        )
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+
+    res = provider.generate_with_metadata("prompt")
+    assert call_count == 2
+    assert res.model_used == "gemini/gemini-3.1-flash-lite"
+
+
+def test_completion_success_no_env_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config()
+    provider = llm_provider.LLMProvider(cfg)
+    before = dict(os.environ)
+
+    def fake_completion(*args: object, **kwargs: object) -> FakeCompletionResponse:
+        return FakeCompletionResponse(
+            choices=[FakeChoice(message=FakeMessage(content="ok"))],
+            usage=FakeUsage(),
+        )
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+
+    provider.generate_with_metadata("prompt")
+    assert dict(os.environ) == before
+
+
+def test_completion_exception_no_env_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config()
+    provider = llm_provider.LLMProvider(cfg)
+    before = dict(os.environ)
+
+    def fake_completion(*args: object, **kwargs: object) -> NoReturn:
+        raise llm_provider.LLMProviderError("fake")
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+    monkeypatch.setattr(provider.generate_with_metadata.retry, "sleep", lambda _: None)
+
+    with pytest.raises(llm_provider.LLMProviderError):
+        provider.generate_with_metadata("prompt")
+    assert dict(os.environ) == before
+
+
+def test_embedding_success_no_env_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="openai/gpt")
+    provider = llm_provider.LLMProvider(cfg)
+    before = dict(os.environ)
+
+    class FakeEmbeddingResponse:
+        data = [{"embedding": [0.1]}]
+
+    def fake_embedding(*args: object, **kwargs: object) -> FakeEmbeddingResponse:
+        return FakeEmbeddingResponse()
+
+    monkeypatch.setattr(llm_provider, "embedding", fake_embedding)
+
+    provider.get_embedding("text")
+    assert dict(os.environ) == before
+
+
+def test_embedding_custom_fallback_does_not_call_gemini(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = llm_provider.LLMProvider(_make_llm_config(model="custom/not-gemini", openai_api_key=None))
+    called_gemini = False
+
+    def fake_post(*args: object, **kwargs: object) -> NoReturn:
+        nonlocal called_gemini
+        called_gemini = True
+        raise AssertionError("Should not be called")
+
+    monkeypatch.setattr(llm_provider.requests, "post", fake_post)
+    monkeypatch.setattr(provider.get_embedding.retry, "sleep", lambda _: None)
+    monkeypatch.setattr(provider.get_embedding.retry, "sleep", lambda _: None)
+
+    import tenacity
+    with pytest.raises(tenacity.RetryError) as exc:
+        provider.get_embedding("text")
+
+    assert not called_gemini
+    inner = exc.value.last_attempt.exception()
+    assert isinstance(inner, llm_provider.LLMProviderError)
+    assert inner.code == "openai_api_key_missing"
+
+
+def test_embedding_transport_failure_no_env_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="gemini/model")
+    provider = llm_provider.LLMProvider(cfg)
+    before = dict(os.environ)
+
+    def fake_post(*args: object, **kwargs: object) -> NoReturn:
+        raise requests.RequestException("fail")
+
+    monkeypatch.setattr(llm_provider.requests, "post", fake_post)
+    monkeypatch.setattr(provider.get_embedding.retry, "sleep", lambda _: None)
+    monkeypatch.setattr(provider.get_embedding.retry, "sleep", lambda _: None)
+
+    import tenacity
+    with pytest.raises(tenacity.RetryError) as exc:
+        provider.get_embedding("text")
+
+    inner = exc.value.last_attempt.exception()
+    assert isinstance(inner, llm_provider.LLMProviderError)
+    assert inner.code == "gemini_embedding_transport_failed"
+    assert dict(os.environ) == before
+
+
+def test_embedding_endpoint_and_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="gemini/model")
+    provider = llm_provider.LLMProvider(cfg)
+
+    captured_url = ""
+    captured_params: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        def json(self) -> dict[str, Any]:
+            return {"embedding": {"values": [0.1]}}
+
+    def fake_post(url: str, *args: object, **kwargs: object) -> FakeResponse:
+        nonlocal captured_url, captured_params
+        captured_url = url
+        captured_params = kwargs.get("params", {})  # type: ignore
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_provider.requests, "post", fake_post)
+    monkeypatch.setattr(provider.get_embedding.retry, "sleep", lambda _: None)
+    monkeypatch.setattr(provider.get_embedding.retry, "sleep", lambda _: None)
+
+    provider.get_embedding("text")
+    assert captured_url == llm_provider.GEMINI_EMBEDDING_ENDPOINT
+    assert "?" not in captured_url
+    assert "GEMINI_KEY_SENTINEL_91f2" not in captured_url
+    assert captured_params == {"key": "GEMINI_KEY_SENTINEL_91f2"}
+
+
+def test_http_status_json_errors_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="gemini/model")
+    provider = llm_provider.LLMProvider(cfg)
+
+    class FakeResponse500:
+        status_code = 500
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    class FakeResponse200Bad:
+        status_code = 200
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    def fake_post_500(*args: object, **kwargs: object) -> FakeResponse500:
+        return FakeResponse500()
+
+    def fake_post_200_bad(*args: object, **kwargs: object) -> FakeResponse200Bad:
+        return FakeResponse200Bad()
+
+    monkeypatch.setattr(llm_provider.requests, "post", fake_post_500)
+    monkeypatch.setattr(provider.get_embedding.retry, "sleep", lambda _: None)
+    import tenacity
+    with pytest.raises(tenacity.RetryError) as exc:
+        provider.get_embedding("text")
+    inner = exc.value.last_attempt.exception()
+    assert inner.code == "gemini_embedding_failed"
+
+    monkeypatch.setattr(llm_provider.requests, "post", fake_post_200_bad)
+    with pytest.raises(tenacity.RetryError) as exc:
+        provider.get_embedding("text")
+    inner = exc.value.last_attempt.exception()
+    assert inner.code == "gemini_embedding_invalid_response"
+
+
+def test_secrets_absent_in_logs_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cfg = _make_llm_config(model="gemini/model")
+    provider = llm_provider.LLMProvider(cfg)
+
+    def fake_completion(*args: object, **kwargs: object) -> NoReturn:
+        raise llm_provider.LLMProviderError("fake")
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+    monkeypatch.setattr(provider.generate_with_metadata.retry, "sleep", lambda _: None)
+
+    with pytest.raises(llm_provider.LLMProviderError):
+        provider.generate_with_metadata("prompt")
+
+    out, err = capsys.readouterr()
+    assert "GEMINI_KEY_SENTINEL_91f2" not in out
+    assert "GEMINI_KEY_SENTINEL_91f2" not in err
+    assert "GEMINI_KEY_SENTINEL_91f2" not in caplog.text
+
+    assert "OPENAI_KEY_SENTINEL_91f2" not in out
+    assert "OPENAI_KEY_SENTINEL_91f2" not in err
+    assert "OPENAI_KEY_SENTINEL_91f2" not in caplog.text
+
+
+def test_global_llm_legacy_export_contract() -> None:
+    assert type(llm_provider.llm) is llm_provider.LLMProvider
+    assert getattr(llm_provider.llm, "generate_with_metadata")
+    assert getattr(llm_provider.llm, "get_embedding")
+
+
+def test_import_contract_consumers_unchanged() -> None:
+    sig_gen = inspect.signature(llm_provider.LLMProvider.generate)
+    assert "prompt" in sig_gen.parameters
+    assert "system_prompt" in sig_gen.parameters
+    assert "temperature" in sig_gen.parameters
+    assert sig_gen.return_annotation is str
+
+    sig_emb = inspect.signature(llm_provider.LLMProvider.get_embedding)
+    assert "text" in sig_emb.parameters
+
+
+def test_llm_provider_error() -> None:
+    err = llm_provider.LLMProviderError("completion_failed")
+    assert err.code == "completion_failed"
+    assert err.args == ("completion_failed",)
+    assert not hasattr(err, "gemini_api_key")
+    assert not hasattr(err, "openai_api_key")
+    assert "secret" not in dir(err)
+
+
+def test_retry_cardinality_generate_with_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="gemini/gemini-1.5-pro")
+    provider = llm_provider.LLMProvider(cfg)
+
+    call_count = 0
+
+    def fake_completion(*args: object, **kwargs: object) -> NoReturn:
+        nonlocal call_count
+        call_count += 1
+        raise llm_provider.LLMProviderError("fake")
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+    monkeypatch.setattr(provider.generate_with_metadata.retry, "sleep", lambda _: None)
+
+    with pytest.raises(llm_provider.LLMProviderError):
+        provider.generate_with_metadata("prompt")
+
+    # Tenacity tries 3 times. We have 3 models in fallback loop.
+    # 3 (tenacity) * 3 (models loop) = 9
+    assert call_count == 12
+
+
+def test_retry_cardinality_generate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_llm_config(model="gemini/gemini-1.5-pro")
+    provider = llm_provider.LLMProvider(cfg)
+
+    call_count = 0
+
+    def fake_completion(*args: object, **kwargs: object) -> NoReturn:
+        nonlocal call_count
+        call_count += 1
+        raise llm_provider.LLMProviderError("fake")
+
+    monkeypatch.setattr(llm_provider, "completion", fake_completion)
+    monkeypatch.setattr(provider.generate_with_metadata.retry, "sleep", lambda _: None)
+    monkeypatch.setattr(provider.generate.retry, "sleep", lambda _: None)
+
+    with pytest.raises(llm_provider.LLMProviderError):
+        provider.generate("prompt")
+
+    # generate() wraps generate_with_metadata(), both have 3x retry
+    # 3 (generate) * 3 (generate_with_metadata) * 3 (models loop) = 27
+    assert call_count == 36
