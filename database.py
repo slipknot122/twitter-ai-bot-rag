@@ -110,7 +110,9 @@ class Database:
         self.db_path = db_path
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    import contextlib
+    @contextlib.contextmanager
+    def _get_connection(self): # type: ignore
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
 
@@ -121,7 +123,11 @@ class Database:
         # Вмикаємо перевірку зовнішніх ключів на кожному з'єднанні
         conn.execute('PRAGMA foreign_keys = ON;')
 
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         """Ініціалізація таблиць та міграції."""
