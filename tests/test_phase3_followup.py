@@ -169,3 +169,48 @@ def test_connection_closes_after_exception(override_db):
     assert captured_connection is not None
     with pytest.raises(sqlite3.ProgrammingError, match="(?i)closed"):
         captured_connection.execute("SELECT 1")
+
+
+def test_connection_closes_when_setup_fails(override_db):
+    real_connect = sqlite3.connect
+    captured_real_conn = None
+
+    class ConnectionProxy:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+
+        def execute(self, sql, *args, **kwargs):
+            if 'PRAGMA journal_mode=WAL;' in sql:
+                raise RuntimeError('setup failed')
+            return self._real_conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self._real_conn.close()
+
+        def __enter__(self):
+            return self._real_conn.__enter__()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._real_conn.__exit__(exc_type, exc_val, exc_tb)
+
+        @property
+        def row_factory(self):
+            return self._real_conn.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self._real_conn.row_factory = value
+
+    def fake_connect(*args, **kwargs):
+        nonlocal captured_real_conn
+        captured_real_conn = real_connect(*args, **kwargs)
+        return ConnectionProxy(captured_real_conn)
+
+    with patch('sqlite3.connect', side_effect=fake_connect):
+        with pytest.raises(RuntimeError, match='setup failed'):
+            with override_db._get_connection():
+                pass
+
+    assert captured_real_conn is not None
+    with pytest.raises(sqlite3.ProgrammingError, match='(?i)closed'):
+        captured_real_conn.execute('SELECT 1')

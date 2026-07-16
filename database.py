@@ -114,16 +114,16 @@ class Database:
     @contextlib.contextmanager
     def _get_connection(self): # type: ignore
         conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-
-        # Увімкнення WAL для конкурентного доступу
-        conn.execute('PRAGMA journal_mode=WAL;')
-        # Рекомендується з WAL для кращої швидкості без втрати надійності
-        conn.execute('PRAGMA synchronous=NORMAL;')
-        # Вмикаємо перевірку зовнішніх ключів на кожному з'єднанні
-        conn.execute('PRAGMA foreign_keys = ON;')
-
         try:
+            conn.row_factory = sqlite3.Row
+
+            # Увімкнення WAL для конкурентного доступу
+            conn.execute('PRAGMA journal_mode=WAL;')
+            # Рекомендується з WAL для кращої швидкості без втрати надійності
+            conn.execute('PRAGMA synchronous=NORMAL;')
+            # Вмикаємо перевірку зовнішніх ключів на кожному з'єднанні
+            conn.execute('PRAGMA foreign_keys = ON;')
+
             with conn:
                 yield conn
         finally:
