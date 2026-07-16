@@ -16,6 +16,7 @@ from database import Database
 import ai_engine as editor_module
 import main as bot_main
 import post_auditor as auditor_module
+import llm_provider
 from web_admin.main import app
 from polling_listener import (
     CancellationReason,
@@ -1532,7 +1533,7 @@ def test_START_06_recovery_runs_before_service_coroutines():
     with (
         patch.object(bot_main.db, "recover_stuck_drafts", side_effect=lambda: events.append("recovery")),
         patch.object(bot_main, "start_listener", new=lambda: service("listener")),
-        patch.object(bot_main, "ai_worker_loop", new=lambda: service("ai")),
+        patch.object(bot_main, "ai_worker_loop", new=lambda *, auditor_instance: service("ai")),
         patch.object(bot_main, "media_worker_loop", new=lambda: service("media")),
         patch.object(bot_main, "scheduler_loop", new=lambda: service("scheduler")),
         patch.object(bot_main, "start_web_admin", new=lambda: service("web")),
@@ -1549,10 +1550,13 @@ def test_START_07_main_does_not_swallow_critical_service_failure():
     async def complete():
         await asyncio.sleep(0)
 
+    async def complete_ai(*, auditor_instance):
+        await asyncio.sleep(0)
+
     with (
         patch.object(bot_main.db, "recover_stuck_drafts"),
         patch.object(bot_main, "start_listener", new=fail),
-        patch.object(bot_main, "ai_worker_loop", new=complete),
+        patch.object(bot_main, "ai_worker_loop", new=complete_ai),
         patch.object(bot_main, "media_worker_loop", new=complete),
         patch.object(bot_main, "scheduler_loop", new=complete),
         patch.object(bot_main, "start_web_admin", new=complete),
@@ -1710,7 +1714,7 @@ def test_PI_05_auditor_serializes_all_untrusted_fields():
         captured.update(kwargs)
         return SimpleNamespace(text=valid_audit_result(), model_used="test-model")
 
-    with patch.object(auditor_module.llm, "generate_with_metadata", side_effect=generate):
+    with patch.object(llm_provider.llm, "generate_with_metadata", side_effect=generate):
         result, model = auditor_module.PostAuditor().audit(attack, attack, attack)
     assert json.loads(captured["prompt"]) == {
         "original_source": attack, "candidate_post": attack, "retrieved_context": attack
@@ -1741,7 +1745,7 @@ def test_PI_08_untrusted_auditor_text_never_enters_system_prompt():
         captured.update(kwargs)
         return SimpleNamespace(text=valid_audit_result(), model_used="test-model")
 
-    with patch.object(auditor_module.llm, "generate_with_metadata", side_effect=generate):
+    with patch.object(llm_provider.llm, "generate_with_metadata", side_effect=generate):
         auditor_module.PostAuditor().audit(attack, "candidate", None)
     assert attack not in captured["system_prompt"]
     assert attack in captured["prompt"]

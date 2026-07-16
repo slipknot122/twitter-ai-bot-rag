@@ -1267,3 +1267,206 @@ def test_retry_cardinality_generate(
     # generate() wraps generate_with_metadata(), both have 3x retry
     # 3 (generate) * 3 (generate_with_metadata) * 3 (models loop) = 27
     assert call_count == 36
+
+# --- A3.3b: PostAuditor DI Migration ---
+
+import ai_worker
+import post_auditor
+
+class FakeGenerationProvider:
+    def __init__(self) -> None:
+        self.inputs: list[tuple[str, str, float | None]] = []
+
+    def generate_with_metadata(
+        self, prompt: str, system_prompt: str = "", temperature: float | None = None
+    ) -> llm_provider.LLMResult:
+        self.inputs.append((prompt, system_prompt, temperature))
+        return llm_provider.LLMResult(text='{"overall_score": 0.9, "recommendation": "APPROVE", "factual_fidelity": 1, "clarity": 1, "hook_strength": 1, "originality": 1, "persona_match": 1, "duplicate_risk": 0, "spam_risk": 0, "policy_risk": 0, "blocking_issues": [], "suggestions": [], "feedback": "good"}', model_used="fake-model")
+
+def test_post_auditor_preserves_provider_identity() -> None:
+    fake = FakeGenerationProvider()
+    auditor = post_auditor.PostAuditor(llm_provider=fake)
+    assert auditor._llm is fake
+
+def test_post_auditor_legacy_works() -> None:
+    auditor = post_auditor.PostAuditor()
+    assert auditor._llm is llm_provider.llm
+
+def test_post_auditor_constructor_no_network() -> None:
+    fake = FakeGenerationProvider()
+    auditor = post_auditor.PostAuditor(llm_provider=fake)
+    assert len(fake.inputs) == 0
+
+def test_post_auditor_audit_uses_injected() -> None:
+    fake = FakeGenerationProvider()
+    auditor = post_auditor.PostAuditor(llm_provider=fake)
+    auditor.audit("orig", "cand", None)
+    assert len(fake.inputs) == 1
+    assert fake.inputs[0][2] == 0.1
+
+from unittest.mock import patch
+
+def test_post_auditor_audit_explicit_over_fallback() -> None:
+    explicit_provider = FakeGenerationProvider()
+    auditor = post_auditor.PostAuditor(llm_provider=explicit_provider)
+
+    assert auditor._llm is explicit_provider
+
+    with patch("llm_provider.llm") as legacy_llm:
+        auditor.audit("orig", "cand", None)
+
+        assert len(explicit_provider.inputs) == 1
+        legacy_llm.generate_with_metadata.assert_not_called()
+
+def test_post_auditor_audit_exception_semantics() -> None:
+    source_error = RuntimeError("test error")
+
+    class ThrowingProvider:
+        def generate_with_metadata(self, prompt: str, system_prompt: str, temperature: float | None = None) -> llm_provider.LLMResult:
+            raise source_error
+
+    auditor = post_auditor.PostAuditor(llm_provider=ThrowingProvider())
+    from utils import classify_safe_error
+    expected_code = classify_safe_error(source_error)
+
+    with pytest.raises(post_auditor.AuditFailure) as exc_info:
+        auditor.audit("orig", "cand", None)
+
+    assert exc_info.value.code == expected_code
+    assert str(exc_info.value) == f"LLM error: {expected_code}"
+    assert exc_info.value.args == (f"LLM error: {expected_code}",)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is source_error
+
+def test_ai_worker_process_draft_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyDB:
+        def get_draft(self, draft_id: int) -> dict[str, Any]:
+            return {"status": "processing", "original_text": "orig"}
+        def complete_ai_processing(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    fake_auditor = post_auditor.PostAuditor(llm_provider=FakeGenerationProvider())
+
+    import ai_engine
+    monkeypatch.setattr(ai_engine.ai_engine, "process_text", lambda text: {"tweet_text": "cand", "action": "TWEET"})
+    monkeypatch.setattr(ai_worker, "validate_post_text", lambda text: text)
+
+    with patch.object(fake_auditor, "audit", wraps=fake_auditor.audit) as mock_audit:
+        ai_worker.process_draft(1, DummyDB(), auditor_instance=fake_auditor)
+        mock_audit.assert_called_once()
+
+def test_ai_worker_process_draft_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyDB:
+        def get_draft(self, draft_id: int) -> dict[str, Any]:
+            return {"status": "processing", "original_text": "orig"}
+        def complete_ai_processing(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    import ai_engine
+    monkeypatch.setattr(ai_engine.ai_engine, "process_text", lambda text: {"tweet_text": "cand", "action": "TWEET"})
+    monkeypatch.setattr(ai_worker, "validate_post_text", lambda text: text)
+
+    with patch("ai_worker.auditor") as mock_auditor:
+        mock_auditor.requires_revision.return_value = False
+        import json
+        mock_auditor.audit.return_value = (post_auditor.AuditResult(**json.loads('{"overall_score": 0.9, "recommendation": "APPROVE", "factual_fidelity": 1, "clarity": 1, "hook_strength": 1, "originality": 1, "persona_match": 1, "duplicate_risk": 0, "spam_risk": 0, "policy_risk": 0, "blocking_issues": [], "suggestions": [], "feedback": "good"}')), "model")
+        ai_worker.process_draft(1, DummyDB())
+        mock_auditor.audit.assert_called_once()
+
+def test_ai_worker_process_draft_explicit_over_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyDB:
+        def get_draft(self, draft_id: int) -> dict[str, Any]:
+            return {"status": "processing", "original_text": "orig"}
+        def complete_ai_processing(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    import ai_engine
+    monkeypatch.setattr(ai_engine.ai_engine, "process_text", lambda text: {"tweet_text": "cand", "action": "TWEET"})
+    monkeypatch.setattr(ai_worker, "validate_post_text", lambda text: text)
+
+    explicit_auditor = post_auditor.PostAuditor(llm_provider=FakeGenerationProvider())
+
+    with patch("ai_worker.auditor") as legacy_auditor, \
+         patch.object(explicit_auditor, "audit", wraps=explicit_auditor.audit) as mock_explicit_audit:
+
+        legacy_auditor.requires_revision.return_value = False
+        import json
+        legacy_auditor.audit.return_value = (post_auditor.AuditResult(**json.loads('{"overall_score": 0.9, "recommendation": "APPROVE", "factual_fidelity": 1, "clarity": 1, "hook_strength": 1, "originality": 1, "persona_match": 1, "duplicate_risk": 0, "spam_risk": 0, "policy_risk": 0, "blocking_issues": [], "suggestions": [], "feedback": "good"}')), "model")
+
+        ai_worker.process_draft(1, DummyDB(), auditor_instance=explicit_auditor)
+
+        mock_explicit_audit.assert_called_once()
+        legacy_auditor.audit.assert_not_called()
+        legacy_auditor.requires_revision.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_ai_worker_loop_passes_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_auditor = post_auditor.PostAuditor(llm_provider=FakeGenerationProvider())
+
+    class DummyDB:
+        def fetch_next_new_draft(self) -> dict[str, Any] | None:
+            return {"id": 1}
+
+    monkeypatch.setattr(ai_worker, "db", DummyDB())
+
+    passed_auditor = None
+
+    class StopLoop(BaseException):
+        pass
+
+    def fake_process_draft(draft_id: int, db_instance: Any, *, auditor_instance: Any) -> None:
+        nonlocal passed_auditor
+        passed_auditor = auditor_instance
+        raise StopLoop("stop loop")
+
+    monkeypatch.setattr(ai_worker, "process_draft", fake_process_draft)
+
+    import asyncio
+    async def dummy_sleep(delay: float) -> None:
+        pass
+    monkeypatch.setattr(asyncio, "sleep", dummy_sleep)
+
+    try:
+        await ai_worker.ai_worker_loop(auditor_instance=fake_auditor)
+    except StopLoop as e:
+        if str(e) != "stop loop":
+            raise
+
+    assert passed_auditor is fake_auditor
+
+@pytest.mark.asyncio
+async def test_main_bootstrap_passes_auditor() -> None:
+    captured: dict[str, object] = {}
+
+    async def inert_service() -> None:
+        return None
+
+    def make_inert_service(*args: Any, **kwargs: Any) -> Any:
+        return inert_service()
+
+    def fake_ai_worker_loop(*args: Any, auditor_instance: Any, **kwargs: Any) -> Any:
+        captured["auditor_instance"] = auditor_instance
+        return inert_service()
+
+    async def fake_run_service_tasks(services: list[tuple[str, Any]]) -> None:
+        for name, service_coro in services:
+            service_coro.close()
+
+    expected_auditor = object()
+
+    from unittest.mock import Mock
+
+    with patch("main.db") as mock_db, \
+         patch("main.start_listener", side_effect=make_inert_service), \
+         patch("main.media_worker_loop", side_effect=make_inert_service), \
+         patch("main.scheduler_loop", side_effect=make_inert_service), \
+         patch("main.start_web_admin", side_effect=make_inert_service), \
+         patch("main.ai_worker_loop", new=Mock(side_effect=fake_ai_worker_loop)), \
+         patch("main.PostAuditor", return_value=expected_auditor) as mock_post_auditor, \
+         patch("main.run_service_tasks", side_effect=fake_run_service_tasks):
+
+        from main import main as main_func, llm
+        await main_func()
+
+    mock_post_auditor.assert_called_once_with(llm_provider=llm)
+    assert captured["auditor_instance"] is expected_auditor

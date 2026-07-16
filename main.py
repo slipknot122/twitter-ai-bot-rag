@@ -9,6 +9,8 @@ from ai_worker import ai_worker_loop
 from scheduler import scheduler_loop
 from media_worker import media_worker_loop
 from web_admin.main import app as web_app
+from post_auditor import PostAuditor
+from llm_provider import llm
 
 # Налаштовуємо логування у файл
 logger.add("bot.log", rotation="10 MB", retention="7 days", encoding="utf-8")
@@ -42,9 +44,11 @@ async def main():
     # Recovery must complete before any listener or worker starts.
     db.recover_stuck_drafts()
 
+    prod_auditor = PostAuditor(llm_provider=llm)
+
     services = [
         ("TelegramListener", start_listener()),
-        ("AIWorker", ai_worker_loop()),
+        ("AIWorker", ai_worker_loop(auditor_instance=prod_auditor)),
         ("MediaWorker", media_worker_loop()),
         ("Scheduler", scheduler_loop()),
         ("WebAdmin", start_web_admin()),
