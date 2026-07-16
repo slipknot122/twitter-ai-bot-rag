@@ -3,7 +3,8 @@ import re
 from typing import List, Literal, Optional, Tuple, Annotated
 from pydantic import BaseModel, Field, ValidationError
 from loguru import logger
-from llm_provider import llm
+from llm_provider import LLMResult
+from typing import cast, Protocol
 from utils import classify_safe_error
 import os
 from config import settings
@@ -63,8 +64,27 @@ Return ONLY a valid JSON object matching this schema:
 Do not include any other text, markdown blocks, or explanation outside the JSON.
 """
 
+class TextGenerationProvider(Protocol):
+    def generate_with_metadata(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        temperature: float | None = None,
+    ) -> LLMResult:
+        ...
+
+_sentinel = object()
+
 class PostAuditor:
-    def __init__(self):
+    def __init__(
+        self,
+        llm_provider: TextGenerationProvider | object = _sentinel,
+    ) -> None:
+        if llm_provider is _sentinel:
+            from llm_provider import llm
+            llm_provider = llm
+
+        self._llm = cast(TextGenerationProvider, llm_provider)
         self.temperature = 0.1
         
     # Note: We rely on strict local Pydantic validation (AuditResult) instead of
@@ -121,7 +141,7 @@ class PostAuditor:
         prompt = json.dumps(payload, ensure_ascii=False)
 
         try:
-            llm_output = llm.generate_with_metadata(
+            llm_output = self._llm.generate_with_metadata(
                 prompt=prompt,
                 system_prompt=AUDITOR_SYSTEM_PROMPT,
                 temperature=self.temperature

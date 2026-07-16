@@ -14,7 +14,6 @@ def db():
     fd, path = tempfile.mkstemp()
     test_db = Database(db_path=path)
     yield test_db
-    test_db._get_connection().close()
     import os
     try:
         os.close(fd)
@@ -35,14 +34,14 @@ def test_semantic_memory_real_publish(mock_save, db):
     mark_draft_processing(db, draft_id)
     db.complete_ai_processing(draft_id, "approved", {"rewritten_text": "real tweet"})
     db.fetch_next_approved_draft_for_publish()
-    
+
     with patch.object(publisher, "dry_run", False), \
          patch.object(publisher, "client") as mock_client, \
          patch.object(publisher, "api_v1") as mock_api_v1, \
          patch("twitter_publisher.db", db):
         mock_client.create_tweet.return_value = MagicMock(data={"id": "123"})
         publisher.publish(draft_id, "real tweet")
-        
+
     mock_save.assert_called_once_with("real tweet")
     mock_client.create_tweet.assert_called_once()
     draft = db.get_draft(draft_id)
@@ -54,13 +53,13 @@ def test_semantic_memory_dry_run(mock_save, db):
     mark_draft_processing(db, draft_id)
     db.complete_ai_processing(draft_id, "approved", {"rewritten_text": "dry tweet"})
     db.fetch_next_approved_draft_for_publish()
-    
+
     with patch.object(publisher, "dry_run", True), \
          patch.object(publisher, "client") as mock_client, \
          patch.object(publisher, "api_v1") as mock_api_v1, \
          patch("twitter_publisher.db", db):
         publisher.publish(draft_id, "dry tweet")
-        
+
     mock_save.assert_not_called()
     mock_client.create_tweet.assert_not_called()
     draft = db.get_draft(draft_id)
@@ -72,16 +71,16 @@ def test_semantic_memory_save_failure_does_not_fail_publish(mock_save, db):
     mark_draft_processing(db, draft_id)
     db.complete_ai_processing(draft_id, "approved", {"rewritten_text": "real tweet"})
     db.fetch_next_approved_draft_for_publish()
-    
+
     mock_save.side_effect = Exception("Semantic DB down")
-    
+
     with patch.object(publisher, "dry_run", False), \
          patch.object(publisher, "client") as mock_client, \
          patch.object(publisher, "api_v1") as mock_api_v1, \
          patch("twitter_publisher.db", db):
         mock_client.create_tweet.return_value = MagicMock(data={"id": "123"})
         publisher.publish(draft_id, "real tweet")
-        
+
     mock_save.assert_called_once_with("real tweet")
     mock_client.create_tweet.assert_called_once()
     draft = db.get_draft(draft_id)
@@ -111,7 +110,7 @@ def test_admin_ui_xss_and_audit(override_db):
         "audit_result": audit_json,
         "audit_error_code": "safe_code"
     })
-    
+
     with patch("web_admin.main.db", override_db):
         response = client.get("/")
     assert response.status_code == 200
@@ -133,7 +132,7 @@ def test_admin_ui_invalid_audit_json(override_db):
         response = client.get("/")
     assert response.status_code == 200
     # Should gracefully handle invalid json
-    
+
 def test_admin_ui_legacy_null_audit(override_db):
     draft_id = override_db.add_message_and_draft("msg_legacy", "chan_legacy", "text")
     mark_draft_processing(override_db, draft_id)
@@ -144,3 +143,74 @@ def test_admin_ui_legacy_null_audit(override_db):
     with patch("web_admin.main.db", override_db):
         response = client.get("/")
     assert response.status_code == 200
+
+import sqlite3
+
+def test_connection_closes_after_success(override_db):
+    captured_connection = None
+    with override_db._get_connection() as conn:
+        captured_connection = conn
+        conn.execute("SELECT 1")
+
+    assert captured_connection is not None
+    with pytest.raises(sqlite3.ProgrammingError, match="(?i)closed"):
+        captured_connection.execute("SELECT 1")
+
+def test_connection_closes_after_exception(override_db):
+    captured_connection = None
+    class ExpectedError(Exception):
+        pass
+
+    with pytest.raises(ExpectedError):
+        with override_db._get_connection() as conn:
+            captured_connection = conn
+            raise ExpectedError("boom")
+
+    assert captured_connection is not None
+    with pytest.raises(sqlite3.ProgrammingError, match="(?i)closed"):
+        captured_connection.execute("SELECT 1")
+
+
+def test_connection_closes_when_setup_fails(override_db):
+    real_connect = sqlite3.connect
+    captured_real_conn = None
+
+    class ConnectionProxy:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+
+        def execute(self, sql, *args, **kwargs):
+            if 'PRAGMA journal_mode=WAL;' in sql:
+                raise RuntimeError('setup failed')
+            return self._real_conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self._real_conn.close()
+
+        def __enter__(self):
+            return self._real_conn.__enter__()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._real_conn.__exit__(exc_type, exc_val, exc_tb)
+
+        @property
+        def row_factory(self):
+            return self._real_conn.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self._real_conn.row_factory = value
+
+    def fake_connect(*args, **kwargs):
+        nonlocal captured_real_conn
+        captured_real_conn = real_connect(*args, **kwargs)
+        return ConnectionProxy(captured_real_conn)
+
+    with patch('sqlite3.connect', side_effect=fake_connect):
+        with pytest.raises(RuntimeError, match='setup failed'):
+            with override_db._get_connection():
+                pass
+
+    assert captured_real_conn is not None
+    with pytest.raises(sqlite3.ProgrammingError, match='(?i)closed'):
+        captured_real_conn.execute('SELECT 1')

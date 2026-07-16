@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from config import settings
+from runtime_types import TelegramConfig
 
 class ValidationError(Exception):
     pass
@@ -28,15 +29,51 @@ def validate_post_text(text: str, min_length: int = 10, max_length: int = 280) -
             
     return cleaned_text
 
-def is_telegram_configured(session_path_override: str = None) -> bool:
+def _normalize_legacy_api_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+def is_telegram_configured_from(config: TelegramConfig, *, session_path_override: str | Path | None = None) -> bool:
     """
-    Checks if Telegram is configured (API ID, API Hash, and session).
+    Explicit-input helper without environment or network access.
+    Uses only explicit inputs; may inspect an explicitly supplied path.
     """
-    if not settings.telegram_api_id or not settings.telegram_api_hash:
+    api_id = config.api_id
+    if api_id is None or api_id <= 0:
         return False
         
-    if settings.telegram_session_string:
+    api_hash = config.api_hash.strip() if config.api_hash else None
+    if not api_hash:
+        return False
+        
+    session_string = config.session_string.strip() if config.session_string else None
+    if session_string:
         return True
+        
+    if session_path_override is not None:
+        session_file = Path(session_path_override)
+        return session_file.is_file()
+        
+    return False
+
+def is_telegram_configured(session_path_override: str | Path | None = None) -> bool:
+    """
+    Checks if Telegram is configured (API ID, API Hash, and session).
+    Legacy wrapper around is_telegram_configured_from.
+    """
+    config = TelegramConfig(
+        api_id=_normalize_legacy_api_id(settings.telegram_api_id),
+        api_hash=settings.telegram_api_hash,
+        session_string=settings.telegram_session_string,
+    )
         
     # Check session file using absolute path from project root
     # or override for testing
@@ -48,7 +85,7 @@ def is_telegram_configured(session_path_override: str = None) -> bool:
         if not session_file.is_absolute():
             session_file = project_root / session_file
             
-    return session_file.exists()
+    return is_telegram_configured_from(config, session_path_override=session_file)
 
 def classify_safe_error(error: Exception) -> str:
     """

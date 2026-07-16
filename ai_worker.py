@@ -1,11 +1,18 @@
 import asyncio
 import json
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Protocol, cast, Optional
 from loguru import logger
 from database import db
 from ai_engine import ai_engine
 from post_auditor import auditor, AuditFailure
+import post_auditor
 from semantic_memory import semantic_memory
+
+class AuditProvider(Protocol):
+    def audit(self, original_text: str, candidate_text: str, rag_context: Optional[str]) -> Tuple[post_auditor.AuditResult, Optional[str]]: ...
+    def requires_revision(self, result: post_auditor.AuditResult, category: str = "NEWS") -> bool: ...
+
+_sentinel = object()
 from utils import validate_post_text, ValidationError
 from datetime import datetime, timezone
 from config import settings
@@ -86,11 +93,22 @@ def _revise_draft(original_text: str, candidate_text: str, blocking_issues: list
         logger.error(f"Revision LLM failed: {safe_code}")
         raise
 
-def process_draft(draft_id: int, db_instance):
+def process_draft(
+    draft_id: int,
+    db_instance,
+    *,
+    auditor_instance: AuditProvider | object = _sentinel,
+):
     """
     Process a single draft for Phase 3:
     generate -> validate -> audit -> optional one revision -> validate -> second audit -> atomic save -> review.
     """
+    if auditor_instance is _sentinel:
+        selected_auditor = auditor
+    else:
+        selected_auditor = auditor_instance
+    selected_auditor = cast(AuditProvider, selected_auditor)
+
     draft = db_instance.get_draft(draft_id)
     if not draft or draft['status'] != 'processing':
         return
@@ -150,7 +168,7 @@ def process_draft(draft_id: int, db_instance):
 
         # 3. First audit
         try:
-            first_audit, model_used = auditor.audit(original_text, candidate_text, None)
+            first_audit, model_used = selected_auditor.audit(original_text, candidate_text, None)
         except AuditFailure as af:
             media_req = settings.media_generation_enabled and not settings.twitter_dry_run and bool(image_prompt)
             db_instance.complete_ai_processing(draft_id, "review", {
@@ -166,7 +184,7 @@ def process_draft(draft_id: int, db_instance):
             return
 
         # 4. Determine if revision is needed
-        needs_revision = auditor.requires_revision(first_audit, category)
+        needs_revision = selected_auditor.requires_revision(first_audit, category)
         
         if not needs_revision:
             # Good first audit
@@ -227,7 +245,7 @@ def process_draft(draft_id: int, db_instance):
 
         # 6. Second audit
         try:
-            second_audit, model_used_2 = auditor.audit(original_text, revised_text, None)
+            second_audit, model_used_2 = selected_auditor.audit(original_text, revised_text, None)
         except AuditFailure as af:
             # Second audit failed technically, fallback to the original candidate
             mandatory_review = False
@@ -254,7 +272,7 @@ def process_draft(draft_id: int, db_instance):
             return
 
         # 7. Final processing after second audit
-        still_needs_revision = auditor.requires_revision(second_audit, category)
+        still_needs_revision = selected_auditor.requires_revision(second_audit, category)
         mandatory_review = False
         reason = "standard_routing"
         if trust_snapshot is not None and processing_mode_snapshot is not None:
@@ -283,7 +301,16 @@ def process_draft(draft_id: int, db_instance):
         logger.error(f"Processing failed for draft {draft_id}: {safe_code}")
         db_instance.complete_ai_processing(draft_id, "failed", {"last_error": safe_code, "audit_error_code": safe_code})
 
-async def ai_worker_loop():
+async def ai_worker_loop(
+    *,
+    auditor_instance: AuditProvider | object = _sentinel,
+):
+    if auditor_instance is _sentinel:
+        selected_auditor = auditor
+    else:
+        selected_auditor = auditor_instance
+    selected_auditor = cast(AuditProvider, selected_auditor)
+
     logger.info("AI Worker started and waiting for new messages in queue...")
     
     while True:
@@ -295,7 +322,7 @@ async def ai_worker_loop():
                 continue
                 
             draft_id = draft['id']
-            await asyncio.to_thread(process_draft, draft_id, db)
+            await asyncio.to_thread(process_draft, draft_id, db, auditor_instance=selected_auditor)
             
         except Exception as e:
             safe_code = classify_safe_error(e)
@@ -307,4 +334,7 @@ async def ai_worker_loop():
             continue
 
 if __name__ == "__main__":
-    asyncio.run(ai_worker_loop())
+    from llm_provider import llm
+    from post_auditor import PostAuditor
+    explicit_auditor = PostAuditor(llm_provider=llm)
+    asyncio.run(ai_worker_loop(auditor_instance=explicit_auditor))

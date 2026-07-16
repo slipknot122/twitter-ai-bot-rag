@@ -22,7 +22,7 @@ def normalize_telegram_id(raw) -> str:
     s = str(raw).strip()
     if not s:
         raise ValueError("Empty Telegram ID")
-        
+
     # Якщо вже має префікс -100
     if s.startswith('-100'):
         abs_part = s[4:]
@@ -33,21 +33,21 @@ def normalize_telegram_id(raw) -> str:
         if int(abs_part) == 0:
             raise ValueError(f"Telegram ID cannot be zero")
         return s
-        
+
     # Якщо починається з -, але не -100
     if s.startswith('-'):
         raise ValueError(f"Negative Telegram ID must start with -100")
-        
+
     # Має складатися лише з цифр (positive bare ID)
     if not s.isdigit() or not s:
         raise ValueError(f"Invalid Telegram ID")
-        
+
     if len(s) > 20:
         raise ValueError(f"Telegram ID too long")
-        
+
     if int(s) == 0:
         raise ValueError(f"Telegram ID cannot be zero")
-        
+
     return f"-100{s}"
 
 
@@ -110,24 +110,30 @@ class Database:
         self.db_path = db_path
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    import contextlib
+    @contextlib.contextmanager
+    def _get_connection(self): # type: ignore
         conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        
-        # Увімкнення WAL для конкурентного доступу
-        conn.execute('PRAGMA journal_mode=WAL;')
-        # Рекомендується з WAL для кращої швидкості без втрати надійності
-        conn.execute('PRAGMA synchronous=NORMAL;')
-        # Вмикаємо перевірку зовнішніх ключів на кожному з'єднанні
-        conn.execute('PRAGMA foreign_keys = ON;')
-        
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+
+            # Увімкнення WAL для конкурентного доступу
+            conn.execute('PRAGMA journal_mode=WAL;')
+            # Рекомендується з WAL для кращої швидкості без втрати надійності
+            conn.execute('PRAGMA synchronous=NORMAL;')
+            # Вмикаємо перевірку зовнішніх ключів на кожному з'єднанні
+            conn.execute('PRAGMA foreign_keys = ON;')
+
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         """Ініціалізація таблиць та міграції."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            
+
             # 1. Schema migration
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS processed_messages (
@@ -138,7 +144,7 @@ class Database:
                     UNIQUE(source_id, source_channel)
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,7 +159,7 @@ class Database:
                     FOREIGN KEY (processed_message_id) REFERENCES processed_messages (id)
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS published_tweets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,7 +169,7 @@ class Database:
                     FOREIGN KEY (draft_id) REFERENCES drafts (id)
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
@@ -171,7 +177,7 @@ class Database:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS semantic_memory (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,7 +186,7 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS migration_conflicts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,10 +199,10 @@ class Database:
                     UNIQUE(migration_name, source_table, source_row_id)
                 )
             ''')
-            
+
             cursor.execute("PRAGMA table_info(drafts)")
             existing_columns = {row['name'] for row in cursor.fetchall()}
-            
+
             new_columns = {
                 "scheduled_at": "DATETIME NULL",
                 "retry_count": "INTEGER DEFAULT 0",
@@ -227,13 +233,13 @@ class Database:
                     cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col_name} {col_def}")
 
             conn.commit()
-            
+
             # Транзакція для логічних міграцій
             cursor.execute('BEGIN IMMEDIATE')
-            
+
             # 2. Pending migration
             cursor.execute("UPDATE drafts SET status = 'review' WHERE status = 'pending'")
-            
+
             # 3. Duplicate backup/deduplication
 
             # Note: published_tweets has published_at, not created_at, fixing ORDER BY to published_at
@@ -283,7 +289,7 @@ class Database:
             # 4. Phase 3 Migration
             cursor.execute("PRAGMA table_info(drafts)")
             existing_columns = {row['name'] for row in cursor.fetchall()}
-            
+
             phase3_columns = {
                 "audit_status": "TEXT DEFAULT NULL",
                 "audit_decision": "TEXT DEFAULT NULL",
@@ -294,30 +300,30 @@ class Database:
                 "audited_at": "TIMESTAMP DEFAULT NULL",
                 "revision_count": "INTEGER NOT NULL DEFAULT 0"
             }
-            
+
             for col_name, col_def in phase3_columns.items():
                 if col_name not in existing_columns:
                     cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col_name} {col_def}")
-                    
+
             # 5. Unique indexes creation
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_created ON drafts(status, created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_status_scheduled ON drafts(status, scheduled_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drafts_media_status_requested ON drafts(media_status, media_requested_at)')
             cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_tweet_id ON published_tweets(tweet_id)')
             cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_published_tweets_draft_id ON published_tweets(draft_id)')
-            
+
             conn.commit()
-            
+
             # 6. Transient status recovery
             self._recover_stuck_drafts(cursor)
             conn.commit()
 
             # 7. Phase 5 migration — sources та snapshot-колонки
             self._migrate_phase5(cursor, conn)
-            
+
             # 8. Phase 6 migration — ingestion state та leases
             self._migrate_phase6(cursor, conn)
-            
+
             logger.debug(f"Database initialized at {self.db_path}")
 
             if self.get_setting("publish_delay_minutes") is None:
@@ -332,6 +338,14 @@ class Database:
                 self.set_setting("semantic_top_k", 2)
             if self.get_setting("minimum_similarity") is None:
                 self.set_setting("minimum_similarity", 0.82)
+
+    def recover_stuck_drafts(self) -> None:
+        """Recover transient draft states in an explicit startup transaction."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            self._recover_stuck_drafts(cursor)
+            conn.commit()
 
     def _recover_stuck_drafts(self, cursor: sqlite3.Cursor):
         cursor.execute("UPDATE drafts SET status = 'new', updated_at = CURRENT_TIMESTAMP WHERE status = 'processing'")
@@ -414,7 +428,7 @@ class Database:
     def _migrate_phase6(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection):
         """Міграція Phase 6: worker_leases, source_poll_state, drafts publication fields."""
         cursor.execute('BEGIN IMMEDIATE')
-        
+
         # a) worker_leases
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS worker_leases (
@@ -425,7 +439,7 @@ class Database:
                 expires_at TIMESTAMP NOT NULL
             )
         ''')
-        
+
         # b) source_poll_state
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS source_poll_state (
@@ -448,11 +462,11 @@ class Database:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
+
         # c) drafts update
         cursor.execute("PRAGMA table_info(drafts)")
         existing_columns = {row['name'] for row in cursor.fetchall()}
-        
+
         phase6_columns = {
             "source_published_at": "TIMESTAMP NULL",
             "source_updated_at": "TIMESTAMP NULL"
@@ -460,49 +474,49 @@ class Database:
         for col_name, col_def in phase6_columns.items():
             if col_name not in existing_columns:
                 cursor.execute(f"ALTER TABLE drafts ADD COLUMN {col_name} {col_def}")
-                
+
         # Fill poll state for active rss/website sources
         cursor.execute("""
             INSERT OR IGNORE INTO source_poll_state (source_id, next_poll_at)
-            SELECT id, CURRENT_TIMESTAMP FROM sources 
+            SELECT id, CURRENT_TIMESTAMP FROM sources
             WHERE source_type IN ('rss', 'website')
         """)
-                
+
         conn.commit()
 
     def _transition_draft(self, conn: sqlite3.Connection, draft_id: int, expected_statuses: Set[str], new_status: str, updates: dict = None) -> bool:
         cursor = conn.cursor()
-        
+
         expected_tuple = tuple(expected_statuses)
-        
+
         # Check current status
         cursor.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,))
         row = cursor.fetchone()
         if not row:
             return False
-            
+
         current_status = row['status']
         if current_status not in expected_tuple:
             return False
-            
+
         if (current_status, new_status) not in ALLOWED_TRANSITIONS:
             raise InvalidStateTransitionError(f"Forbidden transition: {current_status} -> {new_status}")
-            
+
         updates = updates or {}
         for k in updates.keys():
             if k not in ALLOWED_UPDATE_COLUMNS:
                 raise InvalidUpdateColumnError(f"Column '{k}' is not in allowlist.")
-                
+
         set_clauses = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
         params = [new_status]
-        
+
         for k, v in updates.items():
             set_clauses.append(f"{k} = ?")
             params.append(v)
-            
+
         params.extend([draft_id] + list(expected_tuple))
         placeholders = ",".join(["?"] * len(expected_tuple))
-        
+
         query = f"UPDATE drafts SET {', '.join(set_clauses)} WHERE id = ? AND status IN ({placeholders})"
         cursor.execute(query, params)
         return cursor.rowcount == 1
@@ -539,7 +553,7 @@ class Database:
                     (str(source_id), str(source_channel))
                 )
                 processed_id = cursor.lastrowid
-                
+
                 cursor.execute(
                     "INSERT INTO drafts (processed_message_id, original_text, status) VALUES (?, ?, 'new')",
                     (processed_id, original_text)
@@ -576,7 +590,7 @@ class Database:
                         )
                       )
                   ) DESC,
-                  created_at ASC,
+                  julianday(created_at) ASC,
                   id ASC
                 LIMIT 1
             """)
@@ -584,12 +598,12 @@ class Database:
             if not row:
                 return None
             draft_id = row['id']
-            
+
             success = self._transition_draft(conn, draft_id, {"new"}, "processing")
             if not success:
                 conn.rollback()
                 return None
-                
+
             cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
             draft = cursor.fetchone()
             conn.commit()
@@ -618,7 +632,7 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    UPDATE drafts 
+                    UPDATE drafts
                     SET media_status = 'pending',
                         media_generation_token = ?,
                         media_requested_at = ?,
@@ -635,7 +649,7 @@ class Database:
                 )
                 if cursor.rowcount == 0:
                     success = False
-            
+
             if success:
                 conn.commit()
             else:
@@ -669,12 +683,12 @@ class Database:
             if not row:
                 return None
             draft_id = row['id']
-            
+
             success = self._transition_draft(conn, draft_id, {"approved"}, "publishing")
             if not success:
                 conn.rollback()
                 return None
-                
+
             cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
             draft = cursor.fetchone()
             conn.commit()
@@ -689,13 +703,13 @@ class Database:
                 if not success:
                     conn.rollback()
                     raise AmbiguousPublishStateError(f"Draft {draft_id} is not in publishing state.")
-                
+
                 cursor.execute(
                     "UPDATE drafts SET media_status = 'cancelled', media_generation_token = NULL "
                     "WHERE id = ? AND media_status IN ('pending', 'generating')",
                     (draft_id,)
                 )
-                    
+
                 cursor.execute(
                     "INSERT INTO published_tweets (draft_id, tweet_id) VALUES (?, ?)",
                     (draft_id, str(tweet_id))
@@ -712,20 +726,20 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             conn.execute('BEGIN IMMEDIATE')
-            
+
             cursor.execute("SELECT retry_count FROM drafts WHERE id = ?", (draft_id,))
             row = cursor.fetchone()
             if not row:
                 return False
             current_retry = row['retry_count'] + 1
-            
+
             success = self._transition_draft(
-                conn, 
-                draft_id, 
-                {"publishing"}, 
-                "approved", 
+                conn,
+                draft_id,
+                {"publishing"},
+                "approved",
                 {
-                    "scheduled_at": scheduled_at_str, 
+                    "scheduled_at": scheduled_at_str,
                     "retry_count": current_retry,
                     "last_error": error_msg,
                     "last_retry_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -738,10 +752,10 @@ class Database:
         with self._get_connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             success = self._transition_draft(
-                conn, 
-                draft_id, 
-                {"publishing"}, 
-                "failed", 
+                conn,
+                draft_id,
+                {"publishing"},
+                "failed",
                 {
                     "last_error": error_msg,
                     "retry_count": 0
@@ -782,23 +796,23 @@ class Database:
             cursor = conn.cursor()
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             cursor.execute("BEGIN IMMEDIATE")
-            
+
             cursor.execute("SELECT id, media_attempt_count, media_path FROM drafts WHERE media_status = 'generating' AND media_lease_expires_at < ?", (now_iso,))
             expired_rows = cursor.fetchall()
             if not expired_rows:
                 return 0
-                
+
             for row in expired_rows:
                 draft_id = row["id"]
                 attempts = row["media_attempt_count"]
                 old_media_path = row["media_path"]
                 new_token = str(uuid.uuid4())
-                
+
                 if attempts >= max_attempts:
                     new_status = 'ready' if old_media_path else 'failed'
                     cursor.execute(
                         """
-                        UPDATE drafts 
+                        UPDATE drafts
                         SET media_status = ?,
                             media_error_code = 'timeout',
                             media_error_message = 'Max attempts reached due to lease expiration',
@@ -814,7 +828,7 @@ class Database:
                     next_attempt = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)).isoformat()
                     cursor.execute(
                         """
-                        UPDATE drafts 
+                        UPDATE drafts
                         SET media_status = 'pending',
                             media_generation_token = ?,
                             media_started_at = NULL,
@@ -833,15 +847,15 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            
+
             cursor.execute("SELECT media_status, image_prompt FROM drafts WHERE id = ?", (draft_id,))
             row = cursor.fetchone()
             if not row:
                 conn.rollback()
                 return "NOT_FOUND"
-                
+
             status = row['media_status']
-            
+
             # Action guards
             if action == "generate" and status not in ('none', 'cancelled'):
                 conn.rollback()
@@ -852,7 +866,7 @@ class Database:
             if action == "regenerate" and status != 'ready':
                 conn.rollback()
                 return "CONFLICT"
-                
+
             # Prompt invariants
             final_prompt = prompt if prompt is not None else row['image_prompt']
             if not final_prompt or not final_prompt.strip():
@@ -862,13 +876,13 @@ class Database:
             if len(final_prompt) < 20 or len(final_prompt) > 1500:
                 conn.rollback()
                 return "INVALID_PROMPT"
-                
+
             new_token = str(uuid.uuid4())
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            
+
             cursor.execute(
                 """
-                UPDATE drafts 
+                UPDATE drafts
                 SET media_status = 'pending',
                     image_prompt = ?,
                     media_generation_token = ?,
@@ -882,7 +896,7 @@ class Database:
                 """,
                 (final_prompt, new_token, now_iso, draft_id)
             )
-            
+
             success = cursor.rowcount == 1
             if success:
                 conn.commit()
@@ -897,7 +911,7 @@ class Database:
             cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
                 """
-                UPDATE drafts 
+                UPDATE drafts
                 SET media_status = 'cancelled',
                     media_generation_token = NULL
                 WHERE id = ? AND media_status IN ('pending', 'generating')
@@ -916,22 +930,22 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            
+
             cursor.execute("SELECT media_path, media_status FROM drafts WHERE id = ?", (draft_id,))
             row = cursor.fetchone()
             if not row:
                 conn.rollback()
                 return "NOT_FOUND"
-                
+
             if row["media_status"] in ('generating', 'pending'):
                 conn.rollback()
                 return "CONFLICT"
-                
+
             old_path = row["media_path"]
-            
+
             cursor.execute(
                 """
-                UPDATE drafts 
+                UPDATE drafts
                 SET media_status = 'none',
                     media_path = NULL,
                     media_provider = NULL,
@@ -949,7 +963,7 @@ class Database:
                 """,
                 (draft_id,)
             )
-            
+
             success = cursor.rowcount == 1
             if success:
                 conn.commit()
@@ -972,13 +986,13 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            
+
             cursor.execute(
                 """
-                SELECT id FROM drafts 
-                WHERE media_status = 'pending' 
+                SELECT id FROM drafts
+                WHERE media_status = 'pending'
                   AND (media_next_attempt_at IS NULL OR media_next_attempt_at <= ?)
-                ORDER BY media_requested_at ASC, id ASC 
+                ORDER BY media_requested_at ASC, id ASC
                 LIMIT 1
                 """,
                 (now_iso,)
@@ -987,14 +1001,14 @@ class Database:
             if not row:
                 conn.rollback()
                 return None
-                
+
             draft_id = row["id"]
             new_token = str(uuid.uuid4())
             expires_at = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=timeout_seconds)).isoformat()
-            
+
             cursor.execute(
                 """
-                UPDATE drafts 
+                UPDATE drafts
                 SET media_status = 'generating',
                     media_generation_token = ?,
                     media_started_at = ?,
@@ -1004,11 +1018,11 @@ class Database:
                 """,
                 (new_token, now_iso, expires_at, draft_id)
             )
-            
+
             if cursor.rowcount != 1:
                 conn.rollback()
                 return None
-                
+
             cursor.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
             claimed_row = cursor.fetchone()
             conn.commit()
@@ -1018,19 +1032,19 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            
+
             cursor.execute("SELECT media_path FROM drafts WHERE id = ? AND media_status = 'generating' AND media_generation_token = ?", (draft_id, token))
             row = cursor.fetchone()
             if not row:
                 conn.rollback()
                 return False
-                
+
             old_media_path = row['media_path']
             new_media_path = meta.get("media_path")
-            
+
             cursor.execute(
                 """
-                UPDATE drafts 
+                UPDATE drafts
                 SET media_status = 'ready',
                     media_generation_token = NULL,
                     media_path = ?,
@@ -1065,20 +1079,20 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            
+
             cursor.execute(
                 "SELECT media_attempt_count, media_path FROM drafts WHERE id = ? AND media_status = 'generating' AND media_generation_token = ?",
                 (draft_id, token)
             )
             row = cursor.fetchone()
-            
+
             if not row:
                 conn.rollback()
                 return False
-                
+
             attempt_count = row['media_attempt_count']
             old_media_path = row['media_path']
-            
+
             if is_transient and attempt_count < max_attempts:
                 import uuid
                 # Exponential backoff: 30s, 60s, 120s
@@ -1087,7 +1101,7 @@ class Database:
                 new_token = str(uuid.uuid4())
                 cursor.execute(
                     """
-                    UPDATE drafts 
+                    UPDATE drafts
                     SET media_status = 'pending',
                         media_generation_token = ?,
                         media_next_attempt_at = ?,
@@ -1101,7 +1115,7 @@ class Database:
                 new_status = 'ready' if old_media_path else 'failed'
                 cursor.execute(
                     """
-                    UPDATE drafts 
+                    UPDATE drafts
                     SET media_status = ?,
                         media_generation_token = NULL,
                         media_error_code = ?,
@@ -1110,7 +1124,7 @@ class Database:
                     """,
                     (new_status, error_code, error_message, draft_id, token)
                 )
-                
+
             success = cursor.rowcount == 1
             if success:
                 conn.commit()
@@ -1121,19 +1135,19 @@ class Database:
     def get_analytics(self) -> Dict[str, Any]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            
+
             cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE date(created_at) = date('now')")
             total_today = cursor.fetchone()['c']
-            
+
             cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE status IN ('published', 'approved', 'publishing') AND date(updated_at) = date('now')")
             published_today = cursor.fetchone()['c']
-            
+
             cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE status IN ('ignored', 'failed') AND date(updated_at) = date('now')")
             ignored_today = cursor.fetchone()['c']
-            
+
             cursor.execute("SELECT COUNT(*) as c FROM drafts WHERE status IN ('review')")
             pending_total = cursor.fetchone()['c']
-            
+
             return {
                 "total_today": total_today,
                 "published_today": published_today,
@@ -1207,8 +1221,8 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             query = """
-                SELECT s.*, 
-                       p.collector_status, p.last_error_code, p.consecutive_errors, 
+                SELECT s.*,
+                       p.collector_status, p.last_error_code, p.consecutive_errors,
                        p.last_attempt_at, p.last_success_at, p.next_poll_at
                 FROM sources s
                 LEFT JOIN source_poll_state p ON s.id = p.source_id
@@ -1427,11 +1441,11 @@ class Database:
         now = datetime.datetime.now(datetime.timezone.utc)
         expires = (now + datetime.timedelta(seconds=duration_sec)).isoformat()
         now_str = now.isoformat()
-        
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             conn.execute('BEGIN IMMEDIATE')
-            
+
             cursor.execute("SELECT lease_token, expires_at FROM worker_leases WHERE id = 1")
             row = cursor.fetchone()
             if row:
@@ -1455,7 +1469,7 @@ class Database:
         now = datetime.datetime.now(datetime.timezone.utc)
         expires = (now + datetime.timedelta(seconds=duration_sec)).isoformat()
         now_str = now.isoformat()
-        
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -1476,24 +1490,24 @@ class Database:
         now = datetime.datetime.now(datetime.timezone.utc)
         now_str = now.isoformat()
         expires = (now + datetime.timedelta(seconds=source_lease_sec)).isoformat()
-        
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             conn.execute('BEGIN IMMEDIATE')
-            
+
             # 1. Verify global lease
             cursor.execute("SELECT expires_at FROM worker_leases WHERE id = 1 AND lease_token = ?", (global_token,))
             gw = cursor.fetchone()
             if not gw or gw['expires_at'] <= now_str:
                 conn.rollback()
                 return None
-                
+
             # 2. Find eligible source
             cursor.execute("""
                 SELECT p.source_id, p.next_poll_at, p.collector_status, p.resolved_feed_url, s.source_type, s.is_active, s.canonical_url
                 FROM source_poll_state p
                 JOIN sources s ON p.source_id = s.id
-                WHERE s.is_active = 1 
+                WHERE s.is_active = 1
                   AND s.source_type IN ('rss', 'website')
                   AND p.collector_status != 'unsupported'
                   AND p.next_poll_at <= ?
@@ -1501,17 +1515,17 @@ class Database:
                 ORDER BY p.next_poll_at ASC
                 LIMIT 1
             """, (now_str, now_str))
-            
+
             row = cursor.fetchone()
             if not row:
                 conn.rollback()
                 return None
-                
+
             source_id = row['source_id']
             source_type = row['source_type']
             canonical_url = row['canonical_url']
             resolved_feed_url = row['resolved_feed_url']
-            
+
             if source_type == 'rss':
                 claimed_mode = 'rss'
                 claimed_target = canonical_url
@@ -1522,19 +1536,19 @@ class Database:
                 else:
                     claimed_mode = 'website feed'
                     claimed_target = resolved_feed_url
-            
+
             # 3. Claim it
             import uuid
             source_token = str(uuid.uuid4())
             cursor.execute("""
-                UPDATE source_poll_state 
+                UPDATE source_poll_state
                 SET lease_token = ?, lease_expires_at = ?, collector_status = CASE WHEN collector_status = 'idle' THEN 'polling' ELSE collector_status END
                 WHERE source_id = ?
             """, (source_token, expires, source_id))
-            
+
             # Fetch complete row
             cursor.execute("""
-                SELECT p.*, s.source_type, s.external_id, s.name, s.priority, s.trust_rating, s.processing_mode, s.canonical_url 
+                SELECT p.*, s.source_type, s.external_id, s.name, s.priority, s.trust_rating, s.processing_mode, s.canonical_url
                 FROM source_poll_state p
                 JOIN sources s ON p.source_id = s.id
                 WHERE p.source_id = ?
@@ -1542,14 +1556,14 @@ class Database:
             full_row = dict(cursor.fetchone())
             full_row['claimed_mode'] = claimed_mode
             full_row['claimed_target'] = claimed_target
-            
+
             conn.commit()
             return full_row
 
     def complete_source_poll(self, global_token: str, source_id: int, source_token: str, claimed_mode: str, claimed_target: str, outcome_updates: dict, drafts_to_insert: List[dict] = None) -> bool:
         import datetime
         now_str = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        
+
         allowed_fields = {
             'collector_status', 'last_error_code', 'consecutive_errors',
             'last_attempt_at', 'last_success_at', 'next_poll_at',
@@ -1567,7 +1581,7 @@ class Database:
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            
+
             # Check draft limit BEFORE BEGIN IMMEDIATE
             if drafts_to_insert:
                 cursor.execute("SELECT initial_sync_completed_at FROM source_poll_state WHERE source_id = ?", (source_id,))
@@ -1576,11 +1590,11 @@ class Database:
                     limit = 10 if st['initial_sync_completed_at'] is None else 50
                     if len(drafts_to_insert) > limit:
                         raise ValueError(f"drafts_to_insert exceeds limit of {limit}")
-            
+
             conn.execute('BEGIN IMMEDIATE')
-            
+
             cursor.execute("""
-                SELECT 
+                SELECT
                     w.expires_at as gw_expires,
                     p.lease_token as src_token,
                     p.lease_expires_at as src_expires,
@@ -1595,27 +1609,25 @@ class Database:
                 WHERE w.id = 1 AND w.lease_token = ?
             """, (source_id, global_token))
             row = cursor.fetchone()
-            
+
             if not row:
                 conn.rollback()
                 return False # Global lease not found or mismatched
-                
+
             if row['gw_expires'] <= now_str:
                 conn.rollback()
                 return False # Global lease expired
-                
+
             if not row['src_token']:
                 conn.rollback()
                 return False # Source not found
-                
+
             if row['src_token'] != source_token or row['src_expires'] <= now_str:
                 conn.rollback()
                 return False # Stale worker or expired source lease
-                
+
             if row['is_active'] == 0 or row['source_type'] not in ('rss', 'website'):
-                # Still clear lease if we own it but it became invalid
-                cursor.execute("UPDATE source_poll_state SET lease_token = NULL, lease_expires_at = NULL WHERE source_id = ?", (source_id,))
-                conn.commit()
+                conn.rollback()
                 return False
 
             if row['source_type'] == 'rss':
@@ -1628,62 +1640,71 @@ class Database:
                 else:
                     current_mode = 'website feed'
                     current_target = row['resolved_feed_url']
-                    
+
             if current_mode != claimed_mode or current_target != claimed_target:
                 conn.rollback()
                 return False
-                
+
+            # V-18: Clear validators if discovery target changes
+            if 'resolved_feed_url' in outcome_updates:
+                if outcome_updates['resolved_feed_url'] != row['resolved_feed_url']:
+                    outcome_updates['etag'] = None
+                    outcome_updates['last_modified'] = None
+                    outcome_updates['validator_url'] = None
+
             set_clauses = ["lease_token = NULL", "lease_expires_at = NULL", "updated_at = CURRENT_TIMESTAMP"]
             params = []
             for k, v in outcome_updates.items():
                 set_clauses.append(f"{k} = ?")
                 params.append(v)
-                
+
             set_clauses_str = ", ".join(set_clauses)
             params.append(source_id)
-            cursor.execute(f"UPDATE source_poll_state SET {set_clauses_str} WHERE source_id = ?", params)
-            
-            if drafts_to_insert:
-                cursor.execute(
-                    "SELECT name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
-                    (source_id,)
-                )
-                src_meta = cursor.fetchone()
-                
-                for draft in drafts_to_insert:
-                    try:
+            try:
+                cursor.execute(f"UPDATE source_poll_state SET {set_clauses_str} WHERE source_id = ?", params)
+
+                if drafts_to_insert:
+                    cursor.execute(
+                        "SELECT name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
+                        (source_id,)
+                    )
+                    src_meta = cursor.fetchone()
+
+                    for draft in drafts_to_insert:
                         cursor.execute("""
                             INSERT INTO drafts (
-                                original_text, status, source_id, source_name_snapshot, 
-                                source_priority_snapshot, source_trust_snapshot, 
+                                original_text, status, source_id, source_name_snapshot,
+                                source_priority_snapshot, source_trust_snapshot,
                                 source_processing_mode_snapshot, source_item_id,
                                 source_published_at, source_updated_at, created_at, updated_at
                             ) VALUES (?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(source_id, source_item_id) DO NOTHING
                         """, (
                             draft['original_text'], source_id, src_meta['name'],
                             src_meta['priority'], src_meta['trust_rating'], src_meta['processing_mode'],
                             draft['source_item_id'], draft.get('source_published_at'), draft.get('source_updated_at'),
                             now_str, now_str
                         ))
-                    except sqlite3.IntegrityError:
-                        pass
-                        
-            conn.commit()
-            return True
-            
+
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                raise
+
     def get_poll_state(self, source_id: int) -> Optional[dict]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM source_poll_state WHERE source_id = ?", (source_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
-            
+
     def poll_now(self, source_id: int) -> str:
         """API method to enqueue immediate poll. Returns 'queued', 'missing', or 'conflict'"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             conn.execute('BEGIN IMMEDIATE')
-            
+
             cursor.execute("""
                 SELECT p.collector_status, p.lease_token, s.is_active, s.source_type
                 FROM source_poll_state p
@@ -1691,22 +1712,22 @@ class Database:
                 WHERE p.source_id = ?
             """, (source_id,))
             row = cursor.fetchone()
-            
+
             if not row:
                 conn.rollback()
                 return "missing"
-                
+
             if row['is_active'] == 0 or row['source_type'] not in ('rss', 'website'):
                 conn.rollback()
                 return "conflict"
-                
+
             if row['lease_token'] is not None:
                 conn.rollback()
                 return "conflict" # Already polling
-                
+
             # Allow unsupported website to be retried
             cursor.execute("""
-                UPDATE source_poll_state 
+                UPDATE source_poll_state
                 SET next_poll_at = CURRENT_TIMESTAMP, collector_status = 'queued', updated_at = CURRENT_TIMESTAMP
                 WHERE source_id = ?
             """, (source_id,))
