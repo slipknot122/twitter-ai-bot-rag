@@ -43,6 +43,15 @@ VALID_FEED = (
     b'<item><guid>1</guid><title>Entry</title></item></channel></rss>'
 )
 
+TEST_CHANNEL_ID = "-1009999999999"
+
+
+@pytest.fixture(autouse=True)
+def deterministic_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("database.settings.telegram_channels", [TEST_CHANNEL_ID])
+
 
 class FakeResolver:
     def __init__(self) -> None:
@@ -414,7 +423,7 @@ def test_CP_matrix_has_exact_explicit_inventory(request):
     }
     collected = {
         name.removeprefix("test_")[:5].replace("_", "-")
-        for name, value in vars(request.module).items()
+        for name, value in list(vars(request.module).items())
         if name.startswith("test_CP_") and asyncio.iscoroutinefunction(value)
     }
     assert collected == expected
@@ -1247,20 +1256,31 @@ def test_DB_add_source_validation_precedes_write(tmp_path, overrides, message):
     values.update(overrides)
     with pytest.raises(ValueError, match=message):
         database.add_source(**values)
-    assert database.get_sources() == []
+    sources = database.get_sources()
+    sources_by_identity = {(s["source_type"], s["external_id"]): s for s in sources}
+    assert len(sources_by_identity) == 1
+    assert ("telegram", TEST_CHANNEL_ID) in sources_by_identity
 
 
 def test_DB_09_duplicate_source_rolls_back(tmp_path):
     database, source_id = make_polling_db(tmp_path)
     with pytest.raises(sqlite3.IntegrityError):
         database.add_source("rss", "https://example.com/feed", "Duplicate", "https://example.com/feed")
-    assert [source["id"] for source in database.get_sources()] == [source_id]
+    sources = database.get_sources()
+    sources_by_identity = {(s["source_type"], s["external_id"]): s for s in sources}
+    assert len(sources_by_identity) == 2
+    assert ("telegram", TEST_CHANNEL_ID) in sources_by_identity
+    assert ("rss", "https://example.com/feed") in sources_by_identity
+    assert sources_by_identity[("rss", "https://example.com/feed")]["id"] == source_id
 
 
 def test_DB_10_missing_update_is_noop(tmp_path):
     database = Database(str(tmp_path / "missing.db"))
     assert database.update_source(999, {"name": "Missing"}) is None
-    assert database.get_sources() == []
+    sources = database.get_sources()
+    sources_by_identity = {(s["source_type"], s["external_id"]): s for s in sources}
+    assert len(sources_by_identity) == 1
+    assert ("telegram", TEST_CHANNEL_ID) in sources_by_identity
 
 
 def test_DB_11_disallowed_update_precedes_transaction(tmp_path):
