@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import datetime
 import gzip
 import json
@@ -425,7 +426,7 @@ def test_CP_matrix_has_exact_explicit_inventory(request):
     collected = {
         name.removeprefix("test_")[:5].replace("_", "-")
         for name, value in list(vars(request.module).items())
-        if name.startswith("test_CP_") and asyncio.iscoroutinefunction(value)
+        if name.startswith("test_CP_") and inspect.iscoroutinefunction(value)
     }
     assert collected == expected
 

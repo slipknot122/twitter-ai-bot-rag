@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from loguru import logger
 from database import db, AmbiguousPublishStateError
 from typing import Callable, Any
@@ -39,7 +40,7 @@ class RetryManager:
 
         try:
             # Виклик функції (може бути синхронною, тому обгортаємо)
-            if asyncio.iscoroutinefunction(func):
+            if inspect.iscoroutinefunction(func):
                 await func()
             else:
                 await asyncio.to_thread(func)
