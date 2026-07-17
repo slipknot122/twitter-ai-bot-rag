@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="uk">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Auditor Controls</title>
+    <title>Налаштування AI-аудитора</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -61,75 +61,77 @@
     <main class="shell">
         <header class="topbar">
             <div>
-                <span class="eyebrow">Quality control</span>
-                <h1>AI Auditor</h1>
-                <p>Adjust review policy without weakening locked schema and prompt-injection protections.</p>
+                <span class="eyebrow">Контроль якості</span>
+                <h1>AI-аудитор</h1>
+                <p>Налаштовуйте правила перевірки, не послаблюючи захист структури та захист від ін’єкцій у промпт.</p>
             </div>
-            <nav class="nav" aria-label="Admin navigation">
-                <a href="/">Dashboard</a>
-                <a href="/settings">Bot settings</a>
-                <a href="/status">System status</a>
+            <nav class="nav" aria-label="Навігація адміністратора">
+                <a href="/">Панель</a>
+                <a href="/settings">Налаштування бота</a>
+                <a href="/auditor" aria-current="page">AI-аудитор</a>
+                <a href="/status">Стан системи</a>
+                <a href="/logs">Журнал</a>
             </nav>
         </header>
 
-        <section class="notice" aria-label="Runtime behavior">
+        <section class="notice" aria-label="Застосування налаштувань">
             <div>
-                <strong>Changes apply immediately to the next draft.</strong>
-                <p>Each draft keeps one configuration snapshot for its first audit, revision, and final audit.</p>
+                <strong>Зміни одразу застосуються до наступної чернетки.</strong>
+                <p>Для першого аудиту, виправлення та фінальної перевірки кожна чернетка використовує один знімок конфігурації.</p>
             </div>
         </section>
 
         <form id="auditor-form" class="layout">
             <section class="card">
                 <div class="card-header">
-                    <div><h2>Editable policy prompt</h2><p class="help">Describe tone, referral handling, and quality expectations.</p></div>
-                    <span class="badge">Safety rules locked</span>
+                    <div><h2>Редагована політика аудитора</h2><p class="help">Опишіть тон, обробку реферального контенту та вимоги до якості.</p></div>
+                    <span class="badge">Правила безпеки захищені</span>
                 </div>
                 <div class="field">
-                    <label for="policy-prompt">Policy instructions</label>
+                    <label for="policy-prompt">Інструкції політики</label>
                     <textarea id="policy-prompt" minlength="20" maxlength="6000" required>{{ auditor_config.policy_prompt }}</textarea>
-                    <p class="help"><span id="prompt-count">0</span> / 6000 characters</p>
+                    <p class="help"><span id="prompt-count">0</span> / 6000 символів</p>
                 </div>
                 <div class="field">
-                    <label for="referral-policy">Referral content policy</label>
+                    <label for="referral-policy">Політика реферального контенту</label>
                     <select id="referral-policy">
-                        <option value="strict" {% if auditor_config.referral_policy == 'strict' %}selected{% endif %}>Strict — review promotion unless separation is clearly safe</option>
-                        <option value="balanced" {% if auditor_config.referral_policy == 'balanced' %}selected{% endif %}>Balanced — preserve facts and remove promotional noise</option>
-                        <option value="permissive" {% if auditor_config.referral_policy == 'permissive' %}selected{% endif %}>Permissive — judge a cleaned candidate independently</option>
+                        <option value="strict" {% if auditor_config.referral_policy == 'strict' %}selected{% endif %}>Сувора — перевіряти рекламу, якщо її не можна безпечно відокремити</option>
+                        <option value="balanced" {% if auditor_config.referral_policy == 'balanced' %}selected{% endif %}>Збалансована — зберігати факти й прибирати рекламний шум</option>
+                        <option value="permissive" {% if auditor_config.referral_policy == 'permissive' %}selected{% endif %}>Гнучка — оцінювати очищену чернетку окремо</option>
                     </select>
                 </div>
             </section>
 
             <aside class="grid">
                 <section class="card">
-                    <div class="card-header"><div><h2>Model</h2><p class="help">Only configured providers can be saved.</p></div></div>
+                    <div class="card-header"><div><h2>Модель</h2><p class="help">Можна зберегти лише модель із налаштованим провайдером.</p></div></div>
                     <div class="field">
-                        <label for="model">Auditor model</label>
+                        <label for="model">Модель аудитора</label>
                         <select id="model">
                             {% for model in models %}
-                            <option value="{{ model.id }}" {% if auditor_config.model == model.id %}selected{% endif %} {% if not model.available %}disabled{% endif %}>{{ model.id }}{% if not model.available %} — key missing{% endif %}</option>
+                            <option value="{{ model.id }}" {% if auditor_config.model == model.id %}selected{% endif %} {% if not model.available %}disabled{% endif %}>{{ model.id }}{% if not model.available %} — ключ відсутній{% endif %}</option>
                             {% endfor %}
                         </select>
                     </div>
                     <div class="field">
-                        <label for="temperature">Temperature: <span id="temperature-value">{{ auditor_config.temperature }}</span></label>
+                        <label for="temperature">Температура: <span id="temperature-value">{{ auditor_config.temperature }}</span></label>
                         <input id="temperature" type="range" min="0" max="1" step="0.05" value="{{ auditor_config.temperature }}">
                     </div>
                 </section>
 
                 <section class="card">
-                    <div class="card-header"><div><h2>Decision thresholds</h2><p class="help">Higher fidelity and score values are stricter. Lower risk values are stricter.</p></div></div>
+                    <div class="card-header"><div><h2>Пороги рішення</h2><p class="help">Вищі значення точності й оцінки суворіші. Нижчі допустимі ризики також суворіші.</p></div></div>
                     <div class="grid two">
-                        <div class="field"><label for="fidelity-standard">Standard fidelity</label><input id="fidelity-standard" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.factual_fidelity_standard }}"></div>
-                        <div class="field"><label for="fidelity-sensitive">Sensitive fidelity</label><input id="fidelity-sensitive" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.factual_fidelity_sensitive }}"></div>
-                        <div class="field"><label for="policy-risk">Max policy risk</label><input id="policy-risk" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.policy_risk_max }}"></div>
-                        <div class="field"><label for="duplicate-risk">Max duplicate risk</label><input id="duplicate-risk" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.duplicate_risk_max }}"></div>
-                        <div class="field"><label for="overall-score">Minimum overall score</label><input id="overall-score" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.overall_score_min }}"></div>
+                        <div class="field"><label for="fidelity-standard">Точність звичайних тем</label><input id="fidelity-standard" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.factual_fidelity_standard }}"></div>
+                        <div class="field"><label for="fidelity-sensitive">Точність чутливих тем</label><input id="fidelity-sensitive" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.factual_fidelity_sensitive }}"></div>
+                        <div class="field"><label for="policy-risk">Максимальний ризик політики</label><input id="policy-risk" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.policy_risk_max }}"></div>
+                        <div class="field"><label for="duplicate-risk">Максимальний ризик дубля</label><input id="duplicate-risk" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.duplicate_risk_max }}"></div>
+                        <div class="field"><label for="overall-score">Мінімальна загальна оцінка</label><input id="overall-score" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.overall_score_min }}"></div>
                     </div>
                     <div class="actions">
-                        <button class="button" id="save-button" type="submit">Save configuration</button>
-                        <button class="button secondary" id="preview-button" type="button">Preview prompt</button>
-                        <button class="button secondary" id="reset-button" type="button">Reset defaults</button>
+                        <button class="button" id="save-button" type="submit">Зберегти конфігурацію</button>
+                        <button class="button secondary" id="preview-button" type="button">Переглянути промпт</button>
+                        <button class="button secondary" id="reset-button" type="button">Скинути налаштування</button>
                     </div>
                     <p class="status" id="status" role="status" aria-live="polite"></p>
                 </section>
@@ -139,7 +141,7 @@
 
     <dialog id="preview-dialog" aria-labelledby="preview-title">
         <div class="dialog-body">
-            <div class="card-header"><div><h2 id="preview-title">Effective auditor prompt</h2><p class="help">Locked safety rules and your editable policy combined.</p></div><button class="button secondary" id="close-preview" type="button">Close</button></div>
+            <div class="card-header"><div><h2 id="preview-title">Повний промпт аудитора</h2><p class="help">Захищені правила безпеки разом із вашою редагованою політикою.</p></div><button class="button secondary" id="close-preview" type="button">Закрити</button></div>
             <pre id="prompt-preview"></pre>
         </div>
     </dialog>
@@ -187,7 +189,7 @@
         async function requestJson(url, options) {
             const response = await fetch(url, options);
             const data = await response.json();
-            if (!response.ok) throw new Error(data.detail || 'Request failed');
+            if (!response.ok) throw new Error(data.detail || 'Не вдалося виконати запит');
             return data;
         }
 
@@ -195,10 +197,10 @@
             event.preventDefault();
             if (!form.reportValidity()) return;
             saveButton.disabled = true;
-            statusNode.textContent = 'Saving configuration...';
+            statusNode.textContent = 'Збереження конфігурації...';
             try {
                 await requestJson('/api/auditor/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload()) });
-                statusNode.textContent = 'Saved. The next draft will use this configuration.';
+                statusNode.textContent = 'Збережено. Наступна чернетка використає цю конфігурацію.';
             } catch (error) {
                 statusNode.textContent = error.message;
             } finally {
@@ -218,11 +220,11 @@
         });
 
         document.getElementById('reset-button').addEventListener('click', async () => {
-            if (!window.confirm('Reset the auditor configuration to safe defaults?')) return;
+            if (!window.confirm('Скинути конфігурацію аудитора до безпечних стандартних значень?')) return;
             try {
                 const data = await requestJson('/api/auditor/reset', { method: 'POST' });
                 applyConfig(data.config);
-                statusNode.textContent = 'Safe defaults restored and applied.';
+                statusNode.textContent = 'Безпечні стандартні налаштування відновлено й застосовано.';
             } catch (error) {
                 statusNode.textContent = error.message;
             }
