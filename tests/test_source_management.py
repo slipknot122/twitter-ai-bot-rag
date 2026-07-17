@@ -1,8 +1,11 @@
 import json
+from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from database import Database, normalize_source_keywords, source_text_matches
+from web_admin.main import app
 
 
 @pytest.fixture
@@ -77,3 +80,47 @@ def test_source_settings_round_trip(database):
     updated = database.update_source(source["id"], {"include_keywords": ["ML", "ml"], "poll_interval_minutes": 90})
     assert json.loads(updated["include_keywords"]) == ["ml"]
     assert updated["poll_interval_minutes"] == 90
+
+
+def test_sources_page_and_api_lifecycle(database):
+    source = add_source(database, include_keywords=["AI"], poll_interval_minutes=45)
+    client = TestClient(app)
+    with patch("web_admin.main.db", database):
+        page = client.get("/sources")
+        assert page.status_code == 200
+        assert '<html lang="uk">' in page.text
+        assert "Додати джерело" in page.text
+        assert "Обов’язкові ключові слова" in page.text
+
+        updated = client.patch(
+            f"/api/sources/{source['id']}",
+            json={"name": "AI News", "exclude_keywords": ["реклама"]},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["name"] == "AI News"
+
+        archived = client.post(f"/api/sources/{source['id']}/archive")
+        assert archived.status_code == 200
+        assert archived.json()["archived_at"]
+
+        restored = client.post(f"/api/sources/{source['id']}/restore")
+        assert restored.status_code == 200
+        assert restored.json()["archived_at"] is None
+
+        deleted = client.delete(f"/api/sources/{source['id']}?permanent=true")
+        assert deleted.status_code == 200
+        assert deleted.json()["status"] == "deleted"
+
+
+def test_source_api_requires_explicit_detach(database):
+    source = add_source(database)
+    database.create_draft_from_active_source("telegram", source["external_id"], "item", "Вміст")
+    client = TestClient(app)
+    with patch("web_admin.main.db", database):
+        conflict = client.delete(f"/api/sources/{source['id']}?permanent=true")
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["actions"] == ["archive", "detach_and_delete"]
+        detached = client.delete(
+            f"/api/sources/{source['id']}?permanent=true&detach_drafts=true"
+        )
+        assert detached.status_code == 200
