@@ -8,6 +8,7 @@ from typing import cast, Protocol
 from utils import classify_safe_error
 import os
 from config import settings
+from auditor_config import AuditorConfig, default_auditor_config, effective_auditor_prompt, load_auditor_config
 
 BoundedAuditText = Annotated[
     str,
@@ -79,13 +80,40 @@ class PostAuditor:
     def __init__(
         self,
         llm_provider: TextGenerationProvider | object = _sentinel,
+        *,
+        config: AuditorConfig | None = None,
+        db_instance=None,
     ) -> None:
         if llm_provider is _sentinel:
             from llm_provider import llm
             llm_provider = llm
 
         self._llm = cast(TextGenerationProvider, llm_provider)
-        self.temperature = 0.1
+        self._config = config or default_auditor_config()
+        self._db = db_instance
+        self.temperature = self._config.temperature
+
+    def set_config_store(self, db_instance) -> None:
+        self._db = db_instance
+
+    def snapshot(self) -> "PostAuditor":
+        """Freeze one validated configuration for a complete draft audit cycle."""
+        if self._db is None:
+            return self
+
+        config = load_auditor_config(self._db)
+        from llm_provider import LLMProvider
+        from runtime_types import GeminiConfig, LLMConfig
+
+        provider = LLMProvider(
+            LLMConfig(
+                model=config.model,
+                temperature=config.temperature,
+                openai_api_key=settings.openai_api_key,
+                gemini=GeminiConfig(api_key=settings.gemini_api_key),
+            )
+        )
+        return PostAuditor(llm_provider=provider, config=config)
         
     # Note: We rely on strict local Pydantic validation (AuditResult) instead of
     # relying exclusively on the provider's structured output format (`response_format`).
@@ -113,17 +141,17 @@ class PostAuditor:
 
     def requires_revision(self, result: AuditResult, category: str = "NEWS") -> bool:
         if category in ["HACK", "SECURITY", "REGULATION"]:
-            if result.factual_fidelity < 0.95:
+            if result.factual_fidelity < self._config.factual_fidelity_sensitive:
                 return True
         else:
-            if result.factual_fidelity < 0.90:
+            if result.factual_fidelity < self._config.factual_fidelity_standard:
                 return True
 
-        if result.policy_risk > 0.20:
+        if result.policy_risk > self._config.policy_risk_max:
             return True
-        if result.duplicate_risk > 0.75:
+        if result.duplicate_risk > self._config.duplicate_risk_max:
             return True
-        if result.overall_score < 0.80:
+        if result.overall_score < self._config.overall_score_min:
             return True
         if len(result.blocking_issues) > 0:
             return True
@@ -143,7 +171,7 @@ class PostAuditor:
         try:
             llm_output = self._llm.generate_with_metadata(
                 prompt=prompt,
-                system_prompt=AUDITOR_SYSTEM_PROMPT,
+                system_prompt=effective_auditor_prompt(self._config),
                 temperature=self.temperature
             )
         except Exception as e:
