@@ -39,6 +39,9 @@ app = FastAPI(title="Twitter AI Bot Admin")
 
 templates_dir = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(templates_dir))
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # Роздача media файлів через /media/{filename}
 media_dir = Path(__file__).parent.parent / "media"
@@ -329,6 +332,21 @@ def reset_auditor_config():
 
 # --- Phase 5: Source CRUD API ---
 
+@app.get("/sources", response_class=HTMLResponse)
+def sources_page(request: Request):
+    sources = db.get_sources()
+    counts = {
+        "all": len(sources),
+        "active": sum(1 for source in sources if source["is_active"] and not source.get("archived_at")),
+        "archived": sum(1 for source in sources if source.get("archived_at")),
+    }
+    return templates.TemplateResponse(
+        request=request,
+        name="sources.html",
+        context={"request": request, "sources": sources, "counts": counts, "active_page": "sources"},
+    )
+
+
 class SourceCreate(BaseModel, extra='forbid'):
     source_type: Literal['telegram', 'rss', 'website', 'x']
     external_id: str = Field(min_length=1, max_length=200)
@@ -337,6 +355,9 @@ class SourceCreate(BaseModel, extra='forbid'):
     priority: int = Field(default=50, ge=0, le=100)
     trust_rating: int = Field(default=50, ge=0, le=100)
     processing_mode: Literal['auto', 'review'] = 'auto'
+    poll_interval_minutes: int = Field(default=30, ge=5, le=1440)
+    include_keywords: list[str] = Field(default_factory=list, max_length=50)
+    exclude_keywords: list[str] = Field(default_factory=list, max_length=50)
 
 class SourcePatch(BaseModel, extra='forbid'):
     name: Optional[str] = Field(default=None, min_length=1, max_length=200)
@@ -345,6 +366,9 @@ class SourcePatch(BaseModel, extra='forbid'):
     trust_rating: Optional[int] = Field(default=None, ge=0, le=100)
     processing_mode: Optional[Literal['auto', 'review']] = None
     is_active: Optional[bool] = None
+    poll_interval_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+    include_keywords: Optional[list[str]] = Field(default=None, max_length=50)
+    exclude_keywords: Optional[list[str]] = Field(default=None, max_length=50)
 
 class SourceResolve(BaseModel, extra='forbid'):
     external_id: str = Field(min_length=1, max_length=200)
@@ -377,7 +401,10 @@ def create_source(req: SourceCreate):
             canonical_url=req.canonical_url,
             priority=req.priority,
             trust_rating=req.trust_rating,
-            processing_mode=req.processing_mode
+            processing_mode=req.processing_mode,
+            poll_interval_minutes=req.poll_interval_minutes,
+            include_keywords=req.include_keywords,
+            exclude_keywords=req.exclude_keywords,
         )
         _invalidate_source_cache()
         return src
@@ -401,17 +428,55 @@ def update_source(source_id: int, req: SourcePatch):
             raise HTTPException(status_code=409, detail=str(e))
         raise HTTPException(status_code=422, detail=str(e))
 
-@app.delete("/api/sources/{source_id}")
-def delete_source(source_id: int):
-    src = db.deactivate_source(source_id)
+@app.get("/api/sources/{source_id}/usage")
+def source_usage(source_id: int):
+    usage = db.get_source_usage(source_id)
+    if usage is None:
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    return usage
+
+
+@app.post("/api/sources/{source_id}/archive")
+def archive_source(source_id: int):
+    src = db.archive_source(source_id)
     if not src:
-        # Check if exists
-        if not db.get_source(source_id):
-            raise HTTPException(status_code=404, detail="Джерело не знайдено")
-        # Idempotent: already inactive, but get_source exists
-        src = db.get_source(source_id)
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
     _invalidate_source_cache()
     return src
+
+
+@app.post("/api/sources/{source_id}/restore")
+def restore_source(source_id: int):
+    src = db.restore_source(source_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    _invalidate_source_cache()
+    return src
+
+
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: int, permanent: bool = False, detach_drafts: bool = False):
+    if not permanent:
+        src = db.archive_source(source_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Джерело не знайдено")
+        _invalidate_source_cache()
+        return src
+    result = db.delete_source_permanently(source_id, detach_drafts=detach_drafts)
+    if result == "missing":
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    if result == "conflict":
+        usage = db.get_source_usage(source_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Джерело має пов’язані чернетки. Архівуйте його або підтвердьте відв’язування.",
+                "draft_count": usage["draft_count"],
+                "actions": ["archive", "detach_and_delete"],
+            },
+        )
+    _invalidate_source_cache()
+    return {"status": "deleted", "source_id": source_id}
 
 @app.post("/api/sources/{source_id}/resolve")
 def resolve_source(source_id: int, req: SourceResolve):

@@ -56,8 +56,10 @@
             .grid.two { grid-template-columns: 1fr 1fr; }
         }
     </style>
+    <link rel="stylesheet" href="/static/admin.css">
 </head>
-<body>
+<body class="has-admin-sidebar">
+    {% include "_admin_nav.html" %}
     <main class="shell">
         <header class="topbar">
             <div>
@@ -67,6 +69,7 @@
             </div>
             <nav class="nav" aria-label="Навігація адміністратора">
                 <a href="/">Панель</a>
+                <a href="/sources">Джерела</a>
                 <a href="/settings">Налаштування бота</a>
                 <a href="/auditor" aria-current="page">AI-аудитор</a>
                 <a href="/status">Стан системи</a>
@@ -235,5 +238,6 @@
         temperatureInput.addEventListener('input', updateCounters);
         updateCounters();
     </script>
+<script src="/static/admin.js" defer></script>
 </body>
 </html>

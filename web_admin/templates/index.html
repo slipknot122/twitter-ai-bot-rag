@@ -449,14 +449,17 @@
             .tab { padding: 0.5rem 0.75rem; text-align: center; }
         }
     </style>
+    <link rel="stylesheet" href="/static/admin.css">
 </head>
-<body>
+<body class="has-admin-sidebar">
+    {% include "_admin_nav.html" %}
     <div class="container">
         <header>
             <h1>AI-модератор контенту</h1>
             <p class="subtitle">Перевіряйте, редагуйте та публікуйте дописи, створені AI.</p>
             <nav aria-label="Навігація адміністратора" style="margin-top: 1rem; display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem;">
                 <a href="/" aria-current="page" style="color: var(--accent); text-decoration: none; font-weight: 500;">Панель</a>
+                <a href="/sources" style="color: var(--accent); text-decoration: none; font-weight: 500;">Джерела</a>
                 <a href="/settings" style="color: var(--accent); text-decoration: none; font-weight: 500;">Налаштування бота</a>
                 <a href="/auditor" style="color: var(--accent); text-decoration: none; font-weight: 500;">AI-аудитор</a>
                 <a href="/status" style="color: var(--accent); text-decoration: none; font-weight: 500;">Стан системи</a>
@@ -490,7 +493,7 @@
             <a href="/?tab=review" class="tab {% if current_tab == 'review' %}active{% endif %}">На розгляді</a>
             <a href="/?tab=approved" class="tab {% if current_tab == 'approved' %}active{% endif %}">Опубліковані / Схвалені</a>
             <a href="/?tab=ignored" class="tab {% if current_tab == 'ignored' %}active{% endif %}">Відхилені</a>
-            <a href="/?tab=sources" class="tab {% if current_tab == 'sources' %}active{% endif %}">Джерела</a>
+            <a href="/sources" class="tab">Керування джерелами</a>
         </div>
 
         {% if current_tab != "sources" %}
@@ -1351,5 +1354,6 @@
             </div>
         </div>
     </div>
+<script src="/static/admin.js" defer></script>
 </body>
 </html>

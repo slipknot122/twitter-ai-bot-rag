@@ -75,8 +75,10 @@
         ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
     </style>
+    <link rel="stylesheet" href="/static/admin.css">
 </head>
-<body>
+<body class="has-admin-sidebar">
+    {% include "_admin_nav.html" %}
     <div class="container">
         <header>
             <h1>Журнал системи</h1>
@@ -85,6 +87,7 @@
 
         <nav class="nav-links" aria-label="Навігація адміністратора">
             <a href="/">Панель</a>
+            <a href="/sources">Джерела</a>
             <a href="/settings">Налаштування бота</a>
             <a href="/auditor">AI-аудитор</a>
             <a href="/status">Стан системи</a>
@@ -117,5 +120,6 @@
             {% endif %}
         </div>
     </div>
+<script src="/static/admin.js" defer></script>
 </body>
 </html>
