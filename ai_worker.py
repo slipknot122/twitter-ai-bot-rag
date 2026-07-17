@@ -108,6 +108,8 @@ def process_draft(
     else:
         selected_auditor = auditor_instance
     selected_auditor = cast(AuditProvider, selected_auditor)
+    if isinstance(selected_auditor, post_auditor.PostAuditor):
+        selected_auditor = cast(AuditProvider, selected_auditor.snapshot())
 
     draft = db_instance.get_draft(draft_id)
     if not draft or draft['status'] != 'processing':

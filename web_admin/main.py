@@ -23,6 +23,14 @@ from media_builder import media_builder, MediaGenerationError
 from loguru import logger
 
 from config import settings
+from auditor_config import (
+    AuditorConfig,
+    available_auditor_models,
+    default_auditor_config,
+    effective_auditor_prompt,
+    load_auditor_config,
+    save_auditor_config,
+)
 
 if settings.web_admin_host not in {"127.0.0.1", "localhost", "::1"}:
     raise RuntimeError("Web admin must bind to localhost for security reasons.")
@@ -263,6 +271,62 @@ def update_settings(req: SettingsRequest):
     return {"status": "ok"}
 
 
+@app.get("/auditor", response_class=HTMLResponse)
+def auditor_page(request: Request):
+    config = load_auditor_config(db)
+    return templates.TemplateResponse(
+        request=request,
+        name="auditor.html",
+        context={
+            "request": request,
+            "auditor_config": config.model_dump(),
+            "models": available_auditor_models(),
+        },
+    )
+
+
+@app.get("/api/auditor/config")
+def get_auditor_config():
+    config = load_auditor_config(db)
+    return {
+        "config": config.model_dump(),
+        "models": available_auditor_models(),
+        "effective_prompt": effective_auditor_prompt(config),
+    }
+
+
+@app.post("/api/auditor/config")
+def update_auditor_config(req: AuditorConfig):
+    selected_model = next(
+        (model for model in available_auditor_models() if model["id"] == req.model),
+        None,
+    )
+    if selected_model is None or not selected_model["available"]:
+        raise HTTPException(status_code=422, detail="Selected auditor model is not configured.")
+    save_auditor_config(db, req)
+    return {
+        "status": "ok",
+        "config": req.model_dump(),
+        "effective_prompt": effective_auditor_prompt(req),
+    }
+
+
+@app.post("/api/auditor/preview")
+def preview_auditor_config(req: AuditorConfig):
+    return {"effective_prompt": effective_auditor_prompt(req)}
+
+
+@app.post("/api/auditor/reset")
+def reset_auditor_config():
+    config = default_auditor_config()
+    save_auditor_config(db, config)
+    return {
+        "status": "ok",
+        "config": config.model_dump(),
+        "effective_prompt": effective_auditor_prompt(config),
+    }
+
+
 # --- Phase 5: Source CRUD API ---
 
 class SourceCreate(BaseModel, extra='forbid'):
@@ -424,7 +488,6 @@ def logs_page(request: Request, filter: str = "ALL"):
 @app.get("/status", response_class=HTMLResponse)
 def status_page(request: Request):
     # Check Gemini
-    from config import settings
     gemini_configured = bool(settings.gemini_api_key)
     
     # Check Telegram
