@@ -440,6 +440,14 @@
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
+
+        @media (max-width: 640px) {
+            body { padding: 1rem; }
+            h1 { font-size: 2rem; }
+            .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .tabs { flex-wrap: wrap; gap: 0.5rem; }
+            .tab { padding: 0.5rem 0.75rem; text-align: center; }
+        }
     </style>
 </head>
 <body>
@@ -612,8 +620,8 @@
                             {% elif draft.media_status == 'generating' %}Generating...
                             {% elif draft.media_status == 'ready' %}Ready ({{ draft.media_provider }})
                             {% elif draft.media_status == 'failed' %}Failed
-                            {% elif draft.media_status == 'cancelled' %}Скасуватиled
-                            {% else %}None
+{% elif draft.media_status == 'cancelled' %}Скасовано
+                                    {% else %}Немає
                             {% endif %}
                         </span>
                     </h3>
@@ -715,7 +723,7 @@
                             <select id="new_source_type" style="width: 100%; padding: 0.5rem; background: var(--bg-color); color: white; border: 1px solid var(--card-border); border-radius: 0.25rem;">
                                 <option value="telegram">Telegram</option>
                                 <option value="rss">RSS</option>
-                                <option value="website">Website</option>
+                                <option value="website">Вебсайт</option>
                                 <option value="x">X</option>
                             </select>
                         </div>
@@ -948,17 +956,17 @@
                     
                     buttonsDiv.append(btnProc, btnCanc);
                 } else if (status === 'failed') {
-                    const btnПовторити = document.createElement('button');
-                    btnПовторити.className = 'btn-media';
-                    btnПовторити.textContent = 'Повторити';
-                    btnПовторити.onclick = () => generateImage(id, 'retry');
+                    const btnRetry = document.createElement('button');
+                    btnRetry.className = 'btn-media';
+                    btnRetry.textContent = 'Повторити';
+                    btnRetry.onclick = () => generateImage(id, 'retry');
                     
                     const btnRem = document.createElement('button');
                     btnRem.className = 'btn-media btn-media-remove';
                     btnRem.textContent = 'Видалити';
                     btnRem.onclick = () => removeImage(id);
                     
-                    buttonsDiv.append(btnПовторити, btnRem);
+                    buttonsDiv.append(btnRetry, btnRem);
                 } else {
                     const btnGen = document.createElement('button');
                     btnGen.className = 'btn-media';
@@ -1121,7 +1129,7 @@
                     } else {
                         statusBadge.style.background = 'rgba(148, 163, 184, 0.2)';
                         statusBadge.style.color = '#cbd5e1';
-                        statusBadge.textContent = 'Inactive';
+                        statusBadge.textContent = 'Неактивне';
                     }
                     statusCell.appendChild(statusBadge);
                     
@@ -1130,7 +1138,7 @@
                         pollDiv.style.fontSize = '0.75rem';
                         pollDiv.style.marginTop = '0.25rem';
                         pollDiv.style.color = 'var(--text-muted)';
-                        pollDiv.textContent = `Poll: ${src.collector_status} (Err: ${src.consecutive_errors || 0})`;
+                        pollDiv.textContent = `Збір: ${src.collector_status} (помилок: ${src.consecutive_errors || 0})`;
                         if (src.last_error_code) {
                             pollDiv.textContent += ` [${src.last_error_code}]`;
                             pollDiv.style.color = '#fca5a5';
@@ -1148,7 +1156,7 @@
                     
                     if (src.resolution_status === 'unresolved') {
                         const btnRes = document.createElement('button');
-                        btnRes.textContent = 'Resolve';
+                        btnRes.textContent = 'Уточнити';
                         btnRes.style.padding = '0.2rem 0.5rem';
                         btnRes.style.fontSize = '0.8rem';
                         btnRes.className = 'btn-save';
@@ -1156,7 +1164,7 @@
                         actionCell.appendChild(btnRes);
                     } else {
                         const btnToggle = document.createElement('button');
-                        btnToggle.textContent = src.is_active ? 'Deactivate' : 'Reactivate';
+                        btnToggle.textContent = src.is_active ? 'Деактивувати' : 'Активувати знову';
                         btnToggle.style.padding = '0.2rem 0.5rem';
                         btnToggle.style.fontSize = '0.8rem';
                         btnToggle.className = src.is_active ? 'btn-ignore' : 'btn-publish';
@@ -1166,7 +1174,7 @@
                     
                     if (src.is_active && src.resolution_status === 'resolved' && (src.source_type === 'rss' || src.source_type === 'website')) {
                         const btnPoll = document.createElement('button');
-                        btnPoll.textContent = 'Poll Now';
+                        btnPoll.textContent = 'Перевірити зараз';
                         btnPoll.style.padding = '0.2rem 0.5rem';
                         btnPoll.style.fontSize = '0.8rem';
                         btnPoll.className = 'btn-save';
@@ -1213,7 +1221,7 @@
                     fetchSources();
                 } else {
                     const data = await resp.json();
-                    alert(data.detail || "Error adding source");
+                    alert(data.detail || "Не вдалося додати джерело");
                 }
             } catch(e) {
                 alert("Не вдалося виконати запит");
@@ -1231,14 +1239,14 @@
                     });
                     if (!resp.ok) {
                         const data = await resp.json();
-                        alert(data.detail || "Error reactivating");
+                        alert(data.detail || "Не вдалося активувати джерело");
                     }
                 } else {
                     // Deactivate via DELETE
                     const resp = await fetch(`/api/sources/${id}`, { method: 'DELETE' });
                     if (!resp.ok) {
                         const data = await resp.json();
-                        alert(data.detail || "Error deactivating");
+                        alert(data.detail || "Не вдалося деактивувати джерело");
                     }
                 }
                 fetchSources();
@@ -1251,11 +1259,11 @@
             try {
                 const resp = await fetch(`/api/sources/${id}/poll_now`, { method: 'POST' });
                 if(resp.ok) {
-                    alert("Source added to polling queue.");
+                    alert("Джерело додано до черги перевірки.");
                     fetchSources();
                 } else {
                     const data = await resp.json();
-                    alert(data.detail || "Error queueing poll");
+                    alert(data.detail || "Не вдалося додати перевірку до черги");
                 }
             } catch(e) {
                 alert("Не вдалося виконати запит");
@@ -1284,7 +1292,7 @@
                     fetchSources();
                 } else {
                     const data = await resp.json();
-                    alert(data.detail || "Error resolving source");
+                    alert(data.detail || "Не вдалося уточнити джерело");
                 }
             } catch(e) {
                 alert("Не вдалося виконати запит");
@@ -1303,10 +1311,10 @@
                 });
                 if(resp.ok) {
                     document.getElementById('fetch-modal').style.display = 'none';
-                    alert("Fetch task queued! Check logs or drafts soon.");
+                    alert("Завантаження додано до черги. Незабаром перевірте журнал або чернетки.");
                 } else {
                     const data = await resp.json();
-                    alert(data.detail || "Error queueing fetch");
+                    alert(data.detail || "Не вдалося додати завантаження до черги");
                 }
             } catch(e) {
                 alert("Не вдалося виконати запит");

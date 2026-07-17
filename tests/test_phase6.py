@@ -1396,7 +1396,7 @@ def test_API_03_poll_now_missing_source_is_404(tmp_path):
     database = Database(str(tmp_path / "missing-poll.db"))
     response = call_poll_now(database, 999)
     assert response.status_code == 404
-    assert response.json() == {"detail": "Source not found"}
+    assert response.json() == {"detail": "Джерело не знайдено"}
 
 
 def test_API_04_poll_now_inactive_source_is_409(tmp_path):
@@ -1404,7 +1404,7 @@ def test_API_04_poll_now_inactive_source_is_409(tmp_path):
     database.deactivate_source(source_id)
     response = call_poll_now(database, source_id)
     assert response.status_code == 409
-    assert "inactive" in response.json()["detail"]
+    assert "неактивне" in response.json()["detail"]
 
 
 def test_API_05_poll_now_telegram_is_404_without_poll_state(tmp_path):
@@ -1412,7 +1412,7 @@ def test_API_05_poll_now_telegram_is_404_without_poll_state(tmp_path):
     source = database.add_source("telegram", "1234567890", "Telegram")
     response = call_poll_now(database, source["id"])
     assert response.status_code == 404
-    assert response.json() == {"detail": "Source not found"}
+    assert response.json() == {"detail": "Джерело не знайдено"}
 
 
 def test_API_06_poll_now_active_lease_is_409(tmp_path):
@@ -1421,7 +1421,7 @@ def test_API_06_poll_now_active_lease_is_409(tmp_path):
     assert database.claim_due_poll_source(global_token, 60)["source_id"] == source_id
     response = call_poll_now(database, source_id)
     assert response.status_code == 409
-    assert "active lease" in response.json()["detail"]
+    assert "вже обробляється" in response.json()["detail"]
 
 
 def test_API_07_poll_now_requeues_error_state(tmp_path):

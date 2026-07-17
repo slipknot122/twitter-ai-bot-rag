@@ -105,9 +105,9 @@ def publish_draft(draft_id: int):
         row = cursor.fetchone()
         
         if not row:
-            raise HTTPException(status_code=404, detail="Draft not found")
+            raise HTTPException(status_code=404, detail="Чернетку не знайдено")
         if row['status'] not in ['review', 'pending']:
-            raise HTTPException(status_code=409, detail="Only drafts in review status can be approved")
+            raise HTTPException(status_code=409, detail="Схвалити можна лише чернетку зі статусом перевірки")
             
         text = row['rewritten_text']
         from utils import validate_post_text, ValidationError
@@ -119,7 +119,7 @@ def publish_draft(draft_id: int):
     logger.info(f"Web Admin: Approving draft {draft_id} for Scheduler")
     success = db.approve_draft(draft_id, {"rewritten_text": validated_text})
     if not success:
-        raise HTTPException(status_code=409, detail="Failed to transition draft to approved state (possible race condition or invalid state)")
+        raise HTTPException(status_code=409, detail="Не вдалося схвалити чернетку через конфлікт або неприпустимий стан")
             
     return {"status": "success"}
 
@@ -131,14 +131,14 @@ def ignore_draft(draft_id: int):
         row = cursor.fetchone()
         
         if not row:
-            raise HTTPException(status_code=404, detail="Draft not found")
+            raise HTTPException(status_code=404, detail="Чернетку не знайдено")
         if row['status'] not in ['review', 'pending']:
-            raise HTTPException(status_code=400, detail="Only drafts in review status can be ignored")
+            raise HTTPException(status_code=400, detail="Відхилити можна лише чернетку зі статусом перевірки")
 
     logger.info(f"Web Admin: Ignoring draft {draft_id}")
     success = db.ignore_draft(draft_id)
     if not success:
-        raise HTTPException(status_code=409, detail="Failed to transition draft to ignored state")
+        raise HTTPException(status_code=409, detail="Не вдалося перевести чернетку у відхилений стан")
     return {"status": "success"}
 
 @app.post("/api/drafts/{draft_id}/update")
@@ -172,11 +172,11 @@ async def generate_image(draft_id: int, request: GenerateImageRequest):
     """
     status = db.queue_media_generation(draft_id, prompt=request.image_prompt, action=request.action)
     if status == "NOT_FOUND":
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(status_code=404, detail="Чернетку не знайдено")
     if status == "INVALID_PROMPT":
-        raise HTTPException(status_code=422, detail="image_prompt must be 20-1500 chars")
+        raise HTTPException(status_code=422, detail="Промпт зображення має містити від 20 до 1500 символів")
     if status == "CONFLICT":
-        raise HTTPException(status_code=409, detail="Action not allowed for current state or already in progress")
+        raise HTTPException(status_code=409, detail="Дію заборонено для поточного стану або вона вже виконується")
 
     return {"draft_id": draft_id, "media_status": "pending"}
 
@@ -187,11 +187,11 @@ def cancel_image(draft_id: int):
     with db._get_connection() as conn:
         row = conn.cursor().execute("SELECT id FROM drafts WHERE id = ?", (draft_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Draft not found")
+            raise HTTPException(status_code=404, detail="Чернетку не знайдено")
             
     success = db.cancel_media_generation(draft_id)
     if not success:
-        raise HTTPException(status_code=409, detail="Cannot cancel media in current state")
+        raise HTTPException(status_code=409, detail="У поточному стані генерацію медіа не можна скасувати")
     return {"status": "success"}
 
 @app.delete("/api/drafts/{draft_id}/image")
@@ -199,9 +199,9 @@ def delete_image(draft_id: int):
     """Безпечне видалення зображення."""
     status = db.delete_media(draft_id)
     if status == "NOT_FOUND":
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(status_code=404, detail="Чернетку не знайдено")
     if status == "CONFLICT":
-        raise HTTPException(status_code=409, detail="Cannot delete media in current state")
+        raise HTTPException(status_code=409, detail="У поточному стані медіа не можна видалити")
     return {"status": "success"}
 
 
@@ -218,7 +218,7 @@ def get_image_status(draft_id: int):
         draft = cursor.fetchone()
 
     if not draft:
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(status_code=404, detail="Чернетку не знайдено")
 
     result = dict(draft)
     # Не відправляємо абсолютний filesystem path — тільки URL для браузера
@@ -302,7 +302,7 @@ def update_auditor_config(req: AuditorConfig):
         None,
     )
     if selected_model is None or not selected_model["available"]:
-        raise HTTPException(status_code=422, detail="Selected auditor model is not configured.")
+        raise HTTPException(status_code=422, detail="Обрану модель аудитора не налаштовано.")
     save_auditor_config(db, req)
     return {
         "status": "ok",
@@ -357,7 +357,7 @@ def get_sources(is_active: Optional[bool] = None):
 def get_source(source_id: int):
     src = db.get_source(source_id)
     if not src:
-        raise HTTPException(status_code=404, detail="Source not found")
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
     return src
 
 def _invalidate_source_cache():
@@ -382,7 +382,7 @@ def create_source(req: SourceCreate):
         _invalidate_source_cache()
         return src
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Source with this external_id already exists")
+        raise HTTPException(status_code=409, detail="Джерело з таким зовнішнім ID уже існує")
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -391,11 +391,11 @@ def update_source(source_id: int, req: SourcePatch):
     try:
         src = db.update_source(source_id, req.model_dump(exclude_unset=True))
         if not src:
-            raise HTTPException(status_code=404, detail="Source not found")
+            raise HTTPException(status_code=404, detail="Джерело не знайдено")
         _invalidate_source_cache()
         return src
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Conflict updating source")
+        raise HTTPException(status_code=409, detail="Конфлікт під час оновлення джерела")
     except ValueError as e:
         if "Cannot activate source with resolution_status='unresolved'" in str(e):
             raise HTTPException(status_code=409, detail=str(e))
@@ -407,7 +407,7 @@ def delete_source(source_id: int):
     if not src:
         # Check if exists
         if not db.get_source(source_id):
-            raise HTTPException(status_code=404, detail="Source not found")
+            raise HTTPException(status_code=404, detail="Джерело не знайдено")
         # Idempotent: already inactive, but get_source exists
         src = db.get_source(source_id)
     _invalidate_source_cache()
@@ -418,11 +418,11 @@ def resolve_source(source_id: int, req: SourceResolve):
     try:
         src = db.resolve_source(source_id, req.external_id)
         if not src:
-            raise HTTPException(status_code=404, detail="Source not found")
+            raise HTTPException(status_code=404, detail="Джерело не знайдено")
         _invalidate_source_cache()
         return src
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Resolved external_id already exists")
+        raise HTTPException(status_code=409, detail="Уточнений зовнішній ID уже використовується")
     except ValueError as e:
         err = str(e)
         if "only for telegram" in err:
@@ -435,33 +435,33 @@ def resolve_source(source_id: int, req: SourceResolve):
 def poll_now_endpoint(source_id: int):
     status = db.poll_now(source_id)
     if status == "missing":
-        raise HTTPException(status_code=404, detail="Source not found")
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
     if status == "conflict":
-        raise HTTPException(status_code=409, detail="Source cannot be polled currently (inactive, unresolved, or active lease)")
+        raise HTTPException(status_code=409, detail="Зараз джерело не можна перевірити: воно неактивне, не уточнене або вже обробляється")
     return {"status": "queued"}
 
 @app.post("/api/telegram/fetch-history")
 async def fetch_tg_history(req: FetchHistoryRequest):
     import telegram_listener
     if telegram_listener.history_fetch_queue is None:
-        raise HTTPException(status_code=503, detail="Telegram listener is not running or not ready.")
+        raise HTTPException(status_code=503, detail="Слухач Telegram не запущено або він ще не готовий.")
     
     try:
         telegram_listener.history_fetch_queue.put_nowait({
             "messages": req.messages_limit,
             "channels": req.channels_limit
         })
-        return {"status": "ok", "message": "Fetch task queued successfully."}
+        return {"status": "ok", "message": "Завантаження успішно додано до черги."}
     except asyncio.QueueFull:
         raise HTTPException(
             status_code=409,
-            detail="Telegram history fetch is already queued.",
+            detail="Завантаження історії Telegram уже додано до черги.",
         )
     except Exception:
         logger.exception("Failed to queue Telegram history fetch [SAFE_ERR_HISTORY_QUEUE]")
         raise HTTPException(
             status_code=500,
-            detail="Failed to queue Telegram history fetch.",
+            detail="Не вдалося додати завантаження історії Telegram до черги.",
         )
 
 @app.get("/logs", response_class=HTMLResponse)
@@ -505,21 +505,21 @@ def status_page(request: Request):
     pollinations_configured = True 
     
     # Check Database
-    db_status = "Available"
+    db_status = "Доступна"
     try:
         with db._get_connection() as conn:
             conn.execute("SELECT 1")
     except Exception:
-        db_status = "Error"
+        db_status = "Помилка"
         
     return templates.TemplateResponse(
         request=request, name="status.html", context={
             "request": request,
-            "gemini_status": "Configured" if gemini_configured else "Missing",
-            "telegram_status": "Configured" if telegram_configured else "Missing",
-            "twitter_status": "Configured" if twitter_configured else "Missing",
-            "cloudflare_status": "Configured" if cloudflare_configured else "Missing",
-            "pollinations_status": "Configured" if pollinations_configured else "Missing",
+            "gemini_status": "Налаштовано" if gemini_configured else "Відсутнє",
+            "telegram_status": "Налаштовано" if telegram_configured else "Відсутнє",
+            "twitter_status": "Налаштовано" if twitter_configured else "Відсутнє",
+            "cloudflare_status": "Налаштовано" if cloudflare_configured else "Відсутнє",
+            "pollinations_status": "Налаштовано" if pollinations_configured else "Відсутнє",
             "twitter_dry_run": settings.twitter_dry_run,
             "admin_bind": settings.web_admin_host,
             "db_status": db_status,

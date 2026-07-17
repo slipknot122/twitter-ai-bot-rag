@@ -57,7 +57,7 @@ def test_fetch_history_returns_409_when_request_already_queued():
         )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "Telegram history fetch is already queued."
+    assert response.json()["detail"] == "Завантаження історії Telegram уже додано до черги."
 
 
 @pytest.mark.parametrize(

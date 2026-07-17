@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -138,9 +139,12 @@ def test_auditor_page_and_preview_api(monkeypatch):
 
     page = client.get("/auditor")
     assert page.status_code == 200
-    assert "AI Auditor" in page.text
-    assert "Referral content policy" in page.text
-    assert "Preview prompt" in page.text
+    assert '<html lang="uk">' in page.text
+    assert "AI-аудитор" in page.text
+    assert "Політика реферального контенту" in page.text
+    assert "Переглянути промпт" in page.text
+    assert "Налаштування бота" in page.text
+    assert "Стан системи" in page.text
 
     preview = client.post("/api/auditor/preview", json=config.model_dump())
     assert preview.status_code == 200
@@ -156,4 +160,39 @@ def test_save_rejects_model_without_configured_key(monkeypatch):
     client = TestClient(app)
     response = client.post("/api/auditor/config", json=config.model_dump())
     assert response.status_code == 422
-    assert response.json()["detail"] == "Selected auditor model is not configured."
+    assert response.json()["detail"] == "Обрану модель аудитора не налаштовано."
+
+
+def test_all_admin_templates_keep_ukrainian_language_and_navigation():
+    templates_dir = Path(__file__).parents[1] / "web_admin" / "templates"
+    expected_navigation = (
+        "Панель",
+        "Налаштування бота",
+        "AI-аудитор",
+        "Стан системи",
+        "Журнал",
+    )
+
+    for template_name in ("index.html", "settings.html", "auditor.html", "status.html", "logs.html"):
+        html = (templates_dir / template_name).read_text(encoding="utf-8")
+        assert '<html lang="uk">' in html, template_name
+        for label in expected_navigation:
+            assert label in html, f"{label!r} missing from {template_name}"
+
+
+def test_dashboard_localizes_history_bounds_and_dynamic_controls():
+    template = (
+        Path(__file__).parents[1] / "web_admin" / "templates" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="fetch_messages_limit" value="5" min="1" max="20"' in template
+    assert 'id="fetch_channels_limit" value="10" min="1" max="50"' in template
+    for label in (
+        "Завантажити історію Telegram",
+        "Перевірити зараз",
+        "Деактивувати",
+        "Активувати знову",
+        "Уточнити",
+        "Повторити",
+    ):
+        assert label in template
