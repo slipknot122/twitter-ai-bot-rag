@@ -2,6 +2,7 @@ import sys
 import os
 import asyncio
 import datetime
+import uuid
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, Request, Form, HTTPException
@@ -334,7 +335,7 @@ def reset_auditor_config():
 
 @app.get("/sources", response_class=HTMLResponse)
 def sources_page(request: Request):
-    sources = db.get_sources()
+    sources = [_safe_source(source) for source in db.get_sources()]
     counts = {
         "all": len(sources),
         "active": sum(1 for source in sources if source["is_active"] and not source.get("archived_at")),
@@ -349,7 +350,9 @@ def sources_page(request: Request):
 
 class SourceCreate(BaseModel, extra='forbid'):
     source_type: Literal['telegram', 'rss', 'website', 'x']
-    external_id: str = Field(min_length=1, max_length=200)
+    external_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    telegram_input: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    allow_join: bool = False
     canonical_url: Optional[str] = Field(default=None, max_length=500)
     name: str = Field(min_length=1, max_length=200)
     priority: int = Field(default=50, ge=0, le=100)
@@ -373,16 +376,27 @@ class SourcePatch(BaseModel, extra='forbid'):
 class SourceResolve(BaseModel, extra='forbid'):
     external_id: str = Field(min_length=1, max_length=200)
 
+
+class TelegramResolveRequest(BaseModel, extra='forbid'):
+    telegram_input: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    allow_join: bool = False
+
+def _safe_source(source: dict) -> dict:
+    safe = dict(source)
+    safe.pop("telegram_reference", None)
+    return safe
+
+
 @app.get("/api/sources")
 def get_sources(is_active: Optional[bool] = None):
-    return db.get_sources(is_active)
+    return [_safe_source(source) for source in db.get_sources(is_active)]
 
 @app.get("/api/sources/{source_id}")
 def get_source(source_id: int):
     src = db.get_source(source_id)
     if not src:
         raise HTTPException(status_code=404, detail="Джерело не знайдено")
-    return src
+    return _safe_source(src)
 
 def _invalidate_source_cache():
     try:
@@ -391,12 +405,47 @@ def _invalidate_source_cache():
     except Exception as e:
         logger.warning(f"Could not invalidate source cache: {e}")
 
+
+def _queue_telegram_resolution(source_id: int, telegram_input: str, allow_join: bool) -> str:
+    import telegram_listener
+    queue = telegram_listener.telegram_resolve_queue
+    if queue is None:
+        db.mark_telegram_resolution(source_id, "failed", "Слухач Telegram зараз недоступний. Спробуйте перевірити пізніше.")
+        return "unavailable"
+    try:
+        queue.put_nowait({"source_id": source_id, "telegram_input": telegram_input, "allow_join": allow_join})
+        db.mark_telegram_resolution(source_id, "pending", None)
+        return "queued"
+    except asyncio.QueueFull:
+        db.mark_telegram_resolution(source_id, "failed", "Черга перевірки Telegram заповнена. Спробуйте пізніше.")
+        return "full"
+
+
 @app.post("/api/sources", status_code=201)
 def create_source(req: SourceCreate):
     try:
+        telegram_reference = None
+        telegram_display = None
+        external_id = req.external_id
+        parsed = None
+        if req.source_type == 'telegram':
+            from telegram_listener import parse_telegram_reference
+            telegram_value = req.telegram_input or req.external_id
+            if not telegram_value:
+                raise ValueError("Вкажіть посилання, логін або числовий ID Telegram-групи")
+            parsed = parse_telegram_reference(telegram_value)
+            if parsed.kind == 'id':
+                external_id = parsed.value
+            else:
+                telegram_reference = parsed.value
+                telegram_display = parsed.display
+                external_id = f"pending:{uuid.uuid4().hex}"
+        elif not external_id:
+            raise ValueError("Вкажіть зовнішній ID джерела")
+
         src = db.add_source(
             source_type=req.source_type,
-            external_id=req.external_id,
+            external_id=external_id,
             name=req.name,
             canonical_url=req.canonical_url,
             priority=req.priority,
@@ -405,9 +454,15 @@ def create_source(req: SourceCreate):
             poll_interval_minutes=req.poll_interval_minutes,
             include_keywords=req.include_keywords,
             exclude_keywords=req.exclude_keywords,
+            telegram_reference=telegram_reference,
+            telegram_display=telegram_display,
         )
+        if parsed is not None and parsed.kind != 'id':
+            queue_value = f"https://t.me/+{parsed.value}" if parsed.kind == 'invite' else f"@{parsed.value}"
+            _queue_telegram_resolution(src['id'], queue_value, req.allow_join)
+            src = db.get_source(src['id'])
         _invalidate_source_cache()
-        return src
+        return _safe_source(src)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Джерело з таким зовнішнім ID уже існує")
     except ValueError as e:
@@ -496,6 +551,44 @@ def resolve_source(source_id: int, req: SourceResolve):
             raise HTTPException(status_code=409, detail=err)
         raise HTTPException(status_code=422, detail=err)
 
+@app.post("/api/sources/{source_id}/verify-telegram", status_code=202)
+def verify_telegram_source(source_id: int, req: TelegramResolveRequest):
+    source = db.get_source(source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    if source['source_type'] != 'telegram':
+        raise HTTPException(status_code=422, detail="Перевірка доступна лише для Telegram-джерел")
+    try:
+        from telegram_listener import parse_telegram_reference
+        raw_reference = req.telegram_input
+        if not raw_reference and source.get('telegram_reference'):
+            stored = source['telegram_reference']
+            raw_reference = (
+                f"https://t.me/+{stored}"
+                if source.get('telegram_display') == 'Приватне запрошення Telegram'
+                else f"@{stored}"
+            )
+        if not raw_reference:
+            raise ValueError("Вкажіть нове посилання або логін Telegram-групи")
+        parsed = parse_telegram_reference(raw_reference)
+        if parsed.kind == 'id':
+            resolved = db.resolve_source(source_id, parsed.value)
+            _invalidate_source_cache()
+            return {"status": "resolved", "source": _safe_source(resolved)}
+        if parsed.kind == 'invite' and not req.allow_join:
+            db.set_telegram_reference(source_id, parsed.value, parsed.display)
+            db.mark_telegram_resolution(source_id, "join_required", "Підтвердьте вступ Telegram-акаунта до приватної групи")
+            return {"status": "join_required"}
+        db.set_telegram_reference(source_id, parsed.value, parsed.display)
+        queue_value = f"https://t.me/+{parsed.value}" if parsed.kind == 'invite' else f"@{parsed.value}"
+        status = _queue_telegram_resolution(source_id, queue_value, req.allow_join)
+        return {"status": status, "source": _safe_source(db.get_source(source_id))}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Ця Telegram-група вже додана")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
 @app.post("/api/sources/{source_id}/poll_now", status_code=202)
 def poll_now_endpoint(source_id: int):
     status = db.poll_now(source_id)
@@ -570,7 +663,7 @@ def status_page(request: Request):
     pollinations_configured = True 
     
     # Check Database
-    db_status = "Доступна"
+    db_status = "До��тупна"
     try:
         with db._get_connection() as conn:
             conn.execute("SELECT 1")

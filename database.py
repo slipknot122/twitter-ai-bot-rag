@@ -529,6 +529,11 @@ class Database:
             "include_keywords": "TEXT NOT NULL DEFAULT '[]'",
             "exclude_keywords": "TEXT NOT NULL DEFAULT '[]'",
             "archived_at": "TEXT NULL",
+            "telegram_reference": "TEXT NULL",
+            "telegram_display": "TEXT NULL",
+            "telegram_resolve_status": "TEXT NULL",
+            "telegram_resolve_error": "TEXT NULL",
+            "telegram_resolved_at": "TEXT NULL",
         }
         for name, definition in columns.items():
             if name not in existing_columns:
@@ -1328,6 +1333,8 @@ class Database:
         poll_interval_minutes: int = 30,
         include_keywords=None,
         exclude_keywords=None,
+        telegram_reference: str = None,
+        telegram_display: str = None,
     ) -> Dict[str, Any]:
         """Додати нове джерело. Повертає створене джерело як dict.
         Піднімає ValueError при невалідних даних, sqlite3.IntegrityError при дублікаті."""
@@ -1342,8 +1349,15 @@ class Database:
 
         # Нормалізація external_id для telegram
         resolution_status = 'resolved'
+        telegram_resolve_status = None
         if source_type == 'telegram':
-            external_id = normalize_telegram_id(external_id)
+            if telegram_reference is not None:
+                external_id = str(external_id).strip()
+                resolution_status = 'unresolved'
+                telegram_resolve_status = 'pending'
+            else:
+                external_id = normalize_telegram_id(external_id)
+                telegram_resolve_status = 'resolved'
 
         # Валідація canonical_url
         if canonical_url is not None:
@@ -1368,11 +1382,13 @@ class Database:
             cursor.execute(
                 "INSERT INTO sources (source_type, external_id, canonical_url, name, priority, "
                 "trust_rating, processing_mode, resolution_status, is_active, poll_interval_minutes, "
-                "include_keywords, exclude_keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "include_keywords, exclude_keywords, telegram_reference, telegram_display, telegram_resolve_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (source_type, external_id, canonical_url, name, priority, trust_rating,
                  processing_mode, resolution_status, is_active, poll_interval_minutes,
                  json.dumps(include_keywords, ensure_ascii=False),
-                 json.dumps(exclude_keywords, ensure_ascii=False))
+                 json.dumps(exclude_keywords, ensure_ascii=False), telegram_reference,
+                 telegram_display, telegram_resolve_status)
             )
             source_id = cursor.lastrowid
             if source_type in ('rss', 'website'):
@@ -1540,6 +1556,33 @@ class Database:
             conn.commit()
             return "deleted"
 
+    def set_telegram_reference(self, source_id: int, reference: str, display: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sources SET telegram_reference = ?, telegram_display = ?, resolution_status = 'unresolved', "
+                "is_active = 0, telegram_resolve_status = 'pending', telegram_resolve_error = NULL, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND source_type = 'telegram'",
+                (reference, display, source_id),
+            )
+            conn.commit()
+            return self.get_source(source_id) if cursor.rowcount else None
+
+    def mark_telegram_resolution(self, source_id: int, status: str, error: Optional[str]) -> Optional[Dict[str, Any]]:
+        allowed = {'pending', 'join_required', 'failed', 'resolved'}
+        if status not in allowed:
+            raise ValueError("Invalid Telegram resolution status")
+        safe_error = str(error)[:300] if error else None
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sources SET telegram_resolve_status = ?, telegram_resolve_error = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND source_type = 'telegram'",
+                (status, safe_error, source_id),
+            )
+            conn.commit()
+            return self.get_source(source_id) if cursor.rowcount else None
+
     def resolve_source(self, source_id: int, new_external_id: str) -> Optional[Dict[str, Any]]:
         """Resolve unresolved telegram джерело з новим числовим external_id.
         Піднімає ValueError при невалідних даних, sqlite3.IntegrityError при дублікаті."""
@@ -1575,6 +1618,8 @@ class Database:
 
             cursor.execute(
                 "UPDATE sources SET external_id = ?, resolution_status = 'resolved', is_active = 1, "
+                "telegram_resolve_status = 'resolved', telegram_resolve_error = NULL, "
+                "telegram_resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
                 (normalized, source_id)
             )
