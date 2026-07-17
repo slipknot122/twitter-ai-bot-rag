@@ -1328,12 +1328,12 @@
                 Trigger a manual parse of recent messages from active Telegram channels.
             </p>
             <div style="margin-bottom: 1rem;">
-                <label style="display: block; margin-bottom: 0.5rem; color: var(--text-muted);">Messages per channel (1-10):</label>
-                <input type="number" id="fetch_messages_limit" value="5" min="1" max="10" style="width: 100%; padding: 0.75rem; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 0.5rem; color: white;">
+                <label style="display: block; margin-bottom: 0.5rem; color: var(--text-muted);">Messages per channel (1-20):</label>
+                <input type="number" id="fetch_messages_limit" value="5" min="1" max="20" style="width: 100%; padding: 0.75rem; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 0.5rem; color: white;">
             </div>
             <div style="margin-bottom: 1.5rem;">
-                <label style="display: block; margin-bottom: 0.5rem; color: var(--text-muted);">Max channels to process (1-100):</label>
-                <input type="number" id="fetch_channels_limit" value="10" min="1" max="100" style="width: 100%; padding: 0.75rem; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 0.5rem; color: white;">
+                <label style="display: block; margin-bottom: 0.5rem; color: var(--text-muted);">Max channels to process (1-50):</label>
+                <input type="number" id="fetch_channels_limit" value="10" min="1" max="50" style="width: 100%; padding: 0.75rem; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 0.5rem; color: white;">
             </div>
             <div style="display: flex; gap: 1rem; justify-content: flex-end;">
                 <button onclick="document.getElementById('fetch-modal').style.display='none'" style="padding: 0.5rem 1rem; border-radius: 0.5rem; background: transparent; color: var(--text-muted); border: 1px solid var(--card-border); cursor: pointer;">Cancel</button>

@@ -44,8 +44,8 @@ class UpdateDraftRequest(BaseModel):
     rewritten_text: str
 
 class FetchHistoryRequest(BaseModel):
-    messages_limit: int = Field(ge=1, le=10)
-    channels_limit: int = Field(ge=1, le=100)
+    messages_limit: int = Field(ge=1, le=20)
+    channels_limit: int = Field(ge=1, le=50)
 
 class SettingsRequest(BaseModel):
     system_prompt: str

@@ -34,6 +34,18 @@ def test_fetch_history_enqueues_bounded_request():
     assert queue.get_nowait() == {"messages": 4, "channels": 7}
 
 
+def test_fetch_history_accepts_documented_maximum_limits():
+    queue = asyncio.Queue(maxsize=1)
+    with patch.object(telegram_listener, "history_fetch_queue", queue):
+        response = client.post(
+            "/api/telegram/fetch-history",
+            json={"messages_limit": 20, "channels_limit": 50},
+        )
+
+    assert response.status_code == 200
+    assert queue.get_nowait() == {"messages": 20, "channels": 50}
+
+
 def test_fetch_history_returns_409_when_request_already_queued():
     queue = asyncio.Queue(maxsize=1)
     queue.put_nowait({"messages": 1, "channels": 1})
@@ -52,9 +64,9 @@ def test_fetch_history_returns_409_when_request_already_queued():
     "payload",
     [
         {"messages_limit": 0, "channels_limit": 1},
-        {"messages_limit": 11, "channels_limit": 1},
+        {"messages_limit": 21, "channels_limit": 1},
         {"messages_limit": 1, "channels_limit": 0},
-        {"messages_limit": 1, "channels_limit": 101},
+        {"messages_limit": 1, "channels_limit": 51},
     ],
 )
 def test_fetch_history_rejects_out_of_range_limits(payload):
