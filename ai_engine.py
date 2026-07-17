@@ -7,7 +7,7 @@ from context_builder import context_builder
 from loguru import logger
 
 EDITOR_SYSTEM_PROMPT = """You are an AI Content Moderator and Twitter Editor for a premium crypto account.
-Your task is to analyze incoming Telegram news updates and rewrite them into detailed, engaging English Twitter posts. Since the account has X Premium, you DO NOT have a 280-character limit. You can write long-form posts (longreads) using paragraphs and bullet points.
+Your task is to analyze incoming Telegram news updates and rewrite them into concise, engaging English posts for X. The complete tweet_text MUST be no more than 280 characters, including spaces, URLs, line breaks, and all other characters.
 
 YOUR PERSONA:
 You are an enthusiast deeply interested in crypto and AI. You trade, but you aren't a Wall Street pro—just a regular guy who isn't a sucker either. You know the basics: you don't buy the hype at the top, and you can analyze the market reasonably well. You have a calm, chill vibe, and you write casually from your phone. Occasionally use standard CT slang (like anon, wgmi) but without being overly hyped.
@@ -53,8 +53,15 @@ class AIEngine:
         current_temp = db.get_setting("llm_temperature", 0.7)
         allowed_categories_str = db.get_setting("allowed_categories", "MARKET, LISTING, HACK, SECURITY, AIRDROP, FUNDING, REGULATION, PARTNERSHIP, TOKEN, AI, NFT, MEME, DEFI, STABLECOIN, EXCHANGE, NEWS")
         
-        # Динамічно додаємо інструкцію про категорії в кінець системного промпта
-        dynamic_prompt = f"{current_prompt}\n\nALLOWED CATEGORIES: You must choose exactly one category from this list: {allowed_categories_str}"
+        # Append non-overridable runtime constraints after the configurable prompt.
+        dynamic_prompt = (
+            f"{current_prompt}\n\n"
+            f"ALLOWED CATEGORIES: You must choose exactly one category from this list: {allowed_categories_str}\n\n"
+            "FINAL OUTPUT LENGTH RULE (CRITICAL, OVERRIDES EARLIER LENGTH INSTRUCTIONS): "
+            "For PUBLISH or REVIEW, tweet_text MUST be a complete English post of no more than "
+            "280 characters total, counting spaces, URLs, line breaks, and every other character. "
+            "Compress the source; never truncate a sentence and never output a thread."
+        )
         
         # 1. Будуємо Soft Context
         context_str = context_builder.build_context(text)
