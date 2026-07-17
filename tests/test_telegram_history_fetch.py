@@ -12,6 +12,27 @@ from web_admin.main import app
 client = TestClient(app)
 
 
+@pytest.mark.parametrize(
+    ("raw", "kind", "value", "display"),
+    [
+        ("-1001234567890", "id", "-1001234567890", "-1001234567890"),
+        ("@Example_Group", "username", "example_group", "@example_group"),
+        ("https://t.me/Example_Group", "username", "example_group", "@example_group"),
+        ("t.me/+AbCdEfGh123", "invite", "AbCdEfGh123", "Приватне запрошення Telegram"),
+        ("https://telegram.me/joinchat/AbCdEfGh123", "invite", "AbCdEfGh123", "Приватне запрошення Telegram"),
+    ],
+)
+def test_parse_telegram_reference_formats(raw, kind, value, display):
+    parsed = telegram_listener.parse_telegram_reference(raw)
+    assert (parsed.kind, parsed.value, parsed.display) == (kind, value, display)
+
+
+@pytest.mark.parametrize("raw", ["", "https://example.com/group", "https://t.me/share/url?url=x", "t.me/s/group"])
+def test_parse_telegram_reference_rejects_invalid_inputs(raw):
+    with pytest.raises(ValueError):
+        telegram_listener.parse_telegram_reference(raw)
+
+
 def test_fetch_history_returns_503_when_listener_not_ready():
     with patch.object(telegram_listener, "history_fetch_queue", None):
         response = client.post(

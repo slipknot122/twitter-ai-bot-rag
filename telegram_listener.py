@@ -1,10 +1,69 @@
 import asyncio
+import re
 import time
+from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 from telethon import TelegramClient, events
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from loguru import logger
 from config import settings
 from database import db, normalize_telegram_id
+
+
+@dataclass(frozen=True)
+class TelegramReference:
+    kind: str
+    value: str
+    display: str
+
+
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+_INVITE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+_RESERVED_PATHS = {"addstickers", "blog", "faq", "iv", "proxy", "s", "share", "username"}
+
+
+def parse_telegram_reference(raw: str) -> TelegramReference:
+    """Parse a Telegram ID, username or invite URL without exposing invite hashes."""
+    value = str(raw or "").strip()
+    if not value:
+        raise ValueError("Вкажіть посилання, логін або числовий ID Telegram-групи")
+    try:
+        numeric = normalize_telegram_id(value)
+        return TelegramReference("id", numeric, numeric)
+    except ValueError:
+        pass
+
+    candidate = value
+    if candidate.startswith("@"):
+        candidate = candidate[1:]
+    elif "://" in candidate or candidate.lower().startswith(("t.me/", "telegram.me/")):
+        parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
+        if parsed.scheme not in ("http", "https") or parsed.hostname not in ("t.me", "www.t.me", "telegram.me", "www.telegram.me"):
+            raise ValueError("Дозволені лише посилання t.me або telegram.me")
+        if parsed.query or parsed.fragment or parsed.username or parsed.password or parsed.port:
+            raise ValueError("Telegram-посилання містить непідтримувані параметри")
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) == 1 and parts[0].startswith("+"):
+            invite = parts[0][1:]
+            if not _INVITE_RE.fullmatch(invite):
+                raise ValueError("Некоректне приватне Telegram-посилання")
+            return TelegramReference("invite", invite, "Приватне запрошення Telegram")
+        if len(parts) == 2 and parts[0].lower() == "joinchat":
+            invite = parts[1]
+            if not _INVITE_RE.fullmatch(invite):
+                raise ValueError("Некоректне приватне Telegram-посилання")
+            return TelegramReference("invite", invite, "Приватне запрошення Telegram")
+        if len(parts) != 1:
+            raise ValueError("Некоректне Telegram-посилання")
+        candidate = parts[0]
+
+    candidate = candidate.strip()
+    if candidate.lower() in _RESERVED_PATHS or not _USERNAME_RE.fullmatch(candidate):
+        raise ValueError("Некоректний логін Telegram-групи")
+    username = candidate.lower()
+    return TelegramReference("username", username, f"@{username}")
+
 
 class SourceCache:
     def __init__(self, db_instance, ttl_seconds=60):
@@ -46,6 +105,46 @@ class SourceCache:
 source_cache = SourceCache(db)
 
 history_fetch_queue: Optional[asyncio.Queue] = None
+telegram_resolve_queue: Optional[asyncio.Queue] = None
+
+
+async def _telegram_resolve_worker(client, cache, db_instance, queue):
+    while True:
+        request = await queue.get()
+        try:
+            source_id = request["source_id"]
+            reference = parse_telegram_reference(request["telegram_input"])
+            if reference.kind == "id":
+                entity_id = reference.value
+            elif reference.kind == "username":
+                entity = await asyncio.wait_for(client.get_entity(reference.value), timeout=15)
+                entity_id = str(entity.id)
+            else:
+                invite = await asyncio.wait_for(client(CheckChatInviteRequest(reference.value)), timeout=15)
+                chat = getattr(invite, "chat", None)
+                if chat is None:
+                    if not request.get("allow_join"):
+                        db_instance.mark_telegram_resolution(source_id, "join_required", "Потрібне підтвердження вступу до приватної групи")
+                        continue
+                    updates = await asyncio.wait_for(client(ImportChatInviteRequest(reference.value)), timeout=20)
+                    chats = getattr(updates, "chats", [])
+                    chat = chats[0] if chats else None
+                if chat is None:
+                    raise RuntimeError("Telegram invite did not return a chat")
+                entity_id = str(chat.id)
+            db_instance.resolve_source(source_id, entity_id)
+            db_instance.mark_telegram_resolution(source_id, "resolved", None)
+            cache.invalidate()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            source_id = request.get("source_id")
+            if source_id is not None:
+                db_instance.mark_telegram_resolution(source_id, "failed", "Не вдалося перевірити Telegram-групу. Спробуйте ще раз.")
+            logger.error("Telegram source resolution failed [SAFE_ERR_TG_RESOLVE]")
+        finally:
+            queue.task_done()
+
 
 async def _history_fetch_worker(client, cache, db_instance, queue):
     while True:
@@ -140,7 +239,7 @@ async def process_telegram_event(event, cache, db_instance):
 
 async def start_listener():
     """Запуск Telegram слухача."""
-    global history_fetch_queue
+    global history_fetch_queue, telegram_resolve_queue
 
     try:
         client = create_telegram_client()
@@ -159,11 +258,16 @@ async def start_listener():
         await process_telegram_event(event, source_cache, db)
 
     worker_task = None
+    resolve_worker_task = None
     try:
         await client.start()
         history_fetch_queue = asyncio.Queue(maxsize=1)
+        telegram_resolve_queue = asyncio.Queue(maxsize=20)
         worker_task = asyncio.create_task(
             _history_fetch_worker(client, source_cache, db, history_fetch_queue)
+        )
+        resolve_worker_task = asyncio.create_task(
+            _telegram_resolve_worker(client, source_cache, db, telegram_resolve_queue)
         )
         logger.success("Telegram Client started and listening for messages")
         await client.run_until_disconnected()
@@ -172,9 +276,11 @@ async def start_listener():
         raise RuntimeError("Telegram Client connection failed [SAFE_ERR_CONNECTION_FAILED]")
     finally:
         history_fetch_queue = None
-        if worker_task is not None:
-            worker_task.cancel()
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                pass
+        telegram_resolve_queue = None
+        for task in (worker_task, resolve_worker_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
