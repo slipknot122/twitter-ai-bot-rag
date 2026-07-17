@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Налаштування AI-аудитора</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --background: #0f172a;
+            --surface: #1e293b;
+            --foreground: #f8fafc;
+            --muted: #94a3b8;
+            --accent: #3b82f6;
+        }
+        * { box-sizing: border-box; }
+        body { margin: 0; min-height: 100vh; background: var(--background); color: var(--foreground); font-family: Inter, sans-serif; line-height: 1.5; }
+        button, input, select, textarea { font: inherit; }
+        button, select { cursor: pointer; }
+        .shell { width: min(1120px, calc(100% - 2rem)); margin: 0 auto; padding: 2rem 0 4rem; }
+        .topbar { display: flex; flex-direction: column; gap: 1.5rem; margin-bottom: 2rem; }
+        .eyebrow { color: var(--accent); font-size: .8rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+        h1, h2 { margin: 0; text-wrap: balance; }
+        h1 { margin-top: .4rem; font-size: clamp(2rem, 6vw, 3.25rem); line-height: 1.1; }
+        h2 { font-size: 1.1rem; }
+        p { margin: 0; color: var(--muted); }
+        .nav { display: flex; flex-wrap: wrap; gap: .75rem; }
+        .nav a { color: var(--foreground); text-decoration: none; border: 1px solid var(--muted); border-radius: .6rem; padding: .65rem .9rem; }
+        .nav a:hover, .nav a:focus-visible { border-color: var(--accent); outline: none; }
+        .notice { display: flex; gap: .75rem; border-left: 3px solid var(--accent); background: var(--surface); padding: 1rem; border-radius: .5rem; margin-bottom: 1.5rem; }
+        .notice strong { display: block; margin-bottom: .2rem; }
+        .layout { display: grid; gap: 1rem; }
+        .card { background: var(--surface); border: 1px solid var(--muted); border-radius: .9rem; padding: 1.25rem; }
+        .card-header { display: flex; justify-content: space-between; align-items: start; gap: 1rem; margin-bottom: 1.25rem; }
+        .badge { color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: .25rem .55rem; font-size: .75rem; white-space: nowrap; }
+        .field { display: flex; flex-direction: column; gap: .45rem; }
+        .field + .field { margin-top: 1rem; }
+        label { font-weight: 600; }
+        .help { font-size: .84rem; }
+        input, select, textarea { width: 100%; color: var(--foreground); background: var(--background); border: 1px solid var(--muted); border-radius: .55rem; padding: .75rem; }
+        input:focus, select:focus, textarea:focus { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 1px; }
+        textarea { min-height: 330px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88rem; line-height: 1.55; }
+        .grid { display: grid; gap: 1rem; }
+        .actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.25rem; }
+        .button { border: 1px solid var(--accent); border-radius: .6rem; padding: .75rem 1rem; background: var(--accent); color: var(--foreground); font-weight: 700; }
+        .button.secondary { background: transparent; }
+        .button:disabled { opacity: .55; cursor: not-allowed; }
+        .status { min-height: 1.5rem; margin-top: .75rem; color: var(--foreground); }
+        dialog { width: min(900px, calc(100% - 2rem)); max-height: 85vh; color: var(--foreground); background: var(--surface); border: 1px solid var(--muted); border-radius: .9rem; padding: 0; }
+        dialog::backdrop { background: color-mix(in srgb, var(--background) 80%, transparent); }
+        .dialog-body { padding: 1.25rem; }
+        pre { max-height: 60vh; overflow: auto; white-space: pre-wrap; color: var(--foreground); background: var(--background); border: 1px solid var(--muted); border-radius: .6rem; padding: 1rem; font-size: .82rem; }
+        @media (min-width: 760px) {
+            .topbar { flex-direction: row; align-items: end; justify-content: space-between; }
+            .layout { grid-template-columns: minmax(0, 1.35fr) minmax(300px, .65fr); }
+            .grid.two { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+    <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body class="has-admin-sidebar">
+    {% include "_admin_nav.html" %}
+    <main class="shell">
+        <header class="topbar">
+            <div>
+                <span class="eyebrow">Контроль якості</span>
+                <h1>AI-аудитор</h1>
+                <p>Налаштовуйте правила перевірки, не послаблюючи захист структури та захист від ін’єкцій у промпт.</p>
+            </div>
+            <nav class="nav" aria-label="Навігація адміністратора">
+                <a href="/">Панель</a>
+                <a href="/sources">Джерела</a>
+                <a href="/settings">Налаштування бота</a>
+                <a href="/auditor" aria-current="page">AI-аудитор</a>
+                <a href="/status">Стан системи</a>
+                <a href="/logs">Журнал</a>
+            </nav>
+        </header>
+
+        <section class="notice" aria-label="Застосування налаштувань">
+            <div>
+                <strong>Зміни одразу застосуються до наступної чернетки.</strong>
+                <p>Для першого аудиту, виправлення та фінальної перевірки кожна чернетка використовує один знімок конфігурації.</p>
+            </div>
+        </section>
+
+        <form id="auditor-form" class="layout">
+            <section class="card">
+                <div class="card-header">
+                    <div><h2>Редагована політика аудитора</h2><p class="help">Опишіть тон, обробку реферального контенту та вимоги до якості.</p></div>
+                    <span class="badge">Правила безпеки захищені</span>
+                </div>
+                <div class="field">
+                    <label for="policy-prompt">Інструкції політики</label>
+                    <textarea id="policy-prompt" minlength="20" maxlength="6000" required>{{ auditor_config.policy_prompt }}</textarea>
+                    <p class="help"><span id="prompt-count">0</span> / 6000 символів</p>
+                </div>
+                <div class="field">
+                    <label for="referral-policy">Політика реферального контенту</label>
+                    <select id="referral-policy">
+                        <option value="strict" {% if auditor_config.referral_policy == 'strict' %}selected{% endif %}>Сувора — перевіряти рекламу, якщо її не можна безпечно відокремити</option>
+                        <option value="balanced" {% if auditor_config.referral_policy == 'balanced' %}selected{% endif %}>Збалансована — зберігати факти й прибирати рекламний шум</option>
+                        <option value="permissive" {% if auditor_config.referral_policy == 'permissive' %}selected{% endif %}>Гнучка — оцінювати очищену чернетку окремо</option>
+                    </select>
+                </div>
+            </section>
+
+            <aside class="grid">
+                <section class="card">
+                    <div class="card-header"><div><h2>Модель</h2><p class="help">Можна зберегти лише модель із налаштованим провайдером.</p></div></div>
+                    <div class="field">
+                        <label for="model">Модель аудитора</label>
+                        <select id="model">
+                            {% for model in models %}
+                            <option value="{{ model.id }}" {% if auditor_config.model == model.id %}selected{% endif %} {% if not model.available %}disabled{% endif %}>{{ model.id }}{% if not model.available %} — ключ відсутній{% endif %}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="temperature">Температура: <span id="temperature-value">{{ auditor_config.temperature }}</span></label>
+                        <input id="temperature" type="range" min="0" max="1" step="0.05" value="{{ auditor_config.temperature }}">
+                    </div>
+                </section>
+
+                <section class="card">
+                    <div class="card-header"><div><h2>Пороги рішення</h2><p class="help">Вищі значення точності й оцінки суворіші. Нижчі допустимі ризики також суворіші.</p></div></div>
+                    <div class="grid two">
+                        <div class="field"><label for="fidelity-standard">Точність звичайних тем</label><input id="fidelity-standard" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.factual_fidelity_standard }}"></div>
+                        <div class="field"><label for="fidelity-sensitive">Точність чутливих тем</label><input id="fidelity-sensitive" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.factual_fidelity_sensitive }}"></div>
+                        <div class="field"><label for="policy-risk">Максимальний ризик політики</label><input id="policy-risk" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.policy_risk_max }}"></div>
+                        <div class="field"><label for="duplicate-risk">Максимальний ризик дубля</label><input id="duplicate-risk" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.duplicate_risk_max }}"></div>
+                        <div class="field"><label for="overall-score">Мінімальна загальна оцінка</label><input id="overall-score" type="number" min="0" max="1" step="0.01" value="{{ auditor_config.overall_score_min }}"></div>
+                    </div>
+                    <div class="actions">
+                        <button class="button" id="save-button" type="submit">Зберегти конфігурацію</button>
+                        <button class="button secondary" id="preview-button" type="button">Переглянути промпт</button>
+                        <button class="button secondary" id="reset-button" type="button">Скинути налаштування</button>
+                    </div>
+                    <p class="status" id="status" role="status" aria-live="polite"></p>
+                </section>
+            </aside>
+        </form>
+    </main>
+
+    <dialog id="preview-dialog" aria-labelledby="preview-title">
+        <div class="dialog-body">
+            <div class="card-header"><div><h2 id="preview-title">Повний промпт аудитора</h2><p class="help">Захищені правила безпеки разом із вашою редагованою політикою.</p></div><button class="button secondary" id="close-preview" type="button">Закрити</button></div>
+            <pre id="prompt-preview"></pre>
+        </div>
+    </dialog>
+
+    <script>
+        const form = document.getElementById('auditor-form');
+        const statusNode = document.getElementById('status');
+        const saveButton = document.getElementById('save-button');
+        const promptInput = document.getElementById('policy-prompt');
+        const temperatureInput = document.getElementById('temperature');
+
+        function payload() {
+            return {
+                schema_version: 1,
+                model: document.getElementById('model').value,
+                temperature: Number(temperatureInput.value),
+                factual_fidelity_standard: Number(document.getElementById('fidelity-standard').value),
+                factual_fidelity_sensitive: Number(document.getElementById('fidelity-sensitive').value),
+                policy_risk_max: Number(document.getElementById('policy-risk').value),
+                duplicate_risk_max: Number(document.getElementById('duplicate-risk').value),
+                overall_score_min: Number(document.getElementById('overall-score').value),
+                referral_policy: document.getElementById('referral-policy').value,
+                policy_prompt: promptInput.value
+            };
+        }
+
+        function updateCounters() {
+            document.getElementById('prompt-count').textContent = promptInput.value.length;
+            document.getElementById('temperature-value').textContent = Number(temperatureInput.value).toFixed(2);
+        }
+
+        function applyConfig(config) {
+            document.getElementById('model').value = config.model;
+            temperatureInput.value = config.temperature;
+            document.getElementById('fidelity-standard').value = config.factual_fidelity_standard;
+            document.getElementById('fidelity-sensitive').value = config.factual_fidelity_sensitive;
+            document.getElementById('policy-risk').value = config.policy_risk_max;
+            document.getElementById('duplicate-risk').value = config.duplicate_risk_max;
+            document.getElementById('overall-score').value = config.overall_score_min;
+            document.getElementById('referral-policy').value = config.referral_policy;
+            promptInput.value = config.policy_prompt;
+            updateCounters();
+        }
+
+        async function requestJson(url, options) {
+            const response = await fetch(url, options);
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || 'Не вдалося виконати запит');
+            return data;
+        }
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (!form.reportValidity()) return;
+            saveButton.disabled = true;
+            statusNode.textContent = 'Збереження конфігурації...';
+            try {
+                await requestJson('/api/auditor/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload()) });
+                statusNode.textContent = 'Збережено. Наступна чернетка використає цю конфігурацію.';
+            } catch (error) {
+                statusNode.textContent = error.message;
+            } finally {
+                saveButton.disabled = false;
+            }
+        });
+
+        document.getElementById('preview-button').addEventListener('click', async () => {
+            if (!form.reportValidity()) return;
+            try {
+                const data = await requestJson('/api/auditor/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload()) });
+                document.getElementById('prompt-preview').textContent = data.effective_prompt;
+                document.getElementById('preview-dialog').showModal();
+            } catch (error) {
+                statusNode.textContent = error.message;
+            }
+        });
+
+        document.getElementById('reset-button').addEventListener('click', async () => {
+            if (!window.confirm('Скинути конфігурацію аудитора до безпечних стандартних значень?')) return;
+            try {
+                const data = await requestJson('/api/auditor/reset', { method: 'POST' });
+                applyConfig(data.config);
+                statusNode.textContent = 'Безпечні стандартні налаштування відновлено й застосовано.';
+            } catch (error) {
+                statusNode.textContent = error.message;
+            }
+        });
+
+        document.getElementById('close-preview').addEventListener('click', () => document.getElementById('preview-dialog').close());
+        promptInput.addEventListener('input', updateCounters);
+        temperatureInput.addEventListener('input', updateCounters);
+        updateCounters();
+    </script>
+<script src="/static/admin.js" defer></script>
+</body>
+</html>

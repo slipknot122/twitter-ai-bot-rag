@@ -16,6 +16,38 @@ class AmbiguousPublishStateError(Exception):
     pass
 
 
+def normalize_source_keywords(values) -> List[str]:
+    """Normalize bounded keyword lists for predictable Unicode-safe matching."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = values.split(',')
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("keywords must be a list or comma-separated string")
+    result = []
+    seen = set()
+    for value in values:
+        keyword = str(value).strip().casefold()
+        if not keyword or keyword in seen:
+            continue
+        if len(keyword) > 80:
+            raise ValueError("keyword must not exceed 80 characters")
+        seen.add(keyword)
+        result.append(keyword)
+    if len(result) > 50:
+        raise ValueError("keyword list must not exceed 50 items")
+    return result
+
+
+def source_text_matches(text: str, include_keywords, exclude_keywords) -> bool:
+    haystack = str(text or '').casefold()
+    includes = normalize_source_keywords(include_keywords)
+    excludes = normalize_source_keywords(exclude_keywords)
+    if any(keyword in haystack for keyword in excludes):
+        return False
+    return not includes or any(keyword in haystack for keyword in includes)
+
+
 def normalize_telegram_id(raw) -> str:
     """Нормалізує Telegram channel ID до канонічного формату '-100...'.
     Піднімає ValueError при невалідному вводі (юзернейми, URL, порожні, нечислові)."""
@@ -324,6 +356,9 @@ class Database:
             # 8. Phase 6 migration — ingestion state та leases
             self._migrate_phase6(cursor, conn)
 
+            # 9. Source management migration — filters, cadence, archive lifecycle
+            self._migrate_source_management(cursor, conn)
+
             logger.debug(f"Database initialized at {self.db_path}")
 
             if self.get_setting("publish_delay_minutes") is None:
@@ -482,6 +517,26 @@ class Database:
             WHERE source_type IN ('rss', 'website')
         """)
 
+        conn.commit()
+
+    def _migrate_source_management(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection):
+        """Backward-compatible source settings and archive lifecycle migration."""
+        cursor.execute('BEGIN IMMEDIATE')
+        cursor.execute("PRAGMA table_info(sources)")
+        existing_columns = {row['name'] for row in cursor.fetchall()}
+        columns = {
+            "poll_interval_minutes": "INTEGER NOT NULL DEFAULT 30 CHECK(poll_interval_minutes BETWEEN 5 AND 1440)",
+            "include_keywords": "TEXT NOT NULL DEFAULT '[]'",
+            "exclude_keywords": "TEXT NOT NULL DEFAULT '[]'",
+            "archived_at": "TEXT NULL",
+        }
+        for name, definition in columns.items():
+            if name not in existing_columns:
+                cursor.execute(f"ALTER TABLE sources ADD COLUMN {name} {definition}")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sources_archive_active "
+            "ON sources(archived_at, is_active, source_type)"
+        )
         conn.commit()
 
     def _transition_draft(self, conn: sqlite3.Connection, draft_id: int, expected_statuses: Set[str], new_status: str, updates: dict = None) -> bool:
@@ -1184,14 +1239,23 @@ class Database:
                 conn.execute('BEGIN IMMEDIATE')
 
                 cursor.execute(
-                    "SELECT id, name, priority, trust_rating, processing_mode, is_active, resolution_status "
+                    "SELECT id, name, priority, trust_rating, processing_mode, is_active, resolution_status, "
+                    "include_keywords, exclude_keywords, archived_at "
                     "FROM sources WHERE source_type = ? AND external_id = ?",
                     (source_type, external_id)
                 )
                 src = cursor.fetchone()
-                if not src or src['is_active'] == 0 or src['resolution_status'] == 'unresolved':
+                if (not src or src['is_active'] == 0 or src['resolution_status'] == 'unresolved'
+                        or src['archived_at'] is not None):
                     conn.rollback()
                     return "rejected"
+                if not source_text_matches(
+                    original_text,
+                    json.loads(src['include_keywords'] or '[]'),
+                    json.loads(src['exclude_keywords'] or '[]'),
+                ):
+                    conn.rollback()
+                    return "filtered"
 
                 cursor.execute(
                     "INSERT INTO drafts (original_text, status, source_id, source_name_snapshot, "
@@ -1233,7 +1297,11 @@ class Database:
             else:
                 query += " ORDER BY s.id"
                 cursor.execute(query)
-            return [dict(row) for row in cursor.fetchall()]
+            sources = [dict(row) for row in cursor.fetchall()]
+            for source in sources:
+                source['include_keywords'] = json.loads(source.get('include_keywords') or '[]')
+                source['exclude_keywords'] = json.loads(source.get('exclude_keywords') or '[]')
+            return sources
 
     def get_source(self, source_id: int) -> Optional[Dict[str, Any]]:
         """Отримати джерело за ID."""
@@ -1241,7 +1309,12 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            source = dict(row)
+            source['include_keywords'] = json.loads(source.get('include_keywords') or '[]')
+            source['exclude_keywords'] = json.loads(source.get('exclude_keywords') or '[]')
+            return source
 
     def add_source(
         self,
@@ -1252,6 +1325,9 @@ class Database:
         priority: int = 50,
         trust_rating: int = 50,
         processing_mode: str = 'auto',
+        poll_interval_minutes: int = 30,
+        include_keywords=None,
+        exclude_keywords=None,
     ) -> Dict[str, Any]:
         """Додати нове джерело. Повертає створене джерело як dict.
         Піднімає ValueError при невалідних даних, sqlite3.IntegrityError при дублікаті."""
@@ -1280,6 +1356,10 @@ class Database:
             raise ValueError(f"trust_rating must be 0-100, got {trust_rating}")
         if processing_mode not in ('auto', 'review'):
             raise ValueError(f"Invalid processing_mode: {processing_mode!r}")
+        if not (5 <= poll_interval_minutes <= 1440):
+            raise ValueError("poll_interval_minutes must be 5-1440")
+        include_keywords = normalize_source_keywords(include_keywords)
+        exclude_keywords = normalize_source_keywords(exclude_keywords)
 
         is_active = 1 if resolution_status == 'resolved' else 0
 
@@ -1287,10 +1367,12 @@ class Database:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO sources (source_type, external_id, canonical_url, name, priority, "
-                "trust_rating, processing_mode, resolution_status, is_active) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (source_type, external_id, canonical_url, name, priority,
-                 trust_rating, processing_mode, resolution_status, is_active)
+                "trust_rating, processing_mode, resolution_status, is_active, poll_interval_minutes, "
+                "include_keywords, exclude_keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (source_type, external_id, canonical_url, name, priority, trust_rating,
+                 processing_mode, resolution_status, is_active, poll_interval_minutes,
+                 json.dumps(include_keywords, ensure_ascii=False),
+                 json.dumps(exclude_keywords, ensure_ascii=False))
             )
             source_id = cursor.lastrowid
             if source_type in ('rss', 'website'):
@@ -1308,6 +1390,7 @@ class Database:
         allowed_fields = {
             'name', 'canonical_url', 'priority', 'trust_rating',
             'processing_mode', 'is_active', 'external_id', 'source_type',
+            'poll_interval_minutes', 'include_keywords', 'exclude_keywords',
         }
         for key in updates:
             if key not in allowed_fields:
@@ -1347,6 +1430,14 @@ class Database:
             if 'processing_mode' in updates and updates['processing_mode'] not in ('auto', 'review'):
                 conn.rollback()
                 raise ValueError(f"Invalid processing_mode: {updates['processing_mode']!r}")
+            if 'poll_interval_minutes' in updates and not (5 <= updates['poll_interval_minutes'] <= 1440):
+                conn.rollback()
+                raise ValueError("poll_interval_minutes must be 5-1440")
+            for keyword_field in ('include_keywords', 'exclude_keywords'):
+                if keyword_field in updates:
+                    updates[keyword_field] = json.dumps(
+                        normalize_source_keywords(updates[keyword_field]), ensure_ascii=False
+                    )
             if 'canonical_url' in updates and updates['canonical_url'] is not None:
                 source_type = updates.get('source_type', current_dict['source_type'])
                 updates['canonical_url'] = _validate_canonical_url(updates['canonical_url'], source_type)
@@ -1386,6 +1477,68 @@ class Database:
             cursor.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    def archive_source(self, source_id: int) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            cursor.execute(
+                "UPDATE sources SET is_active = 0, archived_at = COALESCE(archived_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')), "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+                (source_id,),
+            )
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return None
+            cursor.execute(
+                "UPDATE source_poll_state SET lease_token = NULL, lease_expires_at = NULL, collector_status = 'idle' "
+                "WHERE source_id = ?",
+                (source_id,),
+            )
+            conn.commit()
+            return self.get_source(source_id)
+
+    def restore_source(self, source_id: int) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sources SET archived_at = NULL, is_active = CASE WHEN resolution_status = 'resolved' THEN 1 ELSE 0 END, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+                (source_id,),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            return self.get_source(source_id)
+
+    def get_source_usage(self, source_id: int) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM sources WHERE id = ?", (source_id,))
+            if not cursor.fetchone():
+                return None
+            cursor.execute("SELECT COUNT(*) AS count FROM drafts WHERE source_id = ?", (source_id,))
+            return {"source_id": source_id, "draft_count": cursor.fetchone()['count']}
+
+    def delete_source_permanently(self, source_id: int, detach_drafts: bool = False) -> str:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            conn.execute('BEGIN IMMEDIATE')
+            cursor.execute("SELECT id FROM sources WHERE id = ?", (source_id,))
+            if not cursor.fetchone():
+                conn.rollback()
+                return "missing"
+            cursor.execute("SELECT COUNT(*) AS count FROM drafts WHERE source_id = ?", (source_id,))
+            draft_count = cursor.fetchone()['count']
+            if draft_count and not detach_drafts:
+                conn.rollback()
+                return "conflict"
+            if draft_count:
+                cursor.execute("UPDATE drafts SET source_id = NULL WHERE source_id = ?", (source_id,))
+            cursor.execute("DELETE FROM source_poll_state WHERE source_id = ?", (source_id,))
+            cursor.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+            conn.commit()
+            return "deleted"
 
     def resolve_source(self, source_id: int, new_external_id: str) -> Optional[Dict[str, Any]]:
         """Resolve unresolved telegram джерело з новим числовим external_id.
@@ -1548,7 +1701,7 @@ class Database:
 
             # Fetch complete row
             cursor.execute("""
-                SELECT p.*, s.source_type, s.external_id, s.name, s.priority, s.trust_rating, s.processing_mode, s.canonical_url
+                SELECT p.*, s.source_type, s.external_id, s.name, s.priority, s.trust_rating, s.processing_mode, s.canonical_url, s.poll_interval_minutes
                 FROM source_poll_state p
                 JOIN sources s ON p.source_id = s.id
                 WHERE p.source_id = ?
@@ -1665,12 +1818,18 @@ class Database:
 
                 if drafts_to_insert:
                     cursor.execute(
-                        "SELECT name, priority, trust_rating, processing_mode FROM sources WHERE id = ?",
+                        "SELECT name, priority, trust_rating, processing_mode, include_keywords, exclude_keywords FROM sources WHERE id = ?",
                         (source_id,)
                     )
                     src_meta = cursor.fetchone()
 
+                    include_keywords = json.loads(src_meta['include_keywords'] or '[]')
+                    exclude_keywords = json.loads(src_meta['exclude_keywords'] or '[]')
                     for draft in drafts_to_insert:
+                        if not source_text_matches(
+                            draft.get('original_text', ''), include_keywords, exclude_keywords
+                        ):
+                            continue
                         cursor.execute("""
                             INSERT INTO drafts (
                                 original_text, status, source_id, source_name_snapshot,

@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Джерела — Bot Control{% endblock %}
+{% block content %}
+<header class="page-header">
+  <div><p class="eyebrow">Ingestion control</p><h1 class="page-title">Джерела</h1><p class="page-description">Керуйте Telegram-групами, RSS та сайтами, задавайте правила відбору й контролюйте стан збору.</p></div>
+  <div class="toolbar"><button class="button" type="button" data-create-source>Додати джерело</button></div>
+</header>
+<section class="metrics" aria-label="Статистика джерел">
+  <article class="metric"><span class="metric-label">Усього</span><strong class="metric-value">{{ counts.all }}</strong></article>
+  <article class="metric"><span class="metric-label">Активні</span><strong class="metric-value">{{ counts.active }}</strong></article>
+  <article class="metric"><span class="metric-label">В архіві</span><strong class="metric-value">{{ counts.archived }}</strong></article>
+  <article class="metric"><span class="metric-label">Потребують уваги</span><strong class="metric-value">{{ sources|selectattr('resolution_status', 'equalto', 'unresolved')|list|length }}</strong></article>
+</section>
+<div class="filter-row">
+  <input class="input search" id="source-search" type="search" placeholder="Пошук за назвою або ID…" aria-label="Пошук джерел">
+  <select class="select" id="type-filter" aria-label="Тип джерела"><option value="">Усі типи</option><option value="telegram">Telegram</option><option value="rss">RSS</option><option value="website">Вебсайт</option><option value="x">X</option></select>
+  <div class="tabs" role="tablist" aria-label="Стан джерел"><button class="tab-button active" data-view="active">Активні {{ counts.active }}</button><button class="tab-button" data-view="archived">Архів {{ counts.archived }}</button><button class="tab-button" data-view="all">Усі {{ counts.all }}</button></div>
+</div>
+<section class="panel">
+  <div class="panel-header"><h2 class="panel-title">Каталог джерел</h2><span class="muted" id="visible-count"></span></div>
+  <div class="source-list" id="source-list">
+    {% for source in sources %}
+    <article class="source-row" data-source-row data-id="{{ source.id }}" data-type="{{ source.source_type }}" data-archived="{{ 'true' if source.archived_at else 'false' }}" data-active="{{ 'true' if source.is_active else 'false' }}" data-search="{{ (source.name ~ ' ' ~ source.external_id)|lower }}">
+      <div class="source-main"><h3 class="source-name">{{ source.name }} {% if source.archived_at %}<span class="badge">Архів</span>{% elif source.resolution_status == 'unresolved' %}<span class="badge warn">Не уточнено</span>{% elif source.is_active %}<span class="badge success">Активне</span>{% else %}<span class="badge">Неактивне</span>{% endif %}</h3><p class="source-id">{{ source.external_id }}</p></div>
+      <div><span class="badge">{{ source.source_type|upper }}</span></div>
+      <div class="source-meta">Довіра <strong>{{ source.trust_rating }}</strong><br>Пріоритет {{ source.priority }}</div>
+      <div class="source-meta">{{ 'Автообробка' if source.processing_mode == 'auto' else 'Ручна перевірка' }}<br>{% if source.source_type in ['rss','website'] %}кожні {{ source.poll_interval_minutes }} хв{% else %}події наживо{% endif %}</div>
+      <div class="row-actions"><button class="button small secondary" data-edit="{{ source.id }}">Редагувати</button>{% if source.archived_at %}<button class="button small" data-restore="{{ source.id }}">Відновити</button>{% else %}<button class="button small ghost" data-archive="{{ source.id }}">Архівувати</button>{% endif %}<button class="button small ghost danger-text" data-delete="{{ source.id }}">Видалити</button></div>
+    </article>
+    {% endfor %}
+    <div class="empty-state hidden" id="source-empty">За вибраними умовами джерел не знайдено.</div>
+  </div>
+</section>
+<dialog class="dialog" id="source-dialog">
+  <form class="dialog-card" id="source-form">
+    <div><p class="eyebrow">Налаштування джерела</p><h2 id="source-form-title">Нове джерело</h2><p class="muted">Правила включення та виключення застосовуються до створення чернетки.</p></div>
+    <input type="hidden" id="source-id">
+    <div class="form-grid">
+      <div class="field"><label for="source-type">Тип</label><select class="select" id="source-type" required><option value="telegram">Telegram</option><option value="rss">RSS</option><option value="website">Вебсайт</option><option value="x">X</option></select></div>
+      <div class="field"><label for="source-name">Назва</label><input class="input" id="source-name" maxlength="200" required></div>
+      <div class="field full"><label for="source-external-id">ID каналу або ідентифікатор</label><input class="input" id="source-external-id" maxlength="200" required><span class="helper">Для Telegram використовуйте числовий ID каналу.</span></div>
+      <div class="field full"><label for="source-url">Канонічна URL-адреса</label><input class="input" id="source-url" type="url" maxlength="500"></div>
+      <div class="field"><label for="source-priority">Пріоритет (0–100)</label><input class="input" id="source-priority" type="number" min="0" max="100" value="50"></div>
+      <div class="field"><label for="source-trust">Довіра (0–100)</label><input class="input" id="source-trust" type="number" min="0" max="100" value="50"></div>
+      <div class="field"><label for="source-mode">Режим обробки</label><select class="select" id="source-mode"><option value="auto">Автоматично</option><option value="review">Ручна перевірка</option></select></div>
+      <div class="field"><label for="source-interval">Інтервал перевірки, хв</label><input class="input" id="source-interval" type="number" min="5" max="1440" value="30"></div>
+      <div class="field full"><label for="source-include">Обов’язкові ключові слова</label><textarea class="textarea" id="source-include" placeholder="AI, стартапи, технології"></textarea><span class="helper">Хоча б одне слово має бути в повідомленні. Порожнє поле дозволяє всі.</span></div>
+      <div class="field full"><label for="source-exclude">Слова-виключення</label><textarea class="textarea" id="source-exclude" placeholder="реклама, казино, спам"></textarea><span class="helper">Будь-який збіг відхиляє повідомлення до AI-обробки.</span></div>
+    </div>
+    <div class="dialog-actions"><button class="button secondary" type="button" data-close-source>Скасувати</button><button class="button" type="submit" id="source-submit">Зберегти</button></div>
+  </form>
+</dialog>
+{% endblock %}
+{% block scripts %}<script>
+const rows=[...document.querySelectorAll('[data-source-row]')],dialog=document.querySelector('#source-dialog'),form=document.querySelector('#source-form');let view='active';
+const keywords=v=>v.split(/[\n,]/).map(x=>x.trim()).filter(Boolean);const api=async(url,options={})=>{const response=await fetch(url,{headers:{'Content-Type':'application/json'},...options});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:(data.detail?.message||'Не вдалося виконати дію'));return data};
+function filterRows(){const q=document.querySelector('#source-search').value.trim().toLowerCase(),type=document.querySelector('#type-filter').value;let visible=0;rows.forEach(row=>{const archive=row.dataset.archived==='true';const state=view==='all'||(view==='archived'?archive:!archive);const show=state&&(!type||row.dataset.type===type)&&(!q||row.dataset.search.includes(q));row.classList.toggle('hidden',!show);if(show)visible++});document.querySelector('#visible-count').textContent=`Показано: ${visible}`;document.querySelector('#source-empty').classList.toggle('hidden',visible>0)}
+document.querySelector('#source-search').addEventListener('input',filterRows);document.querySelector('#type-filter').addEventListener('change',filterRows);document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>{view=button.dataset.view;document.querySelectorAll('[data-view]').forEach(x=>x.classList.toggle('active',x===button));filterRows()}));filterRows();
+function resetForm(){form.reset();document.querySelector('#source-id').value='';document.querySelector('#source-priority').value=50;document.querySelector('#source-trust').value=50;document.querySelector('#source-interval').value=30;document.querySelector('#source-form-title').textContent='Нове джерело';document.querySelector('#source-type').disabled=false;document.querySelector('#source-external-id').disabled=false}
+document.querySelector('[data-create-source]').addEventListener('click',()=>{resetForm();dialog.showModal()});document.querySelector('[data-close-source]').addEventListener('click',()=>dialog.close());
+document.querySelectorAll('[data-edit]').forEach(button=>button.addEventListener('click',async()=>{try{const s=await api(`/api/sources/${button.dataset.edit}`);resetForm();document.querySelector('#source-id').value=s.id;document.querySelector('#source-form-title').textContent='Редагувати джерело';document.querySelector('#source-type').value=s.source_type;document.querySelector('#source-type').disabled=true;document.querySelector('#source-external-id').value=s.external_id;document.querySelector('#source-external-id').disabled=true;document.querySelector('#source-name').value=s.name;document.querySelector('#source-url').value=s.canonical_url||'';document.querySelector('#source-priority').value=s.priority;document.querySelector('#source-trust').value=s.trust_rating;document.querySelector('#source-mode').value=s.processing_mode;document.querySelector('#source-interval').value=s.poll_interval_minutes;document.querySelector('#source-include').value=(s.include_keywords||[]).join(', ');document.querySelector('#source-exclude').value=(s.exclude_keywords||[]).join(', ');dialog.showModal()}catch(e){adminToast(e.message,'error')}}));
+form.addEventListener('submit',async event=>{event.preventDefault();const id=document.querySelector('#source-id').value,payload={name:document.querySelector('#source-name').value.trim(),canonical_url:document.querySelector('#source-url').value.trim()||null,priority:Number(document.querySelector('#source-priority').value),trust_rating:Number(document.querySelector('#source-trust').value),processing_mode:document.querySelector('#source-mode').value,poll_interval_minutes:Number(document.querySelector('#source-interval').value),include_keywords:keywords(document.querySelector('#source-include').value),exclude_keywords:keywords(document.querySelector('#source-exclude').value)};if(!id){payload.source_type=document.querySelector('#source-type').value;payload.external_id=document.querySelector('#source-external-id').value.trim()}const submit=document.querySelector('#source-submit');submit.disabled=true;try{await api(id?`/api/sources/${id}`:'/api/sources',{method:id?'PATCH':'POST',body:JSON.stringify(payload)});adminToast(id?'Джерело оновлено':'Джерело додано');location.reload()}catch(e){adminToast(e.message,'error');submit.disabled=false}});
+document.querySelectorAll('[data-archive]').forEach(button=>button.addEventListener('click',async()=>{if(!await adminConfirm({title:'Архівувати джерело?',message:'Збір нових матеріалів буде зупинено. Джерело можна відновити будь-коли.',action:'Архівувати'}))return;try{await api(`/api/sources/${button.dataset.archive}/archive`,{method:'POST'});location.reload()}catch(e){adminToast(e.message,'error')}}));
+document.querySelectorAll('[data-restore]').forEach(button=>button.addEventListener('click',async()=>{try{await api(`/api/sources/${button.dataset.restore}/restore`,{method:'POST'});location.reload()}catch(e){adminToast(e.message,'error')}}));
+document.querySelectorAll('[data-delete]').forEach(button=>button.addEventListener('click',async()=>{const id=button.dataset.delete;try{const usage=await api(`/api/sources/${id}/usage`);if(usage.draft_count>0){const detach=await adminConfirm({title:'Джерело використовується',message:`Пов’язаних чернеток: ${usage.draft_count}. Безпечніше архівувати. Продовження відв’яже чернетки, збереже їхні snapshot-дані та назавжди видалить джерело.`,action:'Відв’язати й видалити'});if(!detach)return;await api(`/api/sources/${id}?permanent=true&detach_drafts=true`,{method:'DELETE'})}else{if(!await adminConfirm({title:'Видалити назавжди?',message:'Цю дію неможливо скасувати.',action:'Видалити'}))return;await api(`/api/sources/${id}?permanent=true`,{method:'DELETE'})}location.reload()}catch(e){adminToast(e.message,'error')}}));
+</script>{% endblock %}

@@ -23,6 +23,14 @@ from media_builder import media_builder, MediaGenerationError
 from loguru import logger
 
 from config import settings
+from auditor_config import (
+    AuditorConfig,
+    available_auditor_models,
+    default_auditor_config,
+    effective_auditor_prompt,
+    load_auditor_config,
+    save_auditor_config,
+)
 
 if settings.web_admin_host not in {"127.0.0.1", "localhost", "::1"}:
     raise RuntimeError("Web admin must bind to localhost for security reasons.")
@@ -31,6 +39,9 @@ app = FastAPI(title="Twitter AI Bot Admin")
 
 templates_dir = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(templates_dir))
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # Роздача media файлів через /media/{filename}
 media_dir = Path(__file__).parent.parent / "media"
@@ -44,8 +55,8 @@ class UpdateDraftRequest(BaseModel):
     rewritten_text: str
 
 class FetchHistoryRequest(BaseModel):
-    messages_limit: int = Field(ge=1, le=10)
-    channels_limit: int = Field(ge=1, le=100)
+    messages_limit: int = Field(ge=1, le=20)
+    channels_limit: int = Field(ge=1, le=50)
 
 class SettingsRequest(BaseModel):
     system_prompt: str
@@ -97,9 +108,9 @@ def publish_draft(draft_id: int):
         row = cursor.fetchone()
         
         if not row:
-            raise HTTPException(status_code=404, detail="Draft not found")
+            raise HTTPException(status_code=404, detail="Чернетку не знайдено")
         if row['status'] not in ['review', 'pending']:
-            raise HTTPException(status_code=409, detail="Only drafts in review status can be approved")
+            raise HTTPException(status_code=409, detail="Схвалити можна лише чернетку зі статусом перевірки")
             
         text = row['rewritten_text']
         from utils import validate_post_text, ValidationError
@@ -111,7 +122,7 @@ def publish_draft(draft_id: int):
     logger.info(f"Web Admin: Approving draft {draft_id} for Scheduler")
     success = db.approve_draft(draft_id, {"rewritten_text": validated_text})
     if not success:
-        raise HTTPException(status_code=409, detail="Failed to transition draft to approved state (possible race condition or invalid state)")
+        raise HTTPException(status_code=409, detail="Не вдалося схвалити чернетку через конфлікт або неприпустимий стан")
             
     return {"status": "success"}
 
@@ -123,14 +134,14 @@ def ignore_draft(draft_id: int):
         row = cursor.fetchone()
         
         if not row:
-            raise HTTPException(status_code=404, detail="Draft not found")
+            raise HTTPException(status_code=404, detail="Чернетку не знайдено")
         if row['status'] not in ['review', 'pending']:
-            raise HTTPException(status_code=400, detail="Only drafts in review status can be ignored")
+            raise HTTPException(status_code=400, detail="Відхилити можна лише чернетку зі статусом перевірки")
 
     logger.info(f"Web Admin: Ignoring draft {draft_id}")
     success = db.ignore_draft(draft_id)
     if not success:
-        raise HTTPException(status_code=409, detail="Failed to transition draft to ignored state")
+        raise HTTPException(status_code=409, detail="Не вдалося перевести чернетку у відхилений стан")
     return {"status": "success"}
 
 @app.post("/api/drafts/{draft_id}/update")
@@ -164,11 +175,11 @@ async def generate_image(draft_id: int, request: GenerateImageRequest):
     """
     status = db.queue_media_generation(draft_id, prompt=request.image_prompt, action=request.action)
     if status == "NOT_FOUND":
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(status_code=404, detail="Чернетку не знайдено")
     if status == "INVALID_PROMPT":
-        raise HTTPException(status_code=422, detail="image_prompt must be 20-1500 chars")
+        raise HTTPException(status_code=422, detail="Промпт зображення має містити від 20 до 1500 символів")
     if status == "CONFLICT":
-        raise HTTPException(status_code=409, detail="Action not allowed for current state or already in progress")
+        raise HTTPException(status_code=409, detail="Дію заборонено для поточного стану або вона вже виконується")
 
     return {"draft_id": draft_id, "media_status": "pending"}
 
@@ -179,11 +190,11 @@ def cancel_image(draft_id: int):
     with db._get_connection() as conn:
         row = conn.cursor().execute("SELECT id FROM drafts WHERE id = ?", (draft_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Draft not found")
+            raise HTTPException(status_code=404, detail="Чернетку не знайдено")
             
     success = db.cancel_media_generation(draft_id)
     if not success:
-        raise HTTPException(status_code=409, detail="Cannot cancel media in current state")
+        raise HTTPException(status_code=409, detail="У поточному стані генерацію медіа не можна скасувати")
     return {"status": "success"}
 
 @app.delete("/api/drafts/{draft_id}/image")
@@ -191,9 +202,9 @@ def delete_image(draft_id: int):
     """Безпечне видалення зображення."""
     status = db.delete_media(draft_id)
     if status == "NOT_FOUND":
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(status_code=404, detail="Чернетку не знайдено")
     if status == "CONFLICT":
-        raise HTTPException(status_code=409, detail="Cannot delete media in current state")
+        raise HTTPException(status_code=409, detail="У поточному стані медіа не можна видалити")
     return {"status": "success"}
 
 
@@ -210,7 +221,7 @@ def get_image_status(draft_id: int):
         draft = cursor.fetchone()
 
     if not draft:
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(status_code=404, detail="Чернетку не знайдено")
 
     result = dict(draft)
     # Не відправляємо абсолютний filesystem path — тільки URL для браузера
@@ -263,7 +274,78 @@ def update_settings(req: SettingsRequest):
     return {"status": "ok"}
 
 
+@app.get("/auditor", response_class=HTMLResponse)
+def auditor_page(request: Request):
+    config = load_auditor_config(db)
+    return templates.TemplateResponse(
+        request=request,
+        name="auditor.html",
+        context={
+            "request": request,
+            "auditor_config": config.model_dump(),
+            "models": available_auditor_models(),
+        },
+    )
+
+
+@app.get("/api/auditor/config")
+def get_auditor_config():
+    config = load_auditor_config(db)
+    return {
+        "config": config.model_dump(),
+        "models": available_auditor_models(),
+        "effective_prompt": effective_auditor_prompt(config),
+    }
+
+
+@app.post("/api/auditor/config")
+def update_auditor_config(req: AuditorConfig):
+    selected_model = next(
+        (model for model in available_auditor_models() if model["id"] == req.model),
+        None,
+    )
+    if selected_model is None or not selected_model["available"]:
+        raise HTTPException(status_code=422, detail="Обрану модель аудитора не налаштовано.")
+    save_auditor_config(db, req)
+    return {
+        "status": "ok",
+        "config": req.model_dump(),
+        "effective_prompt": effective_auditor_prompt(req),
+    }
+
+
+@app.post("/api/auditor/preview")
+def preview_auditor_config(req: AuditorConfig):
+    return {"effective_prompt": effective_auditor_prompt(req)}
+
+
+@app.post("/api/auditor/reset")
+def reset_auditor_config():
+    config = default_auditor_config()
+    save_auditor_config(db, config)
+    return {
+        "status": "ok",
+        "config": config.model_dump(),
+        "effective_prompt": effective_auditor_prompt(config),
+    }
+
+
 # --- Phase 5: Source CRUD API ---
+
+@app.get("/sources", response_class=HTMLResponse)
+def sources_page(request: Request):
+    sources = db.get_sources()
+    counts = {
+        "all": len(sources),
+        "active": sum(1 for source in sources if source["is_active"] and not source.get("archived_at")),
+        "archived": sum(1 for source in sources if source.get("archived_at")),
+    }
+    return templates.TemplateResponse(
+        request=request,
+        name="sources.html",
+        context={"request": request, "sources": sources, "counts": counts, "active_page": "sources"},
+    )
+
 
 class SourceCreate(BaseModel, extra='forbid'):
     source_type: Literal['telegram', 'rss', 'website', 'x']
@@ -273,6 +355,9 @@ class SourceCreate(BaseModel, extra='forbid'):
     priority: int = Field(default=50, ge=0, le=100)
     trust_rating: int = Field(default=50, ge=0, le=100)
     processing_mode: Literal['auto', 'review'] = 'auto'
+    poll_interval_minutes: int = Field(default=30, ge=5, le=1440)
+    include_keywords: list[str] = Field(default_factory=list, max_length=50)
+    exclude_keywords: list[str] = Field(default_factory=list, max_length=50)
 
 class SourcePatch(BaseModel, extra='forbid'):
     name: Optional[str] = Field(default=None, min_length=1, max_length=200)
@@ -281,6 +366,9 @@ class SourcePatch(BaseModel, extra='forbid'):
     trust_rating: Optional[int] = Field(default=None, ge=0, le=100)
     processing_mode: Optional[Literal['auto', 'review']] = None
     is_active: Optional[bool] = None
+    poll_interval_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+    include_keywords: Optional[list[str]] = Field(default=None, max_length=50)
+    exclude_keywords: Optional[list[str]] = Field(default=None, max_length=50)
 
 class SourceResolve(BaseModel, extra='forbid'):
     external_id: str = Field(min_length=1, max_length=200)
@@ -293,7 +381,7 @@ def get_sources(is_active: Optional[bool] = None):
 def get_source(source_id: int):
     src = db.get_source(source_id)
     if not src:
-        raise HTTPException(status_code=404, detail="Source not found")
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
     return src
 
 def _invalidate_source_cache():
@@ -313,12 +401,15 @@ def create_source(req: SourceCreate):
             canonical_url=req.canonical_url,
             priority=req.priority,
             trust_rating=req.trust_rating,
-            processing_mode=req.processing_mode
+            processing_mode=req.processing_mode,
+            poll_interval_minutes=req.poll_interval_minutes,
+            include_keywords=req.include_keywords,
+            exclude_keywords=req.exclude_keywords,
         )
         _invalidate_source_cache()
         return src
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Source with this external_id already exists")
+        raise HTTPException(status_code=409, detail="Джерело з таким зовнішнім ID уже існує")
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -327,38 +418,76 @@ def update_source(source_id: int, req: SourcePatch):
     try:
         src = db.update_source(source_id, req.model_dump(exclude_unset=True))
         if not src:
-            raise HTTPException(status_code=404, detail="Source not found")
+            raise HTTPException(status_code=404, detail="Джерело не знайдено")
         _invalidate_source_cache()
         return src
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Conflict updating source")
+        raise HTTPException(status_code=409, detail="Конфлікт під час оновлення джерела")
     except ValueError as e:
         if "Cannot activate source with resolution_status='unresolved'" in str(e):
             raise HTTPException(status_code=409, detail=str(e))
         raise HTTPException(status_code=422, detail=str(e))
 
-@app.delete("/api/sources/{source_id}")
-def delete_source(source_id: int):
-    src = db.deactivate_source(source_id)
+@app.get("/api/sources/{source_id}/usage")
+def source_usage(source_id: int):
+    usage = db.get_source_usage(source_id)
+    if usage is None:
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    return usage
+
+
+@app.post("/api/sources/{source_id}/archive")
+def archive_source(source_id: int):
+    src = db.archive_source(source_id)
     if not src:
-        # Check if exists
-        if not db.get_source(source_id):
-            raise HTTPException(status_code=404, detail="Source not found")
-        # Idempotent: already inactive, but get_source exists
-        src = db.get_source(source_id)
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
     _invalidate_source_cache()
     return src
+
+
+@app.post("/api/sources/{source_id}/restore")
+def restore_source(source_id: int):
+    src = db.restore_source(source_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    _invalidate_source_cache()
+    return src
+
+
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: int, permanent: bool = False, detach_drafts: bool = False):
+    if not permanent:
+        src = db.archive_source(source_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Джерело не знайдено")
+        _invalidate_source_cache()
+        return src
+    result = db.delete_source_permanently(source_id, detach_drafts=detach_drafts)
+    if result == "missing":
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    if result == "conflict":
+        usage = db.get_source_usage(source_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Джерело має пов’язані чернетки. Архівуйте його або підтвердьте відв’язування.",
+                "draft_count": usage["draft_count"],
+                "actions": ["archive", "detach_and_delete"],
+            },
+        )
+    _invalidate_source_cache()
+    return {"status": "deleted", "source_id": source_id}
 
 @app.post("/api/sources/{source_id}/resolve")
 def resolve_source(source_id: int, req: SourceResolve):
     try:
         src = db.resolve_source(source_id, req.external_id)
         if not src:
-            raise HTTPException(status_code=404, detail="Source not found")
+            raise HTTPException(status_code=404, detail="Джерело не знайдено")
         _invalidate_source_cache()
         return src
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Resolved external_id already exists")
+        raise HTTPException(status_code=409, detail="Уточнений зовнішній ID уже використовується")
     except ValueError as e:
         err = str(e)
         if "only for telegram" in err:
@@ -371,26 +500,34 @@ def resolve_source(source_id: int, req: SourceResolve):
 def poll_now_endpoint(source_id: int):
     status = db.poll_now(source_id)
     if status == "missing":
-        raise HTTPException(status_code=404, detail="Source not found")
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
     if status == "conflict":
-        raise HTTPException(status_code=409, detail="Source cannot be polled currently (inactive, unresolved, or active lease)")
+        raise HTTPException(status_code=409, detail="Зараз джерело не можна перевірити: воно неактивне, не уточнене або вже обробляється")
     return {"status": "queued"}
 
 @app.post("/api/telegram/fetch-history")
 async def fetch_tg_history(req: FetchHistoryRequest):
     import telegram_listener
     if telegram_listener.history_fetch_queue is None:
-        raise HTTPException(status_code=503, detail="Telegram listener is not running or not ready.")
+        raise HTTPException(status_code=503, detail="Слухач Telegram не запущено або він ще не готовий.")
     
     try:
         telegram_listener.history_fetch_queue.put_nowait({
             "messages": req.messages_limit,
             "channels": req.channels_limit
         })
-        return {"status": "ok", "message": "Fetch task queued successfully."}
-    except Exception as e:
-        logger.error(f"Failed to queue history fetch: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "ok", "message": "Завантаження успішно додано до черги."}
+    except asyncio.QueueFull:
+        raise HTTPException(
+            status_code=409,
+            detail="Завантаження історії Telegram уже додано до черги.",
+        )
+    except Exception:
+        logger.exception("Failed to queue Telegram history fetch [SAFE_ERR_HISTORY_QUEUE]")
+        raise HTTPException(
+            status_code=500,
+            detail="Не вдалося додати завантаження історії Telegram до черги.",
+        )
 
 @app.get("/logs", response_class=HTMLResponse)
 def logs_page(request: Request, filter: str = "ALL"):
@@ -416,7 +553,6 @@ def logs_page(request: Request, filter: str = "ALL"):
 @app.get("/status", response_class=HTMLResponse)
 def status_page(request: Request):
     # Check Gemini
-    from config import settings
     gemini_configured = bool(settings.gemini_api_key)
     
     # Check Telegram
@@ -434,21 +570,21 @@ def status_page(request: Request):
     pollinations_configured = True 
     
     # Check Database
-    db_status = "Available"
+    db_status = "Доступна"
     try:
         with db._get_connection() as conn:
             conn.execute("SELECT 1")
     except Exception:
-        db_status = "Error"
+        db_status = "Помилка"
         
     return templates.TemplateResponse(
         request=request, name="status.html", context={
             "request": request,
-            "gemini_status": "Configured" if gemini_configured else "Missing",
-            "telegram_status": "Configured" if telegram_configured else "Missing",
-            "twitter_status": "Configured" if twitter_configured else "Missing",
-            "cloudflare_status": "Configured" if cloudflare_configured else "Missing",
-            "pollinations_status": "Configured" if pollinations_configured else "Missing",
+            "gemini_status": "Налаштовано" if gemini_configured else "Відсутнє",
+            "telegram_status": "Налаштовано" if telegram_configured else "Відсутнє",
+            "twitter_status": "Налаштовано" if twitter_configured else "Відсутнє",
+            "cloudflare_status": "Налаштовано" if cloudflare_configured else "Відсутнє",
+            "pollinations_status": "Налаштовано" if pollinations_configured else "Відсутнє",
             "twitter_dry_run": settings.twitter_dry_run,
             "admin_bind": settings.web_admin_host,
             "db_status": db_status,

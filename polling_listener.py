@@ -911,14 +911,13 @@ class PollingWorker:
     def succeed_poll(self, source: dict, etag: str, last_modified: str, validator_url: str, status_code: int, drafts: list, is_initial: bool = False, is_empty: bool = False):
         now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        prio = source.get('priority', 3)
-        if prio == 1: delay = 1800
-        elif prio == 2: delay = 3600
-        elif prio == 3: delay = 7200
-        elif prio == 4: delay = 21600
-        else: delay = 43200
+        interval_minutes = source.get('poll_interval_minutes', 30)
+        try:
+            interval_minutes = max(5, min(1440, int(interval_minutes)))
+        except (TypeError, ValueError):
+            interval_minutes = 30
 
-        next_poll = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)
+        next_poll = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=interval_minutes)
 
         updates = {
             "collector_status": "healthy",

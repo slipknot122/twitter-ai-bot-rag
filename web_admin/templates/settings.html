@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="uk">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Settings - AI Content Moderator</title>
+    <title>Налаштування бота — AI-модератор</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -82,78 +82,84 @@
         .btn-save:hover { background: var(--accent-hover); }
         .btn-save.success { background: var(--success); }
     </style>
+    <link rel="stylesheet" href="/static/admin.css">
 </head>
-<body>
+<body class="has-admin-sidebar">
+    {% include "_admin_nav.html" %}
     <div class="container">
         <header>
-            <h1>Settings</h1>
-            <p class="subtitle">Manage AI Prompts and Bot Configuration</p>
+            <h1>Налаштування бота</h1>
+            <p class="subtitle">Керуйте промптом редактора, публікацією та планувальником</p>
         </header>
 
-        <div class="nav-links">
-            <a href="/">&larr; Back to Dashboard</a>
-            <a href="/status">System Status</a>
-        </div>
+        <nav class="nav-links" aria-label="Навігація адміністратора">
+            <a href="/">Панель</a>
+            <a href="/sources">Джерела</a>
+            <a href="/settings" aria-current="page">Налаштування бота</a>
+            <a href="/auditor">AI-аудитор</a>
+            <a href="/status">Стан системи</a>
+            <a href="/logs">Журнал</a>
+        </nav>
 
         <div class="settings-card">
             <div class="form-group">
-                <label for="system-prompt">AI System Prompt (Editor Persona)</label>
-                <p class="help">This prompt defines how the AI moderates and rewrites tweets. You can freely change the persona, rules, and restrictions here.</p>
+                <label for="system-prompt">Системний промпт AI (роль редактора)</label>
+                <p class="help">Цей промпт визначає, як AI модерує та переписує дописи. Тут можна змінити роль, правила й обмеження.</p>
                 <textarea id="system-prompt">{{ system_prompt }}</textarea>
             </div>
 
             <div class="form-group toggle-group" style="margin-bottom: 2rem;">
                 <input type="checkbox" id="shadow-mode" {% if shadow_mode %}checked{% endif %}>
                 <div>
-                    <label style="margin-bottom:0;" for="shadow-mode">Enable Shadow Mode (DRY RUN)</label>
-                    <p class="help" style="margin-bottom:0;">If checked, the bot will pretend to publish to X but only print to console. Use this for testing.</p>
+                    <label style="margin-bottom:0;" for="shadow-mode">Увімкнути тестовий режим (DRY RUN)</label>
+                    <p class="help" style="margin-bottom:0;">Бот імітуватиме публікацію в X, але лише запише результат у консоль. Використовуйте для тестування.</p>
                 </div>
             </div>
 
-            <h3 style="margin-bottom: 1rem; color: #cbd5e1; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem;">Image Overlay Widget</h3>
+            <h3 style="margin-bottom: 1rem; color: #cbd5e1; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem;">Інформаційний блок на зображенні</h3>
             <div style="display: grid; grid-template-columns: 1fr; gap: 1rem; margin-bottom: 2rem;">
                 <div class="form-group">
-                    <label for="image-overlay">Widget Style</label>
-                    <p class="help">Choose what type of information to overlay on the generated image.</p>
+                    <label for="image-overlay">Стиль блока</label>
+                    <p class="help">Оберіть інформацію, яку потрібно накласти на згенероване зображення.</p>
                     <select id="image-overlay" style="width: 100%; padding: 0.8rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); color: #fff; border-radius: 4px;">
-                        <option value="none" {% if image_overlay == 'none' %}selected{% endif %}>None (Clean Image)</option>
-                        <option value="btc_price" {% if image_overlay == 'btc_price' %}selected{% endif %}>BTC Price & Sentiment (Large)</option>
-                        <option value="category_badge" {% if image_overlay == 'category_badge' %}selected{% endif %}>Category Badge (Compact)</option>
+                        <option value="none" {% if image_overlay == 'none' %}selected{% endif %}>Без блока (чисте зображення)</option>
+                        <option value="btc_price" {% if image_overlay == 'btc_price' %}selected{% endif %}>Ціна BTC і настрій (великий)</option>
+                        <option value="category_badge" {% if image_overlay == 'category_badge' %}selected{% endif %}>Позначка категорії (компактна)</option>
                     </select>
                 </div>
                 <div class="form-group">
-                    <label for="allowed-categories">Allowed AI Categories</label>
-                    <p class="help">Comma-separated list of topics the AI can assign (e.g. MARKET, AIRDROP, HACK, LISTING). These will be drawn as badges if "Category Badge" is selected.</p>
+                    <label for="allowed-categories">Дозволені категорії AI</label>
+                    <p class="help">Список тем через кому (наприклад MARKET, AIRDROP, HACK, LISTING). Вони відображатимуться як позначки, якщо вибрано відповідний стиль.</p>
                     <textarea id="allowed-categories" style="min-height: 80px;">{{ allowed_categories }}</textarea>
                 </div>
             </div>
 
-            <h3 style="margin-bottom: 1rem; color: #cbd5e1; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem;">Scheduler & Retry Settings</h3>
+            <h3 style="margin-bottom: 1rem; color: #cbd5e1; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem;">Планувальник і повторні спроби</h3>
 
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
                 <div class="form-group">
-                    <label for="publish-delay">Publish Delay (minutes)</label>
-                    <p class="help">Time to wait between tweets.</p>
+                    <label for="publish-delay">Затримка публікації (хвилини)</label>
+                    <p class="help">Час очікування між дописами.</p>
                     <input type="number" id="publish-delay" value="{{ publish_delay_minutes }}">
                 </div>
                 <div class="form-group">
-                    <label for="publish-jitter">Jitter (%)</label>
-                    <p class="help">Randomize delay by ± percentage.</p>
+                    <label for="publish-jitter">Випадкове відхилення (%)</label>
+                    <p class="help">Змінювати затримку на випадковий відсоток у межах ±.</p>
                     <input type="number" id="publish-jitter" value="{{ publish_jitter_percent }}">
                 </div>
                 <div class="form-group">
-                    <label for="max-retries">Max Retries</label>
-                    <p class="help">Number of retries for transient errors.</p>
+                    <label for="max-retries">Максимум повторних спроб</label>
+                    <p class="help">Кількість повторів у разі тимчасових помилок.</p>
                     <input type="number" id="max-retries" value="{{ max_retries }}">
                 </div>
                 <div class="form-group">
-                    <label for="check-interval">Scheduler Check Interval (s)</label>
-                    <p class="help">How often scheduler checks DB.</p>
+                    <label for="check-interval">Інтервал перевірки планувальника (с)</label>
+                    <p class="help">Як часто планувальник перевіряє базу даних.</p>
                     <input type="number" id="check-interval" value="{{ scheduler_check_interval_seconds }}">
                 </div>
             </div>
 
-            <button class="btn-save" onclick="saveSettings(this)">Save Settings</button>
+            <button class="btn-save" onclick="saveSettings(this)">Зберегти налаштування</button>
         </div>
     </div>
 
@@ -168,7 +174,7 @@
             const retries = parseInt(document.getElementById('max-retries').value);
             const interval = parseInt(document.getElementById('check-interval').value);
             
-            btn.textContent = 'Saving...';
+            btn.textContent = 'Збереження...';
             
             const response = await fetch('/api/settings', {
                 method: 'POST',
@@ -186,17 +192,18 @@
             });
 
             if(response.ok) {
-                btn.textContent = 'Saved Successfully!';
+                btn.textContent = 'Успішно збережено';
                 btn.classList.add('success');
                 setTimeout(() => {
-                    btn.textContent = 'Save Settings';
+                    btn.textContent = 'Зберегти налаштування';
                     btn.classList.remove('success');
                 }, 2000);
             } else {
-                alert('Error saving settings');
-                btn.textContent = 'Save Settings';
+                alert('Не вдалося зберегти налаштування');
+                btn.textContent = 'Зберегти налаштування';
             }
         }
     </script>
+<script src="/static/admin.js" defer></script>
 </body>
 </html>

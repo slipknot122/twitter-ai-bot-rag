@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="uk">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>System Status - AI Content Moderator</title>
+    <title>Стан системи — AI-модератор</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -102,74 +102,80 @@
             text-align: center;
         }
     </style>
+    <link rel="stylesheet" href="/static/admin.css">
 </head>
-<body>
+<body class="has-admin-sidebar">
+    {% include "_admin_nav.html" %}
     <div class="container">
         <header>
-            <h1>System Status</h1>
-            <p class="subtitle">API Credentials and Environment Configuration</p>
+            <h1>Стан системи</h1>
+            <p class="subtitle">Підключення сервісів і конфігурація середовища</p>
         </header>
 
-        <div class="nav-links">
-            <a href="/">&larr; Back to Dashboard</a>
-            <a href="/settings">Bot Settings</a>
-            <a href="/logs">View Logs</a>
-        </div>
+        <nav class="nav-links" aria-label="Навігація адміністратора">
+            <a href="/">Панель</a>
+            <a href="/sources">Джерела</a>
+            <a href="/settings">Налаштування бота</a>
+            <a href="/auditor">AI-аудитор</a>
+            <a href="/status" aria-current="page">Стан системи</a>
+            <a href="/logs">Журнал</a>
+        </nav>
 
         <div class="settings-card">
-            <h2>Services Configuration</h2>
+            <h2>Підключення сервісів</h2>
             <div class="status-grid">
                 <div class="status-item">
                     <span class="status-label">Telegram</span>
-                    <span class="badge {{ 'configured' if telegram_status == 'Configured' else 'missing' }}">{{ telegram_status }}</span>
+                    <span class="badge {{ 'configured' if telegram_status == 'Налаштовано' else 'missing' }}">{{ telegram_status }}</span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">X (Twitter)</span>
-                    <span class="badge {{ 'configured' if twitter_status == 'Configured' else 'missing' }}">{{ twitter_status }}</span>
+                    <span class="badge {{ 'configured' if twitter_status == 'Налаштовано' else 'missing' }}">{{ twitter_status }}</span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Google Gemini (AI)</span>
-                    <span class="badge {{ 'configured' if gemini_status == 'Configured' else 'missing' }}">{{ gemini_status }}</span>
+                    <span class="badge {{ 'configured' if gemini_status == 'Налаштовано' else 'missing' }}">{{ gemini_status }}</span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Cloudflare (Media)</span>
-                    <span class="badge {{ 'configured' if cloudflare_status == 'Configured' else 'missing' }}">{{ cloudflare_status }}</span>
+                    <span class="badge {{ 'configured' if cloudflare_status == 'Налаштовано' else 'missing' }}">{{ cloudflare_status }}</span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Pollinations (Media)</span>
-                    <span class="badge {{ 'configured' if pollinations_status == 'Configured' else 'missing' }}">{{ pollinations_status }}</span>
+                    <span class="badge {{ 'configured' if pollinations_status == 'Налаштовано' else 'missing' }}">{{ pollinations_status }}</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Database</span>
-                    <span class="badge {{ 'configured' if db_status == 'Available' else 'missing' }}">{{ db_status }}</span>
+                    <span class="status-label">База даних</span>
+                    <span class="badge {{ 'configured' if db_status == 'Доступна' else 'missing' }}">{{ db_status }}</span>
                 </div>
             </div>
             <p class="help-text">
-                To update credentials, edit the <code>.env</code> file directly on your server and restart the bot. Keys are not exposed in the web interface for security reasons.
+                Щоб оновити облікові дані, змініть файл <code>.env</code> безпосередньо на сервері та перезапустіть бота. З міркувань безпеки ключі не відображаються у вебінтерфейсі.
             </p>
         </div>
 
         <div class="settings-card">
-            <h2>System Info</h2>
+            <h2>Інформація про систему</h2>
             <div class="status-grid">
                 <div class="status-item">
-                    <span class="status-label">Admin Bind</span>
+                    <span class="status-label">Адреса адмінпанелі</span>
                     <span class="badge {{ 'info' if admin_bind == '127.0.0.1' else 'warning' }}">{{ admin_bind }}</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Twitter Dry Run</span>
-                    <span class="badge {{ 'warning' if twitter_dry_run else 'info' }}">{{ "Enabled" if twitter_dry_run else "Disabled" }}</span>
+                    <span class="status-label">Тестовий режим X</span>
+                    <span class="badge {{ 'warning' if twitter_dry_run else 'info' }}">{{ "Увімкнено" if twitter_dry_run else "Вимкнено" }}</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Media Generation</span>
-                    <span class="badge {{ 'configured' if media_enabled else 'warning' }}">{{ "Enabled" if media_enabled else "Disabled" }}</span>
+                    <span class="status-label">Генерація медіа</span>
+                    <span class="badge {{ 'configured' if media_enabled else 'warning' }}">{{ "Увімкнено" if media_enabled else "Вимкнено" }}</span>
                 </div>
                 <div class="status-item" style="grid-column: span 2;">
-                    <span class="status-label">Media Providers Order</span>
+                    <span class="status-label">Порядок медіапровайдерів</span>
                     <span class="badge info">{{ media_providers }}</span>
                 </div>
             </div>
         </div>
     </div>
+<script src="/static/admin.js" defer></script>
 </body>
 </html>

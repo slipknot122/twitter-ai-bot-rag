@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#111315">
+  <title>{% block title %}Bot Control{% endblock %}</title>
+  <link rel="stylesheet" href="/static/admin.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="Головна навігація">
+      <a class="brand" href="/" aria-label="Bot Control — огляд">
+        <span class="brand-mark">BC</span>
+        <span><strong>Bot Control</strong><small>Operations console</small></span>
+      </a>
+      <nav class="nav-list">
+        <p class="nav-label">Робочий простір</p>
+        <a href="/" class="nav-item {% if active_page == 'overview' %}active{% endif %}"><span>Огляд</span></a>
+        <a href="/?tab=review" class="nav-item {% if active_page == 'drafts' %}active{% endif %}"><span>Чернетки</span></a>
+        <a href="/sources" class="nav-item {% if active_page == 'sources' %}active{% endif %}"><span>Джерела</span></a>
+        <p class="nav-label">Керування</p>
+        <a href="/settings" class="nav-item {% if active_page == 'settings' %}active{% endif %}"><span>Налаштування</span></a>
+        <a href="/auditor" class="nav-item {% if active_page == 'auditor' %}active{% endif %}"><span>AI-аудитор</span></a>
+        <p class="nav-label">Система</p>
+        <a href="/status" class="nav-item {% if active_page == 'status' %}active{% endif %}"><span>Стан системи</span></a>
+        <a href="/logs" class="nav-item {% if active_page == 'logs' %}active{% endif %}"><span>Журнал</span></a>
+      </nav>
+      <div class="sidebar-foot"><span class="status-dot"></span><span>Локальна консоль</span></div>
+    </aside>
+    <div class="page-shell">
+      <header class="mobile-header">
+        <a class="brand compact" href="/"><span class="brand-mark">BC</span><strong>Bot Control</strong></a>
+        <button class="icon-button" type="button" data-menu-toggle aria-controls="sidebar" aria-expanded="false" aria-label="Відкрити меню">Меню</button>
+      </header>
+      <main class="main-content">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
+  <div class="sidebar-scrim" data-menu-close hidden></div>
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <dialog class="dialog" id="confirm-dialog">
+    <form method="dialog" class="dialog-card">
+      <div><p class="eyebrow" id="confirm-eyebrow">Підтвердження</p><h2 id="confirm-title">Підтвердьте дію</h2><p class="muted" id="confirm-message"></p></div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">Скасувати</button><button class="button danger" id="confirm-action" value="confirm">Підтвердити</button></div>
+    </form>
+  </dialog>
+  <script src="/static/admin.js" defer></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

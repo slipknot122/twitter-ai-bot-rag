@@ -45,6 +45,9 @@ async def main():
     db.recover_stuck_drafts()
 
     prod_auditor = PostAuditor(llm_provider=llm)
+    config_store_setter = getattr(prod_auditor, "set_config_store", None)
+    if callable(config_store_setter):
+        config_store_setter(db)
 
     services = [
         ("TelegramListener", start_listener()),
