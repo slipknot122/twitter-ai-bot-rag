@@ -43,6 +43,10 @@ _background_tasks: set[asyncio.Task] = set()
 class UpdateDraftRequest(BaseModel):
     rewritten_text: str
 
+class FetchHistoryRequest(BaseModel):
+    messages_limit: int = Field(ge=1, le=10)
+    channels_limit: int = Field(ge=1, le=100)
+
 class SettingsRequest(BaseModel):
     system_prompt: str
     shadow_mode: bool
@@ -371,6 +375,22 @@ def poll_now_endpoint(source_id: int):
     if status == "conflict":
         raise HTTPException(status_code=409, detail="Source cannot be polled currently (inactive, unresolved, or active lease)")
     return {"status": "queued"}
+
+@app.post("/api/telegram/fetch-history")
+async def fetch_tg_history(req: FetchHistoryRequest):
+    import telegram_listener
+    if telegram_listener.history_fetch_queue is None:
+        raise HTTPException(status_code=503, detail="Telegram listener is not running or not ready.")
+    
+    try:
+        telegram_listener.history_fetch_queue.put_nowait({
+            "messages": req.messages_limit,
+            "channels": req.channels_limit
+        })
+        return {"status": "ok", "message": "Fetch task queued successfully."}
+    except Exception as e:
+        logger.error(f"Failed to queue history fetch: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/logs", response_class=HTMLResponse)
 def logs_page(request: Request, filter: str = "ALL"):

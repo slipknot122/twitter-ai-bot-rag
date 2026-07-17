@@ -451,6 +451,7 @@
                 <a href="/settings" style="color: var(--accent); text-decoration: none; font-weight: 500;">⚙️ Bot Settings</a>
                 <a href="/status" style="color: var(--accent); text-decoration: none; font-weight: 500;">🛡️ System Status</a>
                 <a href="/logs" style="color: var(--accent); text-decoration: none; font-weight: 500;">📄 View Logs</a>
+                <a href="#" onclick="document.getElementById('fetch-modal').style.display='flex'; return false;" style="color: var(--success); text-decoration: none; font-weight: 500;">📥 Fetch TG</a>
             </div>
         </header>
 
@@ -1288,6 +1289,28 @@
             }
         }
 
+        // Fetch TG History Modal
+        async function submitFetchHistory() {
+            const msgs = document.getElementById('fetch_messages_limit').value;
+            const chans = document.getElementById('fetch_channels_limit').value;
+            try {
+                const resp = await fetch('/api/telegram/fetch-history', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ messages_limit: parseInt(msgs), channels_limit: parseInt(chans) })
+                });
+                if(resp.ok) {
+                    document.getElementById('fetch-modal').style.display = 'none';
+                    alert("Fetch task queued! Check logs or drafts soon.");
+                } else {
+                    const data = await resp.json();
+                    alert(data.detail || "Error queueing fetch");
+                }
+            } catch(e) {
+                alert("Request failed");
+            }
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             const urlParams = new URLSearchParams(window.location.search);
             if(urlParams.get('tab') === 'sources') {
@@ -1296,5 +1319,27 @@
         });
 
     </script>
+
+    <!-- Fetch TG History Modal -->
+    <div id="fetch-modal" class="modal" style="display: none; align-items: center; justify-content: center; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000;">
+        <div class="modal-content" style="max-width: 400px; padding: 2rem; background: var(--bg-color); border: 1px solid var(--card-border); border-radius: 1rem; position: relative;">
+            <h2 style="margin-bottom: 1rem; color: var(--text-main);">Fetch TG History</h2>
+            <p style="margin-bottom: 1.5rem; color: var(--text-muted); font-size: 0.9rem;">
+                Trigger a manual parse of recent messages from active Telegram channels.
+            </p>
+            <div style="margin-bottom: 1rem;">
+                <label style="display: block; margin-bottom: 0.5rem; color: var(--text-muted);">Messages per channel (1-10):</label>
+                <input type="number" id="fetch_messages_limit" value="5" min="1" max="10" style="width: 100%; padding: 0.75rem; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 0.5rem; color: white;">
+            </div>
+            <div style="margin-bottom: 1.5rem;">
+                <label style="display: block; margin-bottom: 0.5rem; color: var(--text-muted);">Max channels to process (1-100):</label>
+                <input type="number" id="fetch_channels_limit" value="10" min="1" max="100" style="width: 100%; padding: 0.75rem; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 0.5rem; color: white;">
+            </div>
+            <div style="display: flex; gap: 1rem; justify-content: flex-end;">
+                <button onclick="document.getElementById('fetch-modal').style.display='none'" style="padding: 0.5rem 1rem; border-radius: 0.5rem; background: transparent; color: var(--text-muted); border: 1px solid var(--card-border); cursor: pointer;">Cancel</button>
+                <button onclick="submitFetchHistory()" style="padding: 0.5rem 1rem; border-radius: 0.5rem; background: var(--success); color: white; border: none; cursor: pointer;">Fetch Now</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
