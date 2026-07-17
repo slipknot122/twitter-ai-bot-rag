@@ -5,6 +5,7 @@ import datetime
 import uuid
 from pathlib import Path
 from typing import Optional
+import httpx
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,6 +52,20 @@ app.mount("/media", StaticFiles(directory=str(media_dir)), name="media")
 
 # Background tasks set — захист від garbage collection (рекомендація рев'юера)
 _background_tasks: set[asyncio.Task] = set()
+_source_connection_checks: set[int] = set()
+_MAX_SOURCE_CONNECTION_CHECKS = 20
+
+_CONNECTION_ERROR_MESSAGES = {
+    "body_too_large": "Відповідь джерела завелика",
+    "http_4xx": "Джерело відхилило запит",
+    "http_429": "Джерело тимчасово обмежило запити",
+    "http_503": "Джерело тимчасово недоступне",
+    "network_error": "Не вдалося встановити мережеве з’єднання",
+    "ssrf_blocked": "Адресу заблоковано правилами безпеки",
+    "timeout": "Джерело не відповіло вчасно",
+    "too_many_redirects": "Забагато перенаправлень",
+    "unsupported_content_type": "Джерело повернуло непідтримуваний формат",
+}
 
 class UpdateDraftRequest(BaseModel):
     rewritten_text: str
@@ -587,6 +602,106 @@ def verify_telegram_source(source_id: int, req: TelegramResolveRequest):
         raise HTTPException(status_code=409, detail="Ця Telegram-група вже додана")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+async def _run_http_source_connection_check(source_id: int, source_type: str, url: str):
+    try:
+        from polling_listener import MAX_DECODED_BYTES, MAX_REDIRECTS, PollingWorker
+        worker = PollingWorker()
+        current_url = url
+        visited = {current_url}
+        result = None
+        limits = httpx.Limits(max_keepalive_connections=1, max_connections=2)
+        timeout = httpx.Timeout(5.0, read=10.0, connect=5.0)
+        async with httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=False) as client:
+            for redirect_count in range(MAX_REDIRECTS + 1):
+                result = await worker.fetch_url_single(
+                    client, current_url, min(MAX_DECODED_BYTES, 512 * 1024),
+                    website_mode=source_type != 'rss', redirect_count=redirect_count,
+                )
+                if not result.redirect_url:
+                    break
+                next_url = urllib.parse.urljoin(current_url, result.redirect_url)
+                if next_url in visited:
+                    result.error_code = "too_many_redirects"
+                    break
+                visited.add(next_url)
+                current_url = next_url
+            else:
+                result.error_code = "too_many_redirects"
+        if result is not None and result.status_code is not None and 200 <= result.status_code < 300 and not result.error_code:
+            db.complete_source_connection_check(source_id, ok=True)
+        else:
+            code = result.error_code if result is not None else "network_error"
+            db.complete_source_connection_check(
+                source_id, ok=False, error_code=code,
+                detail=_CONNECTION_ERROR_MESSAGES.get(code, "Не вдалося перевірити з’єднання"),
+            )
+    except asyncio.CancelledError:
+        db.complete_source_connection_check(source_id, ok=False, error_code="cancelled", detail="Перевірку скасовано")
+        raise
+    except Exception:
+        db.complete_source_connection_check(
+            source_id, ok=False, error_code="internal_error", detail="Не вдалося перевірити з’єднання",
+        )
+        logger.error("Source connection check failed [SAFE_ERR_SOURCE_CHECK]")
+    finally:
+        _source_connection_checks.discard(source_id)
+
+
+@app.post("/api/sources/{source_id}/check-connection", status_code=202)
+async def check_source_connection(source_id: int):
+    source = db.get_source(source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Джерело не знайдено")
+    if source_id in _source_connection_checks:
+        raise HTTPException(status_code=409, detail="Перевірка цього джерела вже виконується")
+    if len(_source_connection_checks) >= _MAX_SOURCE_CONNECTION_CHECKS:
+        raise HTTPException(status_code=429, detail="Черга перевірок заповнена. Спробуйте пізніше")
+
+    if source['source_type'] == 'telegram':
+        import telegram_listener
+        queue = telegram_listener.telegram_resolve_queue
+        if source_id in telegram_listener.telegram_connection_checks:
+            raise HTTPException(status_code=409, detail="Перевірка цього джерела вже виконується")
+        if queue is None:
+            db.complete_source_connection_check(
+                source_id, ok=False, error_code="telegram_listener_unavailable",
+                detail="Слухач Telegram зараз недоступний",
+            )
+            raise HTTPException(status_code=503, detail="Слухач Telegram зараз недоступний")
+        reference = source['external_id']
+        if source.get('resolution_status') == 'unresolved':
+            stored = source.get('telegram_reference')
+            if not stored:
+                raise HTTPException(status_code=422, detail="Telegram-адресу не налаштовано")
+            reference = (
+                f"https://t.me/+{stored}"
+                if source.get('telegram_display') == 'Приватне запрошення Telegram'
+                else f"@{stored}"
+            )
+        telegram_listener.telegram_connection_checks.add(source_id)
+        try:
+            queue.put_nowait({"source_id": source_id, "telegram_input": reference, "check_only": True})
+        except asyncio.QueueFull:
+            telegram_listener.telegram_connection_checks.discard(source_id)
+            raise HTTPException(status_code=429, detail="Черга перевірок Telegram заповнена")
+        db.mark_source_connection_checking(source_id)
+        return {"status": "checking", "source_id": source_id}
+
+    target_url = source.get('canonical_url')
+    if not target_url:
+        db.complete_source_connection_check(
+            source_id, ok=False, error_code="missing_url",
+            detail="Для джерела не вказано URL-адресу",
+        )
+        return {"status": "failed", "source_id": source_id}
+    db.mark_source_connection_checking(source_id)
+    _source_connection_checks.add(source_id)
+    task = asyncio.create_task(_run_http_source_connection_check(source_id, source['source_type'], target_url))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return {"status": "checking", "source_id": source_id}
 
 
 @app.post("/api/sources/{source_id}/poll_now", status_code=202)
