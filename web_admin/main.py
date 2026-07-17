@@ -44,8 +44,8 @@ class UpdateDraftRequest(BaseModel):
     rewritten_text: str
 
 class FetchHistoryRequest(BaseModel):
-    messages_limit: int = Field(ge=1, le=10)
-    channels_limit: int = Field(ge=1, le=100)
+    messages_limit: int = Field(ge=1, le=20)
+    channels_limit: int = Field(ge=1, le=50)
 
 class SettingsRequest(BaseModel):
     system_prompt: str
@@ -388,9 +388,17 @@ async def fetch_tg_history(req: FetchHistoryRequest):
             "channels": req.channels_limit
         })
         return {"status": "ok", "message": "Fetch task queued successfully."}
-    except Exception as e:
-        logger.error(f"Failed to queue history fetch: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except asyncio.QueueFull:
+        raise HTTPException(
+            status_code=409,
+            detail="Telegram history fetch is already queued.",
+        )
+    except Exception:
+        logger.exception("Failed to queue Telegram history fetch [SAFE_ERR_HISTORY_QUEUE]")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to queue Telegram history fetch.",
+        )
 
 @app.get("/logs", response_class=HTMLResponse)
 def logs_page(request: Request, filter: str = "ALL"):

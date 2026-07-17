@@ -47,45 +47,49 @@ source_cache = SourceCache(db)
 
 history_fetch_queue: Optional[asyncio.Queue] = None
 
-async def _history_fetch_worker(client, cache, db_instance):
-    global history_fetch_queue
+async def _history_fetch_worker(client, cache, db_instance, queue):
     while True:
+        req = await queue.get()
         try:
-            req = await history_fetch_queue.get()
             msgs_limit = req.get("messages", 5)
             chans_limit = req.get("channels", 10)
-            
+
             logger.info(f"Starting history fetch: {msgs_limit} msgs from up to {chans_limit} channels")
-            
+
             sources = db_instance.get_sources(is_active=1)
-            active_tg_sources = [s for s in sources if s['source_type'] == 'telegram' and s['resolution_status'] == 'resolved']
-            active_tg_sources = active_tg_sources[:chans_limit]
-            
-            # Pre-fetch dialogs to populate Telethon's entity cache
+            active_tg_sources = [
+                source
+                for source in sources
+                if source['source_type'] == 'telegram'
+                and source['resolution_status'] == 'resolved'
+            ][:chans_limit]
+
+            # Pre-fetch dialogs to populate Telethon's entity cache.
             try:
                 await client.get_dialogs(limit=100)
-            except Exception as e:
-                logger.warning(f"Could not pre-fetch dialogs: {e}")
+            except Exception:
+                logger.warning("Could not pre-fetch Telegram dialogs [SAFE_ERR_HISTORY_DIALOGS]")
 
             count = 0
-            for s in active_tg_sources:
-                channel_id = s['external_id']
+            for source in active_tg_sources:
+                channel_id = source['external_id']
                 try:
                     async for message in client.iter_messages(int(channel_id), limit=msgs_limit):
                         if getattr(message, 'text', None):
                             await process_telegram_event(message, cache, db_instance)
                             count += 1
-                except Exception as e:
-                    logger.error(f"Failed to fetch history for {channel_id}: {e}")
-                
-                await asyncio.sleep(1) # Prevent flood
-                
+                except Exception:
+                    logger.error("Failed to fetch Telegram history [SAFE_ERR_HISTORY_CHANNEL]")
+
+                await asyncio.sleep(1)  # Prevent flood
+
             logger.success(f"History fetch complete. Processed {count} messages.")
-            history_fetch_queue.task_done()
         except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"History fetch worker error: {e}")
+            raise
+        except Exception:
+            logger.error("History fetch worker error [SAFE_ERR_HISTORY_WORKER]")
+        finally:
+            queue.task_done()
 
 def create_telegram_client() -> TelegramClient:
     """Factory для створення TelegramClient виключно під час виконання."""
@@ -137,16 +141,15 @@ async def process_telegram_event(event, cache, db_instance):
 async def start_listener():
     """Запуск Telegram слухача."""
     global history_fetch_queue
-    history_fetch_queue = asyncio.Queue()
 
     try:
         client = create_telegram_client()
     except RuntimeError:
         logger.error("Cannot start listener [SAFE_ERR_MISSING_CREDENTIALS]")
         return
-        
+
     logger.info("Starting Telegram Listener with SourceCache filtering")
-    
+
     # Preload cache
     source_cache.reload()
     logger.info(f"Loaded {len(source_cache._cache)} active telegram sources into cache.")
@@ -155,15 +158,23 @@ async def start_listener():
     async def handle_new_message(event):
         await process_telegram_event(event, source_cache, db)
 
-    # Start history fetch worker
-    worker_task = asyncio.create_task(_history_fetch_worker(client, source_cache, db))
-
+    worker_task = None
     try:
         await client.start()
+        history_fetch_queue = asyncio.Queue(maxsize=1)
+        worker_task = asyncio.create_task(
+            _history_fetch_worker(client, source_cache, db, history_fetch_queue)
+        )
         logger.success("Telegram Client started and listening for messages")
         await client.run_until_disconnected()
     except Exception:
         logger.error("Telegram Client connection failed [SAFE_ERR_CONNECTION_FAILED]")
         raise RuntimeError("Telegram Client connection failed [SAFE_ERR_CONNECTION_FAILED]")
     finally:
-        worker_task.cancel()
+        history_fetch_queue = None
+        if worker_task is not None:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
