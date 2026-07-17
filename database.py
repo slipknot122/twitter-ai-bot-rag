@@ -534,6 +534,10 @@ class Database:
             "telegram_resolve_status": "TEXT NULL",
             "telegram_resolve_error": "TEXT NULL",
             "telegram_resolved_at": "TEXT NULL",
+            "connection_status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "connection_checked_at": "TEXT NULL",
+            "connection_error_code": "TEXT NULL",
+            "connection_error_detail": "TEXT NULL",
         }
         for name, definition in columns.items():
             if name not in existing_columns:
@@ -1555,6 +1559,34 @@ class Database:
             cursor.execute("DELETE FROM sources WHERE id = ?", (source_id,))
             conn.commit()
             return "deleted"
+
+    def mark_source_connection_checking(self, source_id: int) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sources SET connection_status = 'checking', connection_error_code = NULL, "
+                "connection_error_detail = NULL WHERE id = ?",
+                (source_id,),
+            )
+            conn.commit()
+            return self.get_source(source_id) if cursor.rowcount else None
+
+    def complete_source_connection_check(
+        self, source_id: int, *, ok: bool, error_code: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        safe_code = str(error_code)[:80] if error_code else None
+        safe_detail = str(detail)[:300] if detail else None
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sources SET connection_status = ?, connection_checked_at = "
+                "strftime('%Y-%m-%dT%H:%M:%fZ','now'), connection_error_code = ?, "
+                "connection_error_detail = ? WHERE id = ?",
+                ('ok' if ok else 'failed', safe_code, safe_detail, source_id),
+            )
+            conn.commit()
+            return self.get_source(source_id) if cursor.rowcount else None
 
     def set_telegram_reference(self, source_id: int, reference: str, display: str) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:

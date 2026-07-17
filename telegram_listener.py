@@ -106,6 +106,7 @@ source_cache = SourceCache(db)
 
 history_fetch_queue: Optional[asyncio.Queue] = None
 telegram_resolve_queue: Optional[asyncio.Queue] = None
+telegram_connection_checks: set[int] = set()
 
 
 async def _telegram_resolve_worker(client, cache, db_instance, queue):
@@ -114,8 +115,10 @@ async def _telegram_resolve_worker(client, cache, db_instance, queue):
         try:
             source_id = request["source_id"]
             reference = parse_telegram_reference(request["telegram_input"])
+            check_only = bool(request.get("check_only"))
             if reference.kind == "id":
-                entity_id = reference.value
+                entity = await asyncio.wait_for(client.get_entity(int(reference.value)), timeout=15)
+                entity_id = str(entity.id)
             elif reference.kind == "username":
                 entity = await asyncio.wait_for(client.get_entity(reference.value), timeout=15)
                 entity_id = str(entity.id)
@@ -123,6 +126,12 @@ async def _telegram_resolve_worker(client, cache, db_instance, queue):
                 invite = await asyncio.wait_for(client(CheckChatInviteRequest(reference.value)), timeout=15)
                 chat = getattr(invite, "chat", None)
                 if chat is None:
+                    if check_only:
+                        db_instance.complete_source_connection_check(
+                            source_id, ok=False, error_code="join_required",
+                            detail="Потрібне підтвердження вступу до приватної групи",
+                        )
+                        continue
                     if not request.get("allow_join"):
                         db_instance.mark_telegram_resolution(source_id, "join_required", "Потрібне підтвердження вступу до приватної групи")
                         continue
@@ -132,17 +141,28 @@ async def _telegram_resolve_worker(client, cache, db_instance, queue):
                 if chat is None:
                     raise RuntimeError("Telegram invite did not return a chat")
                 entity_id = str(chat.id)
-            db_instance.resolve_source(source_id, entity_id)
-            db_instance.mark_telegram_resolution(source_id, "resolved", None)
-            cache.invalidate()
+            if check_only:
+                db_instance.complete_source_connection_check(source_id, ok=True)
+            else:
+                db_instance.resolve_source(source_id, entity_id)
+                db_instance.mark_telegram_resolution(source_id, "resolved", None)
+                cache.invalidate()
         except asyncio.CancelledError:
             raise
         except Exception:
             source_id = request.get("source_id")
             if source_id is not None:
-                db_instance.mark_telegram_resolution(source_id, "failed", "Не вдалося перевірити Telegram-групу. Спробуйте ще раз.")
-            logger.error("Telegram source resolution failed [SAFE_ERR_TG_RESOLVE]")
+                if request.get("check_only"):
+                    db_instance.complete_source_connection_check(
+                        source_id, ok=False, error_code="telegram_unavailable",
+                        detail="Немає доступу до Telegram-групи",
+                    )
+                else:
+                    db_instance.mark_telegram_resolution(source_id, "failed", "Не вдалося перевірити Telegram-групу. Спробуйте ще раз.")
+            logger.error("Telegram source operation failed [SAFE_ERR_TG_SOURCE]")
         finally:
+            if request.get("check_only"):
+                telegram_connection_checks.discard(request.get("source_id"))
             queue.task_done()
 
 

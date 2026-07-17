@@ -32,6 +32,49 @@ def test_source_management_migration_is_idempotent(tmp_path):
     assert {"poll_interval_minutes", "include_keywords", "exclude_keywords", "archived_at"} <= columns
 
 
+def test_connection_status_migration_and_persistence(tmp_path):
+    path = str(tmp_path / "connection-status.db")
+    database = Database(path)
+    source = add_source(database)
+    checking = database.mark_source_connection_checking(source["id"])
+    assert checking["connection_status"] == "checking"
+    completed = database.complete_source_connection_check(
+        source["id"], ok=False, error_code="timeout", detail="Джерело не відповіло вчасно",
+    )
+    assert completed["connection_status"] == "failed"
+    assert completed["connection_checked_at"]
+    assert completed["connection_error_code"] == "timeout"
+    reopened = Database(path).get_source(source["id"])
+    assert reopened["connection_status"] == "failed"
+    assert reopened["connection_error_detail"] == "Джерело не відповіло вчасно"
+
+
+def test_connection_check_button_and_missing_url_result(database):
+    source = add_source(database, source_type="x", external_id="news-account")
+    client = TestClient(app)
+    with patch("web_admin.main.db", database):
+        page = client.get("/sources")
+        assert 'data-check-connection' in page.text
+        assert "Перевірити з’єднання" in page.text
+        response = client.post(f"/api/sources/{source['id']}/check-connection")
+        assert response.status_code == 202
+        assert response.json()["status"] == "failed"
+        stored = database.get_source(source["id"])
+        assert stored["connection_status"] == "failed"
+        assert stored["connection_error_code"] == "missing_url"
+        assert stored["connection_checked_at"]
+
+
+def test_connection_check_rejects_duplicate(database):
+    source = add_source(database, source_type="website", external_id="site", canonical_url="https://example.com")
+    client = TestClient(app)
+    with patch("web_admin.main.db", database), patch(
+        "web_admin.main._source_connection_checks", {source["id"]}
+    ):
+        response = client.post(f"/api/sources/{source['id']}/check-connection")
+    assert response.status_code == 409
+
+
 def test_keyword_normalization_and_matching():
     assert normalize_source_keywords([" AI ", "ai", "Технології"]) == ["ai", "технології"]
     assert source_text_matches("Новини AI", ["AI"], ["казино"])
