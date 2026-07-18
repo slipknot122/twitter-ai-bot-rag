@@ -29,6 +29,20 @@ def validate_post_text(text: str, min_length: int = 10, max_length: int = 280) -
             
     return cleaned_text
 
+
+def truncate_post_text(text: str, max_length: int = 280) -> str:
+    """Return stripped text within max_length, preferring a word boundary."""
+    cleaned_text = text.strip()
+    if len(cleaned_text) <= max_length:
+        return cleaned_text
+
+    candidate = cleaned_text[:max_length].rstrip()
+    boundary = candidate.rfind(" ")
+    if boundary > 0:
+        candidate = candidate[:boundary].rstrip()
+    return candidate
+
+
 def _normalize_legacy_api_id(value: object) -> int | None:
     if isinstance(value, bool):
         return None

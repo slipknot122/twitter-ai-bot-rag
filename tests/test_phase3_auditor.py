@@ -191,6 +191,67 @@ def test_bad_second_audit_stops(mock_revise, mock_process, mock_audit, test_db):
     assert draft['rewritten_text'] == "Revised text"
 
 @patch("post_auditor.PostAuditor.audit")
+@patch("ai_worker._compress_candidate")
+@patch("ai_engine.ai_engine.process_text")
+def test_oversized_candidate_is_compressed_before_audit(mock_process, mock_compress, mock_audit, test_db):
+    long_source = "Detailed source material. " * 300
+    with test_db._get_connection() as conn:
+        conn.execute("UPDATE drafts SET original_text = ? WHERE id = 1", (long_source,))
+        conn.commit()
+    mock_process.return_value = {
+        "action": "PUBLISH",
+        "tweet_text": "Candidate sentence " * 30,
+        "category": "NEWS",
+        "sentiment": "Neutral",
+        "confidence": 0.9,
+    }
+    compressed = "A complete crypto market update that stays within the X post limit."
+    mock_compress.return_value = compressed
+    mock_audit.return_value = (make_valid_audit(), "mock_model")
+
+    ai_worker.process_draft(1, test_db)
+
+    mock_compress.assert_called_once_with(long_source, mock_process.return_value["tweet_text"])
+    mock_audit.assert_called_once_with(long_source, compressed, None)
+    draft = test_db.get_draft(1)
+    assert draft["status"] == "review"
+    assert draft["rewritten_text"] == compressed
+    assert len(draft["original_text"]) == len(long_source)
+
+
+def test_compression_response_over_limit_uses_safe_fallback():
+    response = MagicMock(text="still too long " * 30)
+    with patch("llm_provider.llm.generate_with_metadata", return_value=response):
+        compressed = ai_worker._compress_candidate(
+            "Full original source remains available to the editor.",
+            "Candidate post " * 30,
+        )
+    assert 10 <= len(compressed) <= 280
+    assert not compressed.endswith(" ")
+
+
+@patch("post_auditor.PostAuditor.audit")
+@patch("ai_worker._compress_candidate")
+@patch("ai_engine.ai_engine.process_text")
+def test_oversized_compression_uses_safe_fallback(mock_process, mock_compress, mock_audit, test_db):
+    mock_process.return_value = {
+        "action": "PUBLISH",
+        "tweet_text": "Original candidate " * 30,
+        "category": "NEWS",
+        "sentiment": "Neutral",
+        "confidence": 0.9,
+    }
+    mock_compress.return_value = ai_worker.truncate_post_text("still too long " * 30, 280)
+    mock_audit.return_value = (make_valid_audit(), "mock_model")
+
+    ai_worker.process_draft(1, test_db)
+
+    audited_candidate = mock_audit.call_args.args[1]
+    assert 10 <= len(audited_candidate) <= 280
+    assert test_db.get_draft(1)["rewritten_text"] == audited_candidate
+
+
+@patch("post_auditor.PostAuditor.audit")
 @patch("ai_engine.ai_engine.process_text")
 def test_timeout_first_audit(mock_process, mock_audit, test_db):
     mock_process.return_value = {

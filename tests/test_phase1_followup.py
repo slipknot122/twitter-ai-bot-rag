@@ -1,7 +1,9 @@
 import pytest
 import asyncio
+import json
 from unittest.mock import patch, MagicMock, AsyncMock
-from utils import validate_post_text, ValidationError, is_telegram_configured
+from utils import truncate_post_text, validate_post_text, ValidationError, is_telegram_configured
+from ai_engine import AIEngine
 from ai_worker import ai_worker_loop
 from media_builder import GoogleImagenProvider, CloudflareProvider, ContentRejectionError, TransientMediaError, ProviderAuthError
 
@@ -34,6 +36,48 @@ def test_text_validation_control_chars():
         validate_post_text("Valid text but with \x00 null byte")
     # Newlines should be valid
     assert validate_post_text("Valid text\nwith newline") == "Valid text\nwith newline"
+
+
+def test_truncate_post_text_prefers_word_boundary():
+    text = ("market update " * 30).strip()
+    result = truncate_post_text(text, 280)
+    assert len(result) <= 280
+    assert not result.endswith(" ")
+    assert text.startswith(result)
+    assert result.endswith("update") or result.endswith("market")
+
+
+def test_truncate_post_text_without_boundary_uses_exact_limit():
+    result = truncate_post_text("я" * 400, 280)
+    assert result == "я" * 280
+
+
+def test_rewriter_runtime_prompt_overrides_legacy_long_form_setting():
+    response = json.dumps({
+        "action": "PUBLISH",
+        "confidence": 0.95,
+        "reason": "news",
+        "tweet_text": "A concise market update.",
+        "image_prompt": "Crypto market screens in a newsroom",
+        "sentiment": "Neutral",
+        "category": "NEWS",
+    })
+    with patch("ai_engine.db.get_setting") as get_setting, patch(
+        "ai_engine.context_builder.build_context", return_value=""
+    ), patch("ai_engine.llm.generate", return_value=response) as generate:
+        get_setting.side_effect = lambda key, default: {
+            "system_prompt": "X Premium has no limit. Always write a long-form post.",
+            "llm_temperature": 0.7,
+            "allowed_categories": "NEWS",
+        }.get(key, default)
+        AIEngine().process_text("Source " * 1000)
+
+    system_prompt = generate.call_args.kwargs["system_prompt"]
+    assert "OVERRIDES EARLIER LENGTH INSTRUCTIONS" in system_prompt
+    assert "no more than 280 characters total" in system_prompt
+    payload = json.loads(generate.call_args.kwargs["prompt"])
+    assert payload["original_news"] == "Source " * 1000
+
 
 # --- Telegram Status Detection Tests ---
 
